@@ -1,0 +1,39 @@
+CC            = x86_64-w64-mingw32-gcc
+RC            = windres
+TARGET        = game.exe
+LIBRARIES     = -lstdc++ -lm -lglew32 -lglfw3 -lopengl32 -lgdi32 -lcomctl32
+HEADERS       =                   # $(wildcard include/*.hpp)
+SOURCES       = src/main_winos.cc # $(wildcard src/*.cpp)
+RESOURCES     = $(wildcard res/*.rc)
+OBJECTS       = ${SOURCES:.cc=.o}
+DEPENDENCIES  = ${SOURCES:.cc=.dep}
+RSRC_OBJECTS  = ${RESOURCES:.rc=.o}
+INCLUDE_DIRS  = -I. -Iinclude -Ires
+LIBRARY_DIRS  = -Llib
+PROJ_WARNINGS = -Wall -Wextra
+PROJ_CCFLAGS  = -std=gnu++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS -D _WIN32 -D WIN32 -D _UNICODE -D UNICODE -D GLEW_STATIC
+PROJ_LDFLAGS  = -s -Wl,--subsystem,console
+
+.PHONY: all clean distclean output
+
+all:: ${TARGET}
+
+${TARGET}: ${OBJECTS} ${RSRC_OBJECTS}
+	${CC} ${LDFLAGS} ${PROJ_LDFLAGS} -o $@ $^ ${LIBRARIES}
+
+${OBJECTS}: %.o: %.cc ${DEPENDENCIES}
+	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -o $@ -c $<
+
+${RSRC_OBJECTS}: %.o: %.rc
+	${RC} ${INCLUDE_DIRS} -i $< -o $@
+
+${DEPENDENCIES}: %.dep: %.cc ${HEADERS} ${RESOURCES} Makefile.w64
+	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -MM $< > $@
+
+output:: ${TARGET}
+
+clean::
+	rm -f *~ *.o *.dep res/*~ res/*.o res/*.dep src/*~ src/*.o src/*.dep ${TARGET}
+
+distclean:: clean
+

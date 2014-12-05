@@ -1,0 +1,32 @@
+TARGET        = game
+LIBRARIES     = -lstdc++ -lm -framework Cocoa -framework OpenGL -framework OpenAL
+HEADERS       =                    # $(wildcard include/*.hpp)
+SOURCES       = src/main_macos.cc  # $(wildcard src/*.cpp)
+OBJECTS       = ${SOURCES:.cc=.o}
+DEPENDENCIES  = ${SOURCES:.cc=.dep}
+INCLUDE_DIRS  = -I. -Iinclude
+LIBRARY_DIRS  = -Llib
+PROJ_WARNINGS = -Wall -Wextra
+PROJ_CCFLAGS  = -ggdb -std=c++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS
+PROJ_LDFLAGS  =
+
+.PHONY: all clean distclean output
+
+all:: ${TARGET}
+
+${TARGET}: ${OBJECTS}
+	${CC} ${LDFLAGS} ${PROJ_LDFLAGS} -o $@ $^ ${LIBRARIES}
+
+${OBJECTS}: %.o: %.cc ${DEPENDENCIES}
+	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -o $@ -c $<
+
+${DEPENDENCIES}: %.dep: %.cc ${HEADERS} Makefile.osx
+	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -MM $< > $@
+
+output:: ${TARGET}
+
+clean::
+	rm -f *~ *.o *.dep res/*~ res/*.o res/*.dep src/*~ src/*.o src/*.dep ${TARGET}
+
+distclean:: clean
+
