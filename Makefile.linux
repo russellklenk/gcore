@@ -1,5 +1,5 @@
 TARGET        = game
-LIBRARIES     = -lstdc++ -lrt -lm -lglew -lglfw3 -lGL
+LIBRARIES     = -lstdc++ -lrt -lm -lGLEW -lglfw3 -lGL
 HEADERS       =                        # $(wildcard include/*.h)
 SOURCES       = src/main_linux.cc      # $(wildcard src/*.cpp)
 OBJECTS       = ${SOURCES:.cc=.o}
