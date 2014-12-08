@@ -15,6 +15,16 @@
 /*/////////////////
 //   Constants   //
 /////////////////*/
+/// @summary Define the set of known file types. When adding a file type, also
+/// be sure to add a function pointer entry for the io_callbacks_t structure.
+enum file_type_e
+{
+    FILE_TYPE_DDS         = 0,
+    FILE_TYPE_TGA         = 1,
+    FILE_TYPE_WAV         = 2,
+    FILE_TYPE_JSON        = 3,
+    FILE_TYPE_FORCE_32BIT = 0x7FFFFFFFL
+};
 
 /*////////////////////////////
 //   Forward Declarations   //
@@ -23,10 +33,55 @@
 /*//////////////////
 //   Data Types   //
 //////////////////*/
+/// @summary Function signature for the callback function invoked when the
+/// platform I/O system has some data available for processing by the application.
+/// @param app_id The application-defined identifier of the source file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param data Pointer to the data buffer. The data to read starts at offset 0.
+/// @param offset The starting offset of the buffered data within the file.
+/// @param size The number of valid bytes in the buffer.
+typedef void (*data_callback_fn)(uint32_t app_id, int32_t type, void const *data, uint64_t offset, size_t size);
+
+/// @summary Function signature for a callback function invoked when an error
+/// occurs while the platform I/O system encounters an error during a file operation.
+/// @param app_id The application-defined identifier of the source file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param error_code The system error code value.
+/// @param error_message An optional string description of the error.
+typedef void (*file_error_fn)(uint32_t app_id, int32_t type, int64_t error_code, char const *error_message);
+
+/// @summary Defines the set of callback functions into the application code
+/// used for handling data read from files. There is one callback for each
+/// defined value of the file_type_e enumeration.
+struct io_callbacks_t
+{
+    data_callback_fn DataForDDS;  /// Callback invoked when data is read from a DDS file.
+    data_callback_fn DataForTGA;  /// Callback invoked when data is read from a TGA file.
+    data_callback_fn DataForWAV;  /// Callback invoked when data is read from a WAV file.
+    data_callback_fn DataForJSON; /// Callback invoked when data is read from a JSON file.
+    file_error_fn    IoError;     /// Callback invoked when a system I/O error occurs.
+};
+
+/// @summary A single module in the application code must define an instance of
+/// io_callbacks_t named IoCallback and initialize it.
+extern io_callbacks_t IoCallback;
 
 /*/////////////////
 //   Functions   //
 /////////////////*/
+/// @summary attempts to open a file and read it from beginning to end.
+/// @param path the location of the file to load.
+/// @param file_type one of the values of the file_type_e enumeration.
+/// @param app_id the application-defined identifier associated with the file.
+extern bool platform_read_file(char const *path, int32_t file_type, uint32_t app_id);
+
+/// @summary Closes a file previously opened with platform_read_file. This
+/// should be called when the application has finished processing the file
+/// data, or when the platform has reported an error while reading the file.
+/// @param file_type One of the values of the file_type_e enumeration.
+/// @param app_id The application-defined identifier of the file to close.
+extern void platform_close_file(int32_t file_type, uint32_t app_id);
+
 // TODO: So the big question here is I/O, and whether or not we even want to
 // expose the internals of the I/O system to the 'application' layer, having
 // queues and whatnot to communicate back and forth, or whether we instead

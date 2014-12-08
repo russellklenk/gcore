@@ -24,16 +24,28 @@
 
 #define never_inline               __attribute__((noinline))
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS              MAP_ANON
+#endif
+
 /*////////////////
 //   Includes   //
 ////////////////*/
+#include <fcntl.h>
+#include <stdio.h>
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <libaio.h>
 #include <pthread.h>
+#include <execinfo.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+
+#include "bridge.h"
 
 /*/////////////////
 //   Constants   //
@@ -52,9 +64,9 @@
 /// use as long as reads and writes of 32-bit values are atomic on the platform.
 struct srsw_flq_t
 {
-    uint32_t          PushedCount; /// Number of push operations performed.
-    uint32_t          PoppedCount; /// Number of pop operations performed.
-    uint32_t          Capacity;    /// The queue capacity. Always a power-of-two.
+    uint32_t          PushedCount;  /// Number of push operations performed.
+    uint32_t          PoppedCount;  /// Number of pop operations performed.
+    uint32_t          Capacity;     /// The queue capacity. Always a power-of-two.
 };
 
 /// @summary Defines the data associated with a fixed-size queue safe for
@@ -63,8 +75,8 @@ struct srsw_flq_t
 template <typename T>
 struct srsw_fifo_t
 {
-    srsw_flq_t         Queue;      /// Maintains queue state and capacity.
-    T                 *Store;      /// Storage for the queue items.
+    srsw_flq_t         Queue;       /// Maintains queue state and capacity.
+    T                 *Store;       /// Storage for the queue items.
 };
 
 /// @summary A waitable queue safe for concurrent access by a single reader and
@@ -74,17 +86,62 @@ struct srsw_fifo_t
 template <typename T>
 struct srsw_waitable_fifo_t
 {
-    srsw_flq_t         Queue;      /// Maintains queue state and capacity.
-    T                 *Store;      /// Storage for the queue items.
-    pthread_mutex_t    MtNotEmpty; /// Mutex guarding the 'not empty' condition.
-    pthread_cond_t     CvNotEmpty; /// Used to wait on or signal a not empty condition.
-    pthread_mutex_t    MtNotFull;  /// Mutex guarding the 'not full' condition.
-    pthread_cond_t     CvNotFull;  /// Used to wait on or signal a not full condition.
+    srsw_flq_t         Queue;       /// Maintains queue state and capacity.
+    T                 *Store;       /// Storage for the queue items.
+    pthread_mutex_t    MtNotEmpty;  /// Mutex guarding the 'not empty' condition.
+    pthread_cond_t     CvNotEmpty;  /// Used to wait on or signal a not empty condition.
+    pthread_mutex_t    MtNotFull;   /// Mutex guarding the 'not full' condition.
+    pthread_cond_t     CvNotFull;   /// Used to wait on or signal a not full condition.
+};
+
+/// @summary Defines the state associated with a direct I/O buffer manager.
+/// This object allocates a single large chunk of memory aligned to a multiple
+/// of the physical disk sector size, and then allows the caller to allocate
+/// fixed-size chunks from within that buffer. The allocator can only be used
+/// from a single thread. This allocator can also be used for cached I/O.
+struct iobuf_allocator_t
+{
+    size_t             TotalSize;   /// The total number of bytes allocated.
+    size_t             PageSize;    /// The size of a single page, in bytes.
+    size_t             AllocSize;   /// The number of pages per-allocation.
+    void              *BaseAddress; /// The base address of the committed range.
+    size_t             FreeCount;   /// The number of unallocated AllocSize blocks.
+    void             **FreeList;    /// Pointers to the start of each unallocated block.
+};
+
+/*///////////////
+//   Globals   //
+///////////////*/
+/// @summary A list of all of the file type identifiers we consider to be valid.
+static file_type_e FILE_TYPE_LIST[] = {
+    FILE_TYPE_DDS,
+    FILE_TYPE_TGA,
+    FILE_TYPE_WAV,
+    FILE_TYPE_JSON
 };
 
 /*///////////////////////
 //   Local Functions   //
 ///////////////////////*/
+/// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
+/// @param size The size value to round up.
+/// @param pow2 The power-of-two alignment.
+/// @return The input size, rounded up to the nearest even multiple of pow2.
+static inline size_t align_up(size_t size, size_t pow2)
+{
+    assert((pow2 & (pow2-1)) == 0);
+    return (size == 0) ? pow2 : ((size + (pow2-1)) & ~(pow2-1));
+}
+
+/// @summary Clamps a value to a given maximum.
+/// @param size The size value to clamp.
+/// @param limit The upper-bound to clamp to.
+/// @return The smaller of size and limit.
+static inline size_t clamp_to(size_t size, size_t limit)
+{
+    return (size > limit) ? limit : size;
+}
+
 /// @summary Atomically writes a 32-bit unsigned integer value to a given address.
 /// Ensure that this function is not inlined by the compiler.
 /// @param address The address to write to. This address must be 32-bit aligned.
@@ -512,6 +569,193 @@ static bool srsw_fifo_get(srsw_waitable_fifo_t<T> *fifo, T &item)
     return false;
 }
 
+/// @summary Create a new I/O buffer allocator with the specified minimum buffer
+/// and allocation sizes. The total buffer size and allocation size may be
+/// somewhat larger than what is requested in order to meet alignment requirements.
+/// @param alloc The I/O buffer allocator to initialize.
+/// @param total_size The total number of bytes to allocate. This size is
+/// rounded up to the nearest even multiple of the sub-allocation size. It is
+/// best to keep the total buffer size as small as is reasonable for the application
+/// workload, as this memory may be allocated from the non-paged pool.
+/// @param alloc_size The sub-allocation size, in bytes. This is the size of a
+/// single buffer that can be returned to the application. This size is rounded
+/// up to the nearest even multiple of the largest disk sector size.
+/// @return true if the allocator was initialized. Check alloc->TotalSize and
+/// alloc->AllocSize to determine the values selected by the system.
+static bool create_iobuf_allocator(iobuf_allocator_t *alloc, size_t total_size, size_t alloc_size)
+{
+    // round the allocation size up to an even multiple of the page size.
+    // round the total size up to an even multiple of the allocation size.
+    size_t page_size = size_t(sysconf(_SC_PAGESIZE));
+    alloc_size       = align_up(alloc_size, page_size);
+    total_size       = align_up(total_size, alloc_size);
+    size_t nallocs   = total_size / alloc_size;
+
+    // reserve and commit the entire region, and then pin it in physical memory.
+    // this prevents the buffers from being paged out during normal execution.
+    void  *baseaddr = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (baseaddr == NULL)
+    {   // the requested amount of memory could not be allocated.
+        return false;
+    }
+
+    madvise(baseaddr, total_size, MADV_HUGEPAGE);
+
+    void **freelist = (void**) malloc(nallocs * sizeof(void*));
+    if (freelist == NULL)
+    {   // the requested memory could not be allocated.
+        munmap(baseaddr, total_size);
+        return false;
+    }
+
+    // at this point, everything that could have failed has succeeded.
+    // set the fields of the allocator and initialize the free list.
+    alloc->TotalSize   = total_size;
+    alloc->PageSize    = page_size;
+    alloc->AllocSize   = alloc_size;
+    alloc->BaseAddress = baseaddr;
+    alloc->FreeCount   = nallocs;
+    alloc->FreeList    = freelist;
+    uint8_t *buf_it    = (uint8_t*) baseaddr;
+    for (size_t i = 0; i < nallocs; ++i)
+    {
+        freelist[i]    = buf_it;
+        buf_it        += alloc_size;
+    }
+    return true;
+}
+
+/// @summary Delete an I/O buffer allocator. All memory is freed, regardless
+/// of whether any I/O buffers are in use by the application.
+/// @param alloc The I/O buffer allocator to delete.
+static void delete_iobuf_allocator(iobuf_allocator_t *alloc)
+{
+    if (alloc->FreeList    != NULL) free(alloc->FreeList);
+    if (alloc->BaseAddress != NULL) munmap(alloc->BaseAddress, alloc->TotalSize);
+    alloc->BaseAddress = NULL;
+    alloc->FreeCount   = 0;
+    alloc->FreeList    = NULL;
+}
+
+/// @summary Returns all I/O buffers to the free list of the allocator, regardless
+/// of whether any I/O buffers are in use by the application.
+/// @param alloc The I/O buffer allocator to flush.
+static void flush_iobuf_allocator(iobuf_allocator_t *alloc)
+{
+    size_t const nallocs = alloc->TotalSize / alloc->AllocSize;
+    size_t const allocsz = alloc->AllocSize;
+    uint8_t       *bufit = (uint8_t*) alloc->BaseAddress;
+    void         **freel = alloc->FreeList;
+    for (size_t i = 0; i < nallocs; ++i)
+    {
+        freel[i]  = bufit;
+        bufit    += allocsz;
+    }
+    alloc->FreeCount = nallocs;
+}
+
+/// @summary Retrieves an I/O buffer from the pool.
+/// @param alloc The I/O buffer allocator to query.
+/// @return A pointer to the I/O buffer, or NULL if no buffers are available.
+static inline void* iobuf_get(iobuf_allocator_t *alloc)
+{
+    if (alloc->FreeCount > 0)
+    {   // return the next buffer from the free list,
+        // which is typically the most recently used buffer.
+        return alloc->FreeList[--alloc->FreeCount];
+    }
+    else return NULL; // no buffers available for use.
+}
+
+/// @summary Returns an I/O buffer to the pool.
+/// @param alloc The I/O buffer allocator that owns the buffer.
+/// @param iobuf The address of the buffer returned by iobuf_get().
+static inline void iobuf_put(iobuf_allocator_t *alloc, void *iobuf)
+{
+    assert(iobuf != NULL);
+    alloc->FreeList[alloc->FreeCount++] = iobuf;
+}
+
+/// @summary Calaculate the number of bytes currently unused.
+/// @param alloc The I/O buffer allocator to query.
+/// @return The number of bytes currently available for use by the application.
+static inline size_t iobuf_allocator_bytes_free(iobuf_allocator_t const *alloc)
+{
+    return (alloc->AllocSize *  alloc->FreeCount);
+}
+
+/// @summary Calaculate the number of bytes currently allocated.
+/// @param alloc The I/O buffer allocator to query.
+/// @return The number of bytes currently in-use by the application.
+static inline size_t iobuf_allocator_bytes_used(iobuf_allocator_t const *alloc)
+{
+    return  alloc->TotalSize - (alloc->AllocSize * alloc->FreeCount);
+}
+
+/// @summary Calculate the number of buffers currently allocated.
+/// @param alloc The I/O buffer allocator to query.
+/// @return The number of buffers currently in-use by the application.
+static inline size_t iobuf_allocator_buffers_used(iobuf_allocator_t const *alloc)
+{
+    size_t const nallocs = alloc->TotalSize / alloc->AllocSize;
+    size_t const nunused = alloc->FreeCount;
+    return (nallocs - nunused);
+}
+
+/// @summary Perform any required setup of the platform-specific virtual file
+/// system and I/O system. Calls to open files are routed through the VFS and
+/// eventually are translated into filesystem operations.
+static bool platform_setup_io(void)
+{
+    // TODO: Initialize the application virtual file system on this platform.
+    // This will typically involve things like directory enumeration and
+    // the reading and parsing of packages. Once that is done, initialize the
+    // platform I/O subsystem.
+    return true;
+}
+
+/// @summary Checks a file type value to make sure it is known.
+/// @param file_type One of the values of the file_type_e enumeration.
+/// @return true if the file type is known.
+static bool check_file_type(int32_t file_type)
+{
+    size_t  const  ntypes   = sizeof(FILE_TYPE_LIST) / sizeof(FILE_TYPE_LIST[0]);
+    int32_t const *typelist = (int32_t const*) FILE_TYPE_LIST;
+    for (size_t i = 0; i  < ntypes; ++i)
+    {
+        if (typelist[i] == file_type)
+            return true;
+    }
+    return false;
+}
+
+/// @summary attempts to open a file and read it from beginning to end.
+/// @param path the location of the file to load.
+/// @param file_type One of the values of the file_type_e enumeration.
+/// @param app_id the application-defined identifier associated with the file.
+bool platform_read_file(char const *path, int32_t file_type, uint32_t app_id)
+{
+#if DEBUG
+    if (!check_file_type(file_type))
+    {
+        IoCallback->IoError(app_id, file_type, EINVAL, "Invalid file type");
+        return false;
+    }
+#endif
+    // TODO: route mounting of the file through the VFS.
+    return false;
+}
+
+/// @summary Closes a file previously opened with platform_read_file. This
+/// should be called when the application has finished processing the file
+/// data, or when the platform has reported an error while reading the file.
+/// @param file_type One of the values of the file_type_e enumeration.
+/// @param app_id The application-defined identifier of the file to close.
+void platform_close_file(int32_t file_type, uint32_t app_id)
+{
+    // TODO: route closing of the file through the VFS.
+}
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -526,6 +770,11 @@ int main(int argc, char **argv)
     if (argc > 1)
     {
         /* USAGE */
+    }
+    if (!platform_setup_io())
+    {
+        fprintf(stderr, "FATAL: Unable to setup the platform Virtual File System.\n");
+        exit(EXIT_FAILURE);
     }
 
     exit(exit_code);
