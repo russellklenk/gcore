@@ -5,6 +5,10 @@
 /*////////////////////
 //   Preprocessor   //
 ////////////////////*/
+#define _LARGEFILE_SOURCE
+#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS    64
+
 #if (__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 1)
 #define COMPILER_MFENCE_READ       __sync_synchronize()
 #define COMPILER_MFENCE_WRITE      __sync_synchronize()
@@ -31,6 +35,7 @@
 /*////////////////
 //   Includes   //
 ////////////////*/
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <assert.h>
@@ -43,13 +48,18 @@
 #include <pthread.h>
 #include <execinfo.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/epoll.h>
 #include <sys/param.h>
+#include <sys/eventfd.h>
 
 #include "bridge.h"
 
 /*/////////////////
 //   Constants   //
 /////////////////*/
+/// @summary Define the maximum number of concurrently open files and streams.
+static size_t const MAX_ACTIVE_FILES  = 16;
 
 /*///////////////////
 //   Local Types   //
@@ -701,6 +711,152 @@ static inline size_t iobuf_allocator_buffers_used(iobuf_allocator_t const *alloc
     size_t const nunused = alloc->FreeCount;
     return (nallocs - nunused);
 }
+
+/// @summary Synchronously opens a file, creates an eventfd, and retrieves
+/// various information about the file.
+/// @param path The path of the file to open.
+/// @param flags The set of flags to pass to open(). Usually, this value will
+/// be O_RDONLY | O_LARGEFILE | O_DIRECT, but it may be any combination of values
+/// supported by the open() call.
+/// @param fd On return, this value is set to the raw file descriptor, or -1 if
+/// an error occurred. Close the file using the close() function.
+/// @param efd On return, this value is set to an eventfd file descriptor, or -1
+/// if an error occurred. Close the file descriptor using the close() function.
+/// @param file_size On return, this value is set to the current size of the file, in bytes.
+/// @param sector_size On return, this value is set to the size of the physical disk sector, in bytes.
+/// @return true if all operations were successful.
+static bool open_file_raw(char const *path, int flags, int &fd, int &efd, int64_t &file_size, size_t &sector_size)
+{   // typical read flags are O_RDONLY | O_LARGEFILE | O_DIRECT
+    struct stat  st;
+    int evtdes = -1;
+    int fildes = -1;
+
+    evtdes = eventfd(0, 0); // flags could be EFD_NONBLOCK?
+    if (evtdes == -1)
+    {   // unable to create the eventfd. check errno to find out why.
+        goto error_cleanup;
+    }
+
+    fildes = open(path, flags);
+    if (fildes == -1)
+    {   // unable to open the file. check errno to find out why.
+        goto error_cleanup;
+    }
+
+    // retrieve the physical block size for the disk containing the file.
+    // this will also retrieve the current size of the file, in bytes.
+    if (fstat(fildes, &st) < 0)
+    {   // unable to retrieve file stats; fail.
+        goto error_cleanup;
+    }
+
+    // the file has been opened, and all resources created successfully.
+    fd          = fildes;
+    efd         = evtdes;
+    file_size   = st.st_size;
+    sector_size = st.st_blksize;
+    return true;
+
+error_cleanup:
+    if (evtdes != -1) close(evtdes);
+    if (fildes != -1) close(fildes);
+    fd          = -1;
+    efd         = -1;
+    file_size   =  0;
+    sector_size =  0;
+    return false;
+}
+
+/// @summary Closes the file descriptors associated with a file.
+/// @param fd The raw file descriptor of the underlying file. On return, set to -1.
+/// @param efd The eventfd file descriptor associated with the file. On return, set to -1.
+static void close_file_raw(int &fd, int &efd)
+{
+    if (efd != -1) close(efd);
+    if (fd  != -1) close(fd);
+    fd  = -1;
+    efd = -1;
+}
+
+struct aio_file_t
+{
+    int          Fildes;                    // the raw file descriptor
+    int          Eventfd;                   // the eventfd for the file
+    int64_t      FileSize;                  // the file size, in bytes
+    size_t       SectorSize;                // the physical sector size, in bytes
+};
+
+struct aio_state_t
+{
+    int          EpollId;                    // epoll queue file descriptor
+    io_context_t AIOContext;                 // kernel aio context information
+    size_t       ActiveCount;                // the number of currently active files
+    intptr_t     FileId  [MAX_ACTIVE_FILES]; // app_ids for each active file [ActiveCount]
+    aio_file_t   FileData[MAX_ACTIVE_FILES]; // constant info for the life of the file [ActiveCount]
+    struct iocb  IOCBPool[MAX_ACTIVE_FILES]; // pool of aio operation descriptors [ActiveCount]
+};
+
+static bool init_aio_state(aio_state_t *aio)
+{
+    io_context_t aio_ctx = 0;
+    int result   = -1;
+    int epollfd  =  epoll_create1(0);
+    if (epollfd !=  0)
+    {   // unable to create the epoll queue.
+        goto error_cleanup;
+    }
+
+    // TODO: is MAX_ACTIVE_FILES the correct value for max events?
+    // we *should* have only one outstanding read per-file at any
+    // given time, but we may find that this is not actually true!
+    result = io_setup(MAX_ACTIVE_FILES, &aio_ctx);
+    if (result != 0)
+    {   // unable to create the AIO context.
+        goto error_cleanup;
+    }
+
+    // initialize the aio state instance.
+    aio->EpollId      = epollfd;
+    aio->AIOContext   = aio_ctx;
+    aio->ActiveCount  = 0;
+    for (size_t i = 0 , n = MAX_ACTIVE_FILES; i < n; ++i)
+    {
+        aio->FileId[i]  = INVALID_ID;
+    }
+    for (size_t i = 0 , n = MAX_ACTIVE_FILES; i < n; ++i)
+    {
+        aio->FileData[i].Fildes     = -1;
+        aio->FileData[i].Eventfd    = -1;
+        aio->FileData[i].FileSize   =  0;
+        aio->FileData[i].SectorSize =  0;
+    }
+    for (size_t i = 0 , n = MAX_ACTIVE_FILES; i < n; ++i)
+    {
+        aio->IOCBPool[i].data           = (void*) INVALID_ID;
+        aio->IOCBPool[i].aio_lio_opcode = IO_CMD_PREAD;
+        aio->IOCBPool[i].aio_fildes     = -1;
+        aio->IOCBPool[i].u.c.buf        = NULL;
+        aio->IOCBPool[i].u.c.nbytes     = 0;
+        aio->IOCBPool[i].u.c.offset     = 0;
+    }
+
+    return true;
+
+error_cleanup:
+    if (epollfd != 0) close(epollfd);
+    aio->EpollId      = -1;
+    aio->AIOContext   =  0;
+    aio->ActiveCount  =  0;
+    return false;
+    return false;
+}
+
+// 1. Create the AIO context using io_setup(MAX_ACTIVE_FILES, io_context_t *out)
+// 2. Determine what state must be kept for each file. App_ID should be an intptr_t.
+// 3. Functions to manage the iocb free list.
+// 4. Define queues to manage open and close file requests.
+// 5. Define a queue to manage read file requests.
+// 6. Implement the main poll routine. Note that at this level, nothing to do with file type.
 
 /// @summary Perform any required setup of the platform-specific virtual file
 /// system and I/O system. Calls to open files are routed through the VFS and

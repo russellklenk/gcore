@@ -26,6 +26,10 @@ enum file_type_e
     FILE_TYPE_FORCE_32BIT = 0x7FFFFFFFL
 };
 
+/// @summary The sentinal value representing an invalid file ID. Applications
+/// cannot specify this as the app_id parameter to any I/O functions.
+static intptr_t const INVALID_ID = (intptr_t) -1;
+
 /*////////////////////////////
 //   Forward Declarations   //
 ////////////////////////////*/
