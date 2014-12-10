@@ -211,26 +211,80 @@ struct aio_state_t
     aio_wresultq_t     WriteResults; /// Queue for completed write operations.
     aio_fresultq_t     FlushResults; /// Queue for completed flush operations.
     aio_cresultq_t     CloseResults; /// Queue for completed close operations.
-    #undef N
+    #undef MA
 };
 
 /// @summary Defines the data associated with a file open request passed to the
 /// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_ofrq_t
+struct vfs_ofreq_t
 {
-    vfs_ofrq_t        *Next;         /// Pointer to the next node in the queue.
+    vfs_ofreq_t       *Next;         /// Pointer to the next node in the queue.
     intptr_t           AFID;         /// The application-defined ID for the file.
     char              *Path;         /// The file path, allocated with strdup.
     int32_t            Type;         /// The file type, one of file_type_e.
+    int32_t            Priority;     /// The file access priority (0 = highest).
 };
 
 /// @summary Defines the data associated with a file close request passed to the
 /// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_cfrq_t
+struct vfs_cfreq_t
 {
-    vfs_cfrq_t        *Next;         /// Pointer to the next node in the queue.
+    vfs_cfreq_t       *Next;         /// Pointer to the next node in the queue.
     intptr_t           AFID;         /// The application-defined ID for the file.
     int32_t            Type;         /// The file type, one of file_type_e.
+};
+
+/// @summary Defines the data associated with a file read request passed to the
+/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_rfreq_t
+{
+    vfs_rfreq_t       *Next;         /// Pointer to the next node in the queue.
+    int64_t            Offset;       /// The byte offset at which to begin reading.
+    intptr_t           AFID;         /// The application-defined ID for the file.
+    int32_t            Type;         /// The file type, one of file_type_e.
+    uint32_t           Amount;       /// The number of bytes being requested.
+};
+
+/// @summary Defines the data associated with a file load request passed to the
+/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_lfreq_t
+{
+    vfs_lfreq_t       *Next;         /// Pointer to the next node in the queue.
+    intptr_t           AFID;         /// The application-defined ID for the file.
+    char              *Path;         /// The file path, allocated with strdup.
+    int32_t            Type;         /// The file type, one of file_type_e.
+    int32_t            Priority;     /// The file access priority (0 = highest).
+};
+
+typedef srmw_fifo_t<vfs_ofreq_t>     vfs_ofq_t; /// Open file request queue.
+typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t; /// Close file request queue.
+typedef srmw_fifo_t<vfs_rfreq_t>     vfs_rfq_t; /// Read file request queue.
+typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t; /// Load file request queue.
+
+/// @summary Information that remains constant from the point that a file is opened for reading.
+struct vfs_fdinfo_t
+{
+    int                Fildes;       /// The file descriptor for the file.
+    int                Eventfd;      /// The eventfd descriptor for the file, or -1.
+    int64_t            FileSize;     /// The current logical file size, in bytes.
+    size_t             SectorSize;   /// The disk physical sector size, in bytes.
+};
+
+/// @summary Defines the state data maintained by a VFS driver instance.
+struct vfs_state_t
+{
+    #define MF         MAX_OPEN_FILES
+    #define NT         FILE_TYPE_COUNT
+    vfs_ofq_t          OpenQueue;    /// The queue for open file requests.
+    vfs_rfq_t          ReadQueue;    /// The queue for file segment read requests.
+    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
+    vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
+    size_t             ActiveCount;  /// The number of open files.
+    intptr_t           AFIDList[MF]; /// The list of application-defined file IDs.
+    int32_t            TypeList[MF]; /// The list of file types for each file.
+    vfs_fdinfo_t       InfoList[MF]; /// The list of base file info for each file.
+    #undef NT
+    #undef MF
 };
 
 /*///////////////
@@ -392,36 +446,36 @@ static inline void srsw_flq_pop(srsw_flq_t &srswq)
 /// one should be accessing the queue at the time.
 /// @param fifo The queue to flush.
 template <typename T, uint32_t N>
-static inline void flush_srsw_fifo(srsw_fifo_t<T, N> &fifo)
+static inline void flush_srsw_fifo(srsw_fifo_t<T, N> *fifo)
 {
-    srsw_flq_clear(fifo.Queue, N);
+    srsw_flq_clear(fifo->Queue, N);
 }
 
 /// @summary Retrieves the number of items 'currently' in the queue.
 /// @param fifo The queue to query.
 /// @return The number of items in the queue at the instant of the call.
 template <typename T, uint32_t N>
-static inline size_t srsw_fifo_count(srsw_fifo_t<T, N> &fifo)
+static inline size_t srsw_fifo_count(srsw_fifo_t<T, N> *fifo)
 {
-    return srsw_flq_count(fifo.Queue);
+    return srsw_flq_count(fifo->Queue);
 }
 
 /// @summary Determines whether the queue is 'currently' empty.
 /// @param fifo The queue to query.
 /// @return true if the queue contains zero items at the instant of the call.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_is_empty(srsw_fifo_t<T, N> &fifo)
+static inline bool srsw_fifo_is_empty(srsw_fifo_t<T, N> *fifo)
 {
-    return srsw_flq_empty(fifo.Queue);
+    return srsw_flq_empty(fifo->Queue);
 }
 
 /// @summary Determines whether the queue is 'currently' full.
 /// @param fifo The queue to query.
 /// @return true if the queue is full at the instant of the call.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> &fifo)
+static inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> *fifo)
 {
-    return srsw_flq_full(fifo.Queue);
+    return srsw_flq_full(fifo->Queue);
 }
 
 /// @summary Enqueues an item.
@@ -429,15 +483,15 @@ static inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> &fifo)
 /// @param item The item to enqueue. This must be a POD type.
 /// @return true if the item was enqueued, or false if the queue is at capacity.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_put(srsw_fifo_t<T, N> &fifo, T const &item)
+static inline bool srsw_fifo_put(srsw_fifo_t<T, N> *fifo, T const &item)
 {
-    uint32_t count = srsw_flq_count(fifo.Queue) + 1;
+    uint32_t count = srsw_flq_count(fifo->Queue) + 1;
     if (count <= N)
     {
-        uint32_t   index  = srsw_flq_next_push(fifo.Queue);
-        fifo.Store[index] = item;
+        uint32_t    index  = srsw_flq_next_push(fifo->Queue);
+        fifo->Store[index] = item;
         COMPILER_MFENCE_WRITE;
-        srsw_flq_push(fifo.Queue);
+        srsw_flq_push(fifo->Queue);
         return true;
     }
     return false;
@@ -448,15 +502,15 @@ static inline bool srsw_fifo_put(srsw_fifo_t<T, N> &fifo, T const &item)
 /// @param item On return, the dequeued item is copied here.
 /// @return true if an item was dequeued, or false if the queue is empty.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_get(srsw_fifo_t<T, N> &fifo, T &item)
+static inline bool srsw_fifo_get(srsw_fifo_t<T, N> *fifo, T &item)
 {
-    uint32_t count = srsw_flq_count(fifo.Queue);
+    uint32_t count = srsw_flq_count(fifo->Queue);
     if (count > 0)
     {
-        uint32_t index = srsw_flq_next_pop(fifo.Queue);
-        item = fifo.Store[index];
+        uint32_t index = srsw_flq_next_pop(fifo->Queue);
+        item = fifo->Store[index];
         COMPILER_MFENCE_READ;
-        srsw_flq_pop(fifo.Queue);
+        srsw_flq_pop(fifo->Queue);
         return true;
     }
     return false;
@@ -553,36 +607,36 @@ static inline void srmw_freelist_put(srmw_freelist_t<T> &list, T *node)
 /// @param capacity The initial capacity of the FIFO.
 /// @return true if the FIFO is initialized.
 template <typename T>
-static bool create_srmw_fifo(srmw_fifo_t<T> &fifo, size_t capacity)
+static bool create_srmw_fifo(srmw_fifo_t<T> *fifo, size_t capacity)
 {
-    pthread_mutex_init  (&fifo.HeadLock, 0);
-    pthread_mutex_init  (&fifo.TailLock, 0);
-    create_srmw_freelist( fifo.FreeList, capacity);
-    fifo.XXXX       = srmw_freelist_get( fifo.FreeList);
-    fifo.XXXX->Next = NULL;
-    fifo.Head       = fifo.XXXX;
-    fifo.Tail       = fifo.XXXX;
+    pthread_mutex_init  (&fifo->HeadLock, 0);
+    pthread_mutex_init  (&fifo->TailLock, 0);
+    create_srmw_freelist( fifo->FreeList, capacity);
+    fifo->XXXX       = srmw_freelist_get(fifo->FreeList);
+    fifo->XXXX->Next = NULL;
+    fifo->Head       = fifo->XXXX;
+    fifo->Tail       = fifo->XXXX;
     return true;
 }
 
 /// @summary Frees resources associated with a SRMW FIFO.
 /// @param fifo The FIFO to delete.
 template <typename T>
-static void delete_srmw_fifo(srmw_fifo_t<T> &fifo)
+static void delete_srmw_fifo(srmw_fifo_t<T> *fifo)
 {   // move all items from the queue to the free list.
-    while (fifo.Head != NULL)
+    while (fifo->Head != NULL)
     {
-        T *old_head = fifo.Head;       // never NULL (will point to XXXX)
-        T *new_head = fifo.Head->Next; // NULL if the queue is now empty
-        srmw_freelist_put( fifo.FreeList, old_head);
-        fifo.Head   = new_head;
+        T *old_head = fifo->Head;       // never NULL (will point to XXXX)
+        T *new_head = fifo->Head->Next; // NULL if the queue is now empty
+        srmw_freelist_put(fifo->FreeList , old_head);
+        fifo->Head  = new_head;
     }
-    delete_srmw_freelist ( fifo.FreeList);
-    pthread_mutex_destroy(&fifo.TailLock);
-    pthread_mutex_destroy(&fifo.HeadLock);
-    fifo.Head   = NULL;
-    fifo.Tail   = NULL;
-    fifo.XXXX   = NULL;
+    delete_srmw_freelist ( fifo->FreeList);
+    pthread_mutex_destroy(&fifo->TailLock);
+    pthread_mutex_destroy(&fifo->HeadLock);
+    fifo->Head   = NULL;
+    fifo->Tail   = NULL;
+    fifo->XXXX   = NULL;
 }
 
 /// @summary Retrieves the next item from the FIFO.
@@ -590,27 +644,27 @@ static void delete_srmw_fifo(srmw_fifo_t<T> &fifo)
 /// @param item On return, the contents of the next item are copied here.
 /// @return true if an item was retrieved.
 template <typename T>
-static bool srmw_fifo_get(srmw_fifo_t<T> &fifo, T &item)
+static bool srmw_fifo_get(srmw_fifo_t<T> *fifo, T &item)
 {
     T  *old_head = NULL;
     T  *new_head = NULL;
     bool  result = false;
-    if (pthread_mutex_lock(&fifo.HeadLock) == 0)
+    if (pthread_mutex_lock(&fifo->HeadLock) == 0)
     {
-        old_head = fifo.Head;       // never NULL (will point to XXXX)
-        new_head = fifo.Head->Next; // NULL if the queue is now empty
-        if (new_head != NULL)
+        old_head = fifo->Head;       // never NULL (will point to XXXX)
+        new_head = fifo->Head->Next; // NULL if the queue is now empty
+        if (new_head  != NULL)
         {   // the queue was not empty (we popped an item)
-            result    = true;
-            fifo.Head = new_head;
+            result     = true;
+            fifo->Head = new_head;
         }
-        pthread_mutex_unlock(&fifo.HeadLock);
+        pthread_mutex_unlock(&fifo->HeadLock);
     }
     if (result)
     {   // if we popped an item, return its node to the free list.
         item = *new_head; // copy the node contents for the caller
         item.Next = NULL; // not necessary, but may as well
-        srmw_freelist_put(fifo.FreeList, old_head);
+        srmw_freelist_put(fifo->FreeList, old_head);
     }
     return result;
 }
@@ -620,17 +674,17 @@ static bool srmw_fifo_get(srmw_fifo_t<T> &fifo, T &item)
 /// @param item The item to enqueue.
 /// @return true if the item was appended to the queue.
 template <typename T>
-static bool srmw_fifo_put(srmw_fifo_t<T> &fifo, T const &item)
+static bool srmw_fifo_put(srmw_fifo_t<T> *fifo, T const &item)
 {
-    T  *node   = srmw_freelist_get(fifo.FreeList);
+    T  *node   = srmw_freelist_get(fifo->FreeList);
     if (node  == NULL) return false;
     *node      = item;
     node->Next = NULL;
-    if (pthread_mutex_lock(&fifo.TailLock) == 0)
+    if (pthread_mutex_lock(&fifo->TailLock) == 0)
     {
-        fifo.Tail->Next = node;
-        fifo.Tail = node;
-        pthread_mutex_unlock(&fifo.TailLock);
+        fifo->Tail->Next = node;
+        fifo->Tail = node;
+        pthread_mutex_unlock(&fifo->TailLock);
     }
     return true;
 }
@@ -1000,7 +1054,7 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
         req.Type,
         0             /* Reserved   */
     };
-    return srsw_fifo_put(aio->CloseResults, res) ? 0 : -1;
+    return srsw_fifo_put(&aio->CloseResults, res) ? 0 : -1;
 }
 
 /// @summary Implements the main loop of the AIO driver using a polling mechanism.
@@ -1064,13 +1118,13 @@ static void aio_tick(aio_state_t *aio, struct timespec *timeout)
                 switch (req.Command)
                 {
                     case AIO_COMMAND_READ:
-                        srsw_fifo_put(aio->ReadResults , res);
+                        srsw_fifo_put(&aio->ReadResults , res);
                         break;
                     case AIO_COMMAND_WRITE:
-                        srsw_fifo_put(aio->WriteResults, res);
+                        srsw_fifo_put(&aio->WriteResults, res);
                         break;
                     case AIO_COMMAND_FLUSH:
-                        srsw_fifo_put(aio->FlushResults, res);
+                        srsw_fifo_put(&aio->FlushResults, res);
                         break;
                     default:
                         break;
@@ -1088,7 +1142,7 @@ static void aio_tick(aio_state_t *aio, struct timespec *timeout)
     while (aio->ActiveCount < AIO_MAX_ACTIVE)
     {   // grab the next request from the queue.
         aio_req_t req;
-        if (srsw_fifo_get(aio->RequestQueue, req) == false)
+        if (srsw_fifo_get(&aio->RequestQueue, req) == false)
         {   // there are no more requests waiting in the queue.
             break;
         }
@@ -1149,10 +1203,10 @@ static int create_aio_state(aio_state_t *aio)
     aio->AIOContext    = io_ctx;
     aio->ActiveCount   = 0;
     aio->IOCBFreeCount = AIO_MAX_ACTIVE;
-    flush_srsw_fifo(aio->RequestQueue);
-    flush_srsw_fifo(aio->ReadResults );
-    flush_srsw_fifo(aio->WriteResults);
-    flush_srsw_fifo(aio->CloseResults);
+    flush_srsw_fifo(&aio->RequestQueue);
+    flush_srsw_fifo(&aio->ReadResults );
+    flush_srsw_fifo(&aio->WriteResults);
+    flush_srsw_fifo(&aio->CloseResults);
     return 0;
 }
 
@@ -1168,10 +1222,10 @@ static void delete_aio_state(aio_state_t *aio)
     aio->AIOContext    = 0;
     aio->ActiveCount   = 0;
     aio->IOCBFreeCount = 0;
-    flush_srsw_fifo(aio->RequestQueue);
-    flush_srsw_fifo(aio->ReadResults );
-    flush_srsw_fifo(aio->WriteResults);
-    flush_srsw_fifo(aio->CloseResults);
+    flush_srsw_fifo(&aio->RequestQueue);
+    flush_srsw_fifo(&aio->ReadResults );
+    flush_srsw_fifo(&aio->WriteResults);
+    flush_srsw_fifo(&aio->CloseResults);
 }
 
 /// @summary Submits a file read request to the AIO pending operation queue.
@@ -1201,7 +1255,7 @@ static bool aio_request_read(aio_state_t *aio, int fd, int efd, int64_t offset, 
     req.AFID       = afid;
     req.Type       = type;
     req.Reserved   = 0;
-    return srsw_fifo_put(aio->RequestQueue, req);
+    return srsw_fifo_put(&aio->RequestQueue, req);
 }
 
 /// @summary Submits a file write request to the AIO pending operation queue.
@@ -1231,7 +1285,7 @@ static bool aio_request_write(aio_state_t *aio, int fd, int efd, int64_t offset,
     req.AFID       = afid;
     req.Type       = type;
     req.Reserved   = 0;
-    return srsw_fifo_put(aio->RequestQueue, req);
+    return srsw_fifo_put(&aio->RequestQueue, req);
 }
 
 /// @summary Submits a file flush request to the AIO pending operation queue.
@@ -1255,7 +1309,7 @@ static bool aio_request_flush(aio_state_t *aio, int fd, int efd, intptr_t afid, 
     req.AFID       = afid;
     req.Type       = type;
     req.Reserved   = 0;
-    return srsw_fifo_put(aio->RequestQueue, req);
+    return srsw_fifo_put(&aio->RequestQueue, req);
 }
 
 /// @summary Submits a file close request to the AIO pending operation queue.
@@ -1279,7 +1333,7 @@ static bool aio_request_close(aio_state_t *aio, int fd, int efd, intptr_t afid, 
     req.AFID       = afid;
     req.Type       = type;
     req.Reserved   = 0;
-    return srsw_fifo_put(aio->RequestQueue, req);
+    return srsw_fifo_put(&aio->RequestQueue, req);
 }
 
 /*////////////////////////
@@ -1296,19 +1350,19 @@ static inline vfs_ofrq_t maken(char const *v)
 int main(int argc, char **argv)
 {
     srmw_fifo_t<vfs_ofrq_t> fifo;
-    create_srmw_fifo(fifo, 100);
-    srmw_fifo_put(fifo, maken("1"));
-    srmw_fifo_put(fifo, maken("2"));
-    srmw_fifo_put(fifo, maken("3"));
-    srmw_fifo_put(fifo, maken("A"));
-    srmw_fifo_put(fifo, maken("B"));
-    srmw_fifo_put(fifo, maken("C"));
+    create_srmw_fifo(&fifo, 100);
+    srmw_fifo_put(&fifo, maken("1"));
+    srmw_fifo_put(&fifo, maken("2"));
+    srmw_fifo_put(&fifo, maken("3"));
+    srmw_fifo_put(&fifo, maken("A"));
+    srmw_fifo_put(&fifo, maken("B"));
+    srmw_fifo_put(&fifo, maken("C"));
     vfs_ofrq_t v;
-    while (srmw_fifo_get(fifo, v))
+    while (srmw_fifo_get(&fifo, v))
     {
         fprintf(stdout, "%s\n", v.Path);
     }
-    delete_srmw_fifo(fifo);
+    delete_srmw_fifo(&fifo);
     aio_poll(NULL);
     exit(EXIT_SUCCESS);
 }
