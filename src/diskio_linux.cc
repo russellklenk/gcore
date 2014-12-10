@@ -1130,35 +1130,156 @@ static inline void aio_poll(aio_state_t *aio)
     aio_tick(aio , &timeout);
 }
 
-struct aio_state_t
+/// @summary Allocates a new AIO context and initializes the AIO state.
+/// @param aio The AIO state to allocate and initialize.
+/// @return 0 if the operation completed successfully; otherwise, the errno value.
+static int create_aio_state(aio_state_t *aio)
 {
-    #define MA         AIO_MAX_ACTIVE
-    aio_requestq_t     RequestQueue; /// The queue for all pending AIO requests.
-    struct iocb        IOCBPool[MA]; /// The static pool of IOCB structures.
-    io_context_t       AIOContext;   /// The kernel AIO context descriptor.
-    size_t             ActiveCount;  /// The number of in-flight AIO requests.
-    aio_req_t          AAIOList[MA]; /// The set of active AIO requests [ActiveCount valid].
-    struct iocb       *IOCBList[MA]; /// The dynamic list of active IOCBs [ActiveCount valid].
-    size_t             IOCBFreeCount;/// The number of available IOCBs.
-    struct iocb       *IOCBFree[MA]; /// The list of available IOCBs [IOCBFreeCount valid].
-    aio_rresultq_t     ReadResults;  /// Queue for completed read  operations.
-    aio_wresultq_t     WriteResults; /// Queue for completed write operations.
-    aio_fresultq_t     FlushResults; /// Queue for completed flush operations.
-    aio_cresultq_t     CloseResults; /// Queue for completed close operations.
-    #undef N
-};
-static bool create_aio_state(aio_state_t *aio)
-{
-    io_context_t aio_ctx = 0;
-    int result = io_setup
+    io_context_t  io_ctx = 0;
+    int result  = io_setup(AIO_MAX_ACTIVE, &io_ctx);
+    if (result != 0)
+    {   // unable to create the AIO context; everything else fails.
+        return -result;
+    }
+    // setup the iocb free list. all items are initially available.
+    for (size_t i = 0, n =  AIO_MAX_ACTIVE; i < n; ++i)
+    {
+        aio->IOCBFree[i] = &aio->IOCBPool[i];
+    }
+    aio->AIOContext    = io_ctx;
+    aio->ActiveCount   = 0;
+    aio->IOCBFreeCount = AIO_MAX_ACTIVE;
     flush_srsw_fifo(aio->RequestQueue);
     flush_srsw_fifo(aio->ReadResults );
     flush_srsw_fifo(aio->WriteResults);
-    flish_srsw_fifo(aio->CloseResults);
+    flush_srsw_fifo(aio->CloseResults);
+    return 0;
 }
 
+/// @summary Cancels all pending AIO operations and frees associated resources.
+/// This call may block until pending operations have completed.
+/// @param aio The AIO state to delete.
 static void delete_aio_state(aio_state_t *aio)
 {
+    if (aio->AIOContext != 0)
+    {
+        io_destroy(aio->AIOContext);
+    }
+    aio->AIOContext    = 0;
+    aio->ActiveCount   = 0;
+    aio->IOCBFreeCount = 0;
+    flush_srsw_fifo(aio->RequestQueue);
+    flush_srsw_fifo(aio->ReadResults );
+    flush_srsw_fifo(aio->WriteResults);
+    flush_srsw_fifo(aio->CloseResults);
+}
+
+/// @summary Submits a file read request to the AIO pending operation queue.
+/// @param aio The AIO context that will be processing the I/O.
+/// @param fd The file descriptor of the file to read from.
+/// @param efd The eventfd file descriptor to associate with the request, or -1.
+/// @param offset The absolute byte offset within the file at which to being reading data.
+/// The caller is responsible for ensuring that alignment requirements are met.
+/// @param amount The maximum number of bytes to read. The caller is responsible for
+/// ensuring that this size meets any alignment requirements (sector size multiple, etc.)
+/// @param iobuf The buffer in which to place data read from the file. The caller is
+/// responsible for ensuring that this buffer meets any alignment requirements.
+/// @param afid The application-defined file ID to pass along to the result.
+/// @param type The file type, one of file_type_e, to pass along to the result.
+/// @return true if the request was accepted.
+static bool aio_request_read(aio_state_t *aio, int fd, int efd, int64_t offset, uint32_t amount, void *iobuf, intptr_t afid, int32_t type)
+{
+    aio_req_t req;
+    req.Command    = AIO_COMMAND_READ;
+    req.Fildes     = fd;
+    req.Eventfd    = efd;
+    req.DataAmount = amount;
+    req.FileOffset = offset;
+    req.DataBuffer = iobuf;
+    req.QTimeNanos = nanotime();
+    req.ATimeNanos = 0;
+    req.AFID       = afid;
+    req.Type       = type;
+    req.Reserved   = 0;
+    return srsw_fifo_put(aio->RequestQueue, req);
+}
+
+/// @summary Submits a file write request to the AIO pending operation queue.
+/// @param aio The AIO context that will be processing the I/O.
+/// @param fd The file descriptor of the file to write to.
+/// @param efd The eventfd file descriptor to associate with the request, or -1.
+/// @param offset The absolute byte offset within the file at which to being writing data.
+/// The caller is responsible for ensuring that alignment requirements are met.
+/// @param amount The number of bytes to write. The caller is responsible for ensuring
+/// that this size meets any alignment requirements (sector size multiple, etc.)
+/// @param iobuf The buffer containing the data to write to the file. The caller is
+/// responsible for ensuring that this buffer meets any alignment requirements.
+/// @param afid The application-defined file ID to pass along to the result.
+/// @param type The file type, one of file_type_e, to pass along to the result.
+/// @return true if the request was accepted.
+static bool aio_request_write(aio_state_t *aio, int fd, int efd, int64_t offset, uint32_t amount, void *iobuf, intptr_t afid, int32_t type)
+{
+    aio_req_t req;
+    req.Command    = AIO_COMMAND_WRITE;
+    req.Fildes     = fd;
+    req.Eventfd    = efd;
+    req.DataAmount = amount;
+    req.FileOffset = offset;
+    req.DataBuffer = iobuf;
+    req.QTimeNanos = nanotime();
+    req.ATimeNanos = 0;
+    req.AFID       = afid;
+    req.Type       = type;
+    req.Reserved   = 0;
+    return srsw_fifo_put(aio->RequestQueue, req);
+}
+
+/// @summary Submits a file flush request to the AIO pending operation queue.
+/// @param aio The AIO context that will be processing the I/O.
+/// @param fd The file descriptor of the file to flush.
+/// @param efd The eventfd file descriptor to associate with the request, or -1.
+/// @param afid The application-defined file ID to pass along to the result.
+/// @param type The file type, one of file_type_e, to pass along to the result.
+/// @return true if the request was accepted.
+static bool aio_request_flush(aio_state_t *aio, int fd, int efd, intptr_t afid, int32_t type)
+{
+    aio_req_t req;
+    req.Command    = AIO_COMMAND_FLUSH;
+    req.Fildes     = fd;
+    req.Eventfd    = efd;
+    req.DataAmount = 0;
+    req.FileOffset = 0;
+    req.DataBuffer = 0;
+    req.QTimeNanos = nanotime();
+    req.ATimeNanos = 0;
+    req.AFID       = afid;
+    req.Type       = type;
+    req.Reserved   = 0;
+    return srsw_fifo_put(aio->RequestQueue, req);
+}
+
+/// @summary Submits a file close request to the AIO pending operation queue.
+/// @param aio The AIO context that will be processing the I/O.
+/// @param fd The file descriptor of the file to close.
+/// @param efd The eventfd file descriptor to associate with the request, or -1.
+/// @param afid The application-defined file ID to pass along to the result.
+/// @param type The file type, one of file_type_e, to pass along to the result.
+/// @return true if the request was accepted.
+static bool aio_request_close(aio_state_t *aio, int fd, int efd, intptr_t afid, int32_t type)
+{
+    aio_req_t req;
+    req.Command    = AIO_COMMAND_CLOSE;
+    req.Fildes     = fd;
+    req.Eventfd    = efd;
+    req.DataAmount = 0;
+    req.FileOffset = 0;
+    req.DataBuffer = 0;
+    req.QTimeNanos = nanotime();
+    req.ATimeNanos = 0;
+    req.AFID       = afid;
+    req.Type       = type;
+    req.Reserved   = 0;
+    return srsw_fifo_put(aio->RequestQueue, req);
 }
 
 /*////////////////////////
