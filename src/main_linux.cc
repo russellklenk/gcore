@@ -275,7 +275,7 @@ static inline bool create_srsw_fifo(srsw_fifo_t<T> *fifo, uint32_t capacity)
     {
         srsw_flq_clear(fifo->Queue, capacity);
         fifo->Store = (T*) malloc(capacity * sizeof(T));
-        return true;
+        return (fifo->Store != NULL);
     }
     else return false;
 }
@@ -780,25 +780,96 @@ static void close_file_raw(int &fd, int &efd)
 
 struct aio_file_t
 {
-    int          Fildes;                    // the raw file descriptor
-    int          Eventfd;                   // the eventfd for the file
-    int64_t      FileSize;                  // the file size, in bytes
-    size_t       SectorSize;                // the physical sector size, in bytes
+    int          Fildes;                     /// the raw file descriptor
+    int          Eventfd;                    /// the eventfd for the file
+    int64_t      FileSize;                   /// the file size, in bytes
+    size_t       SectorSize;                 /// the physical sector size, in bytes
+    int32_t      FileType;                   /// one of file_type_e.
 };
+
+struct aio_open_t
+{
+    char        *Path;                       /// the file path, copied using strdup.
+    intptr_t     FileId;                     /// application-defined file identifier.
+    int32_t      FileType;                   /// one of file_type_e.
+};
+
+struct aio_close_t
+{
+    intptr_t     FileId;                     /// application-defined file identfier.
+    int32_t      FileType;                   /// one of file_type_e.
+};
+
+struct aio_error_t
+{
+    intptr_t     FileId;                     /// application-defined file identifier.
+    int32_t      FileType;                   /// one of file_type_e.
+    int64_t      FileOffset;                 /// absolute offset of start of operation, or 0.
+    uint32_t     DataAmount;                 /// the number of bytes being read or written.
+    int          OSError;                    /// the errno value.
+    char const  *Message;                    /// pointer to string literal.
+};
+
+struct aio_read_t
+{
+    intptr_t     FileId;                     /// application-defined file identifier.
+    int32_t      FileType;                   /// one of file_type_e.
+    int64_t      FileOffset;                 /// absolute offset of start of read.
+    uint32_t     ReadAmount;                 /// the number of bytes to read.
+    void        *TargetBuffer;               /// buffer where data will be written.
+    ptrdiff_t    TargetOffset;               /// byte offset within target buffer.
+};
+
+struct aio_return_t
+{
+    void        *TargetBuffer;               /// the buffer being returned.
+};
+
+typedef srsw_fifo_t<aio_open_t>      aio_openq_t;
+typedef srsw_fifo_t<aio_close_t>     aio_closeq_t;
+typedef srsw_fifo_t<aio_error_t>     aio_errorq_t;
+typedef srsw_fifo_t<aio_read_t>      aio_readq_t;
+typedef srsw_fifo_t<aio_return_t>    aio_returnq_t;
 
 struct aio_state_t
 {
-    int          EpollId;                    // epoll queue file descriptor
-    io_context_t AIOContext;                 // kernel aio context information
-    size_t       ActiveCount;                // the number of currently active files
-    intptr_t     FileId  [MAX_ACTIVE_FILES]; // app_ids for each active file [ActiveCount]
-    aio_file_t   FileData[MAX_ACTIVE_FILES]; // constant info for the life of the file [ActiveCount]
-    struct iocb  IOCBPool[MAX_ACTIVE_FILES]; // pool of aio operation descriptors [ActiveCount]
+    int               EpollId;                    /// epoll queue file descriptor
+    io_context_t      AIOContext;                 /// kernel aio context information
+    iobuf_allocator_t Allocator;
+
+    size_t            ActiveCount;                /// the number of currently active files
+    intptr_t          FileId  [MAX_ACTIVE_FILES]; /// app_ids for each active file [ActiveCount]
+    aio_file_t        FileData[MAX_ACTIVE_FILES]; /// constant info for the life of the file [ActiveCount]
+
+    struct iocb       IOCBPool[MAX_ACTIVE_FILES]; /// pool of aio operation descriptors
+    struct iocb      *IOCBFree[MAX_ACTIVE_FILES]; /// free list of aio operation descriptors [FreeIOCBCount]
+    size_t            FreeIOCBCount;              /// the number of items in IOCBFree
+
+    aio_openq_t       OpenQueue;                  /// A I/O is writer, P I/O is reader
+    aio_closeq_t      CloseQueue;                 /// A I/O is writer, P I/O is reader
+    aio_errorq_t      ErrorQueue;                 /// P I/O is writer, P I/O is reader
 };
+
+static void init_aio_read(aio_read_t *read)
+{
+    read->FileId       = INVALID_ID;
+    read->FileType     = FILE_TYPE_COUNT;
+    read->FileOffset   = 0;
+    read->ReadAmount   = 0;
+    read->TargetBuffer = NULL;
+    read->TargetOffset = 0;
+}
+
+static aio_readq_t* find_readq(intptr_t file_id)
+{
+}
 
 static bool init_aio_state(aio_state_t *aio)
 {
+    aio_openq_t  openq;
+    aio_closeq_t closeq;
     io_context_t aio_ctx = 0;
+    size_t const ntypes  = sizeof(FILE_TYPE_LIST) / sizeof(FILE_TYPE_LIST[0]);
     int result   = -1;
     int epollfd  =  epoll_create1(0);
     if (epollfd !=  0)
@@ -814,6 +885,8 @@ static bool init_aio_state(aio_state_t *aio)
     {   // unable to create the AIO context.
         goto error_cleanup;
     }
+
+    // create the various queues.
 
     // initialize the aio state instance.
     aio->EpollId      = epollfd;
@@ -839,16 +912,42 @@ static bool init_aio_state(aio_state_t *aio)
         aio->IOCBPool[i].u.c.nbytes     = 0;
         aio->IOCBPool[i].u.c.offset     = 0;
     }
+    for (size_t i = 0 , n = MAX_ACTIVE_FILES; i < n; ++i)
+    {
+        aio->IOCBFree[i]  = &aio->IOCBPool[i];
+    }
+    aio->FreeIOCBCount    = MAX_ACTIVE_FILES;
 
     return true;
 
 error_cleanup:
-    if (epollfd != 0) close(epollfd);
-    aio->EpollId      = -1;
-    aio->AIOContext   =  0;
-    aio->ActiveCount  =  0;
+    if (epollfd != 0)  close(epollfd);
+    aio->EpollId       = -1;
+    aio->AIOContext    =  0;
+    aio->ActiveCount   =  0;
+    aio->FreeIOCBCount =  0;
     return false;
     return false;
+}
+
+/// @summary Allocates an AIO state structure from the free list.
+/// @param aio The AIO state managing the IOCB pool to allocate from.
+/// @return A pointer to the IOCB request structure.
+static inline struct iocb* iocb_get(aio_state_t *aio)
+{
+    assert(aio->FreeIOCBCount  > 0);
+    return aio->IOCBFree[--aio->FreeIOCBCount];
+}
+
+/// @summary Returns an IOCB request structure to the free list. This must only
+/// be performed after the request has fully completed.
+/// @param aio The AIO state managing the IOCB pool.
+/// @param iocb The IOCB request structure to return to the free list.
+static inline void iocb_put(aio_state_t *aio, struct iocb *iocb)
+{
+    assert(iocb != NULL);
+    assert(aio->FreeIOCBCount < MAX_ACTIVE_FILES);
+    aio->IOCBFree[aio->FreeIOCBCount++] = iocb;
 }
 
 // 1. Create the AIO context using io_setup(MAX_ACTIVE_FILES, io_context_t *out)

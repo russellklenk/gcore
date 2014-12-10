@@ -17,13 +17,15 @@
 /////////////////*/
 /// @summary Define the set of known file types. When adding a file type, also
 /// be sure to add a function pointer entry for the io_callbacks_t structure.
+/// These values MUST start at 0, and must be sequential. FILE_TYPE_COUNT must
+/// be the last item in the enum definition.
 enum file_type_e
 {
-    FILE_TYPE_DDS         = 0,
-    FILE_TYPE_TGA         = 1,
-    FILE_TYPE_WAV         = 2,
-    FILE_TYPE_JSON        = 3,
-    FILE_TYPE_FORCE_32BIT = 0x7FFFFFFFL
+    FILE_TYPE_DDS   = 0,
+    FILE_TYPE_TGA,
+    FILE_TYPE_WAV,
+    FILE_TYPE_JSON,
+    FILE_TYPE_COUNT
 };
 
 /// @summary The sentinal value representing an invalid file ID. Applications
