@@ -1881,47 +1881,46 @@ static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 {
     if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
 }
-/*struct vfs_state_t
+
+/// @summary Initialize a VFS driver state object and allocate any I/O resources.
+/// @param vfs The VFS driver state to initialize.
+/// @return true if the VFS driver state is initialized.
+static bool create_vfs_state(vfs_state_t *vfs)
+{   // TODO: some error handling would be nice.
+    create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
+    create_srmw_fifo(&vfs->CloseQueue, 10); // TODO: figure out capacity
+    create_srmw_fifo(&vfs->LoadQueue , 10); // TODO: figure out capacity
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        flush_srsw_fifo(&vfs->IoResult[i]);
+        flush_srsw_fifo(&vfs->IoReturn[i]);
+    }
+    io_opq_clear(&vfs->IoOperations);
+    vfs->ActiveCount = 0;
+    return true;
+}
+
+/// @summary Free resources associated with a VFS driver state.
+/// @param vfs The VFS driver state to delete.
+static void delete_vfs_state(vfs_state_t *vfs)
 {
-    #define MF         MAX_OPEN_FILES
-    #define NT         FILE_TYPE_COUNT
-    vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
-    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
-    iobuf_alloc_t      IoAllocator;  /// The I/O buffer allocator.
-    size_t             ActiveCount;  /// The number of open files.
-    intptr_t           FileAFID[MF]; /// An application-defined ID for each active file.
-    int32_t            FileType[MF]; /// One of file_mode_e for each active file.
-    int32_t            FileMode[MF]; /// One of vfs_mode_e for each active file.
-    uint32_t           Priority[MF]; /// The access priority for each active file.
-    int64_t            RdOffset[MF]; /// The current read offset for each active file.
-    vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
-    vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
-    vfs_resultq_t      IoResult[NT]; /// The per-file type queue for I/O results.
-    vfs_returnq_t      IoReturn[NT]; /// The per-file type queue for I/O buffer returns.
-    #undef NT
-    #undef MF
-};*/
-// need one srsw_fifo_t<void*> for each file_type_e to be buffer return queues.
-// need one srsw_fifo_t<aio_res_t> for each file_type_e.
-// when processing completions:
-// aio_res_t res;
-// while (srsw_fifo_get(&aio->QueueName, res))
-// {
-//     // perform any processing required by VFS here.
-//     // get the srsw_fifo_t<vfs_res_t> for the file type, res.Type.
-//     // push res onto the type FIFO. the platform layer will decide
-//     // where to process the queue for that type.
-// }
-// Each aio_res_t is 72 bytes currently. Each type queue needs to be at least
-// 2x the maximum number of pending AIO ops (=1024 items) to hopefully avoid
-// any potential overflows; this would only be enough for 32MB of data transfer.
-// at 72 bytes/entry, each queue is slightly larger than 72KB. this overhead
-// seems acceptable, of course the number of entries can be adjusted for lower
-// end systems.
+    vfs->ActiveCount = 0;
+    io_opq_clear(&vfs->IoOperations);
+    delete_srmw_fifo(&vfs->LoadQueue);
+    delete_srmw_fifo(&vfs->CloseQueue);
+    delete_iobuf_allocator(vfs->IoAllocator);
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        flush_srsw_fifo(&vfs->IoResult[i]);
+        flush_srsw_fifo(&vfs->IoReturn[i]);
+    }
+}
 
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+static aio_state_t AIO_STATE;
+static vfs_state_t VFS_STATE;
 /// @summary Queues a file for loading. The file is read from beginning to end and
 /// data is returned to the application on the thread appropriate for the given type.
 /// @param path The NULL-terminated UTF-8 path of the file to load.
@@ -1963,8 +1962,58 @@ bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t pr
     }
 }
 
+/// @summary Closes a file explicitly opened for reading or writing.
+/// @param id The application-defined identifier associated with the file.
+/// @return true if the close request was successfuly queued.
+bool platform_close_file(intptr_t id)
+{
+    vfs_cfreq_t req;
+    req.Next = NULL;
+    req.AFID = id;
+    return srmw_fifo_put(&VFS_STATE.CloseQueue, req);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc < 1)
+    {
+        fprintf(stdout, "USAGE: a.out path\n");
+        exit(EXIT_FAILURE);
+    }
+    create_aio_state(&AIO_STATE); // return 0 on success
+    create_vfs_state(&VFS_STATE); // return true on success (yuck)
+
+    int64_t offset    = 0;
+    int64_t file_size = 0;
+    if (!platform_load_file(argv[1], 0, 0, 0, file_size))
+    {
+        fprintf(stdout, "ERROR: Cannot load file %s\n", argv[1]);
+        goto cleanup;
+    }
+
+    while (offset < file_size)
+    {
+        vfs_tick(&VFS_STATE, &AIO_STATE);
+        aio_poll(&AIO_STATE);
+
+        // now poll the read results queue.
+        vfs_res_t res;
+        while (srsw_fifo_get(&VFS_STATE.IoResult[0], res))
+        {
+            // normally we'd send this to a callback. print it for now!
+            char *ptr = (char*) res.DataBuffer;
+            for (uint32_t i = 0; i < res.DataAmount; ++i)
+            {
+                fputc(*ptr++, stdout);
+            }
+            vfs_return_buffer(&VFS_STATE, 0, res.DataBuffer);
+            offset += res.DataAmount;
+        }
+    }
+
+cleanup:
+    delete_aio_state(&AIO_STATE);
+    delete_vfs_state(&VFS_STATE);
     exit(EXIT_SUCCESS);
 }
 
