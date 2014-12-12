@@ -64,19 +64,44 @@
 /// The scale used to convert from seconds into nanoseconds.
 static uint64_t const SEC_TO_NANOSEC = 1000000000ULL;
 
+/// @summary Define the number of times per-second we want the I/O system to
+/// update (assuming it's on a background thread and we have that control).
+/// The lower the update rate of the I/O system, the more latency there is in
+/// processing and completing I/O requests, and the lower the I/O thoroughput.
+static size_t   const IO_SYSTEM_RATE = 60;
+
 /// @summary Define the maximum number of concurrently open files.
 static size_t   const MAX_OPEN_FILES = 128;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
-static size_t   const AIO_MAX_ACTIVE = 128;
+/// We set this based on what the maximum number of AIO operations we want to
+/// poll during each tick, and the maximum number the underlying OS can handle.
+/// TODO: Make this overridable at compile time.
+static size_t   const AIO_MAX_ACTIVE = 512;
+
+/// @summary Define the size of the I/O buffer. This is calculated based on an
+/// maximum I/O transfer rate of 960MB/s, and an I/O system tick rate of 60Hz;
+/// 960MB/sec divided across 60 ticks/sec gives 16MB/tick maximum transfer rate.
+/// TODO: Make this overridable at compile time.
+static size_t   const VFS_IOBUF_SIZE = 16 * 1024 * 1024;
+
+/// @summary Define the size of the buffer allocated for each I/O request.
+static size_t   const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
 
 /// @summary Define the supported AIO commands.
 enum aio_command_e
 {
-    AIO_COMMAND_READ     = 0,
-    AIO_COMMAND_WRITE    = 1,
-    AIO_COMMAND_FLUSH    = 2,
-    AIO_COMMAND_CLOSE    = 3,
+    AIO_COMMAND_READ     = 0, /// Data should be read from the file.
+    AIO_COMMAND_WRITE    = 1, /// Data should be written to the file.
+    AIO_COMMAND_FLUSH    = 2, /// Any pending writes should be flushed to disk.
+    AIO_COMMAND_CLOSE    = 3, /// The file should be closed.
+};
+
+/// @summary Define the supported VFS access modes for a file.
+enum vfs_mode_e
+{
+    READ_LOAD            = 0, /// The file is being loaded entirely and then closed.
+    READ_EXPLICIT        = 1, /// The file reads are controlled by the user.
 };
 
 /*///////////////////
@@ -144,7 +169,7 @@ struct iobuf_alloc_t
 {
     size_t             TotalSize;    /// The total number of bytes allocated.
     size_t             PageSize;     /// The size of a single page, in bytes.
-    size_t             AllocSize;    /// The number of pages per-allocation.
+    size_t             AllocSize;    /// The size of a single allocation, in bytes.
     void              *BaseAddress;  /// The base address of the committed range.
     size_t             FreeCount;    /// The number of unallocated AllocSize blocks.
     void             **FreeList;     /// Pointers to the start of each unallocated block.
@@ -214,15 +239,19 @@ struct aio_state_t
     #undef MA
 };
 
-/// @summary Defines the data associated with a file open request passed to the
+/// @summary Defines the data associated with a file load request passed to the
 /// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_ofreq_t
+struct vfs_lfreq_t
 {
-    vfs_ofreq_t       *Next;         /// Pointer to the next node in the queue.
+    vfs_lfreq_t       *Next;         /// Pointer to the next node in the queue.
+    int                Fildes;       /// The file descriptor of the opened file.
+    int                Eventfd;      /// The eventfd descriptor of the opened file.
+    int64_t            DataSize;     /// The logical size of the file, in bytes.
+    int64_t            FileSize;     /// The physical size of the file, in bytes.
     intptr_t           AFID;         /// The application-defined ID for the file.
-    char              *Path;         /// The file path, allocated with strdup.
     int32_t            Type;         /// The file type, one of file_type_e.
-    int32_t            Priority;     /// The file access priority (0 = highest).
+    uint32_t           Priority;     /// The file access priority (0 = highest).
+    size_t             SectorSize;   /// The physical sector size of the disk.
 };
 
 /// @summary Defines the data associated with a file close request passed to the
@@ -231,43 +260,46 @@ struct vfs_cfreq_t
 {
     vfs_cfreq_t       *Next;         /// Pointer to the next node in the queue.
     intptr_t           AFID;         /// The application-defined ID for the file.
-    int32_t            Type;         /// The file type, one of file_type_e.
 };
 
-/// @summary Defines the data associated with a file read request passed to the
-/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_rfreq_t
-{
-    vfs_rfreq_t       *Next;         /// Pointer to the next node in the queue.
-    int64_t            Offset;       /// The byte offset at which to begin reading.
-    intptr_t           AFID;         /// The application-defined ID for the file.
-    int32_t            Type;         /// The file type, one of file_type_e.
-    uint32_t           Amount;       /// The number of bytes being requested.
-};
-
-/// @summary Defines the data associated with a file load request passed to the
-/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_lfreq_t
-{
-    vfs_lfreq_t       *Next;         /// Pointer to the next node in the queue.
-    intptr_t           AFID;         /// The application-defined ID for the file.
-    char              *Path;         /// The file path, allocated with strdup.
-    int32_t            Type;         /// The file type, one of file_type_e.
-    int32_t            Priority;     /// The file access priority (0 = highest).
-};
-
-typedef srmw_fifo_t<vfs_ofreq_t>     vfs_ofq_t; /// Open file request queue.
-typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t; /// Close file request queue.
-typedef srmw_fifo_t<vfs_rfreq_t>     vfs_rfq_t; /// Read file request queue.
 typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t; /// Load file request queue.
+typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t; /// Close file request queue.
 
 /// @summary Information that remains constant from the point that a file is opened for reading.
 struct vfs_fdinfo_t
 {
     int                Fildes;       /// The file descriptor for the file.
     int                Eventfd;      /// The eventfd descriptor for the file, or -1.
-    int64_t            FileSize;     /// The current logical file size, in bytes.
+    int64_t            FileSize;     /// The physical file size, in bytes.
+    int64_t            DataSize;     /// The file size after any size-changing transforms.
+    int64_t            FileOffset;   /// The absolute byte offset of the start of the file data.
     size_t             SectorSize;   /// The disk physical sector size, in bytes.
+};
+
+/// @summary Defines the data associated with a priority queue of pending AIO operations.
+/// TODO: Determine if 32-bits for the insertion ID is enough. This would be enough for
+/// 128TB of data, which if you were streaming 32KB chunks continuously at 980MB/sec, is
+/// enough for ~39 hours before the counter wraps around.
+struct vfs_io_opq_t
+{
+    #define MO         AIO_MAX_ACTIVE
+    int32_t            Count;        /// The number of items in the queue.
+    uint32_t           InsertionId;  /// The counter for tagging each AIO request.
+    uint32_t           Priority[MO]; /// The priority value for each item.
+    uint32_t           InsertId[MO]; /// The inserion order value for each item.
+    aio_req_t          Request [MO]; /// The populated AIO request for each item.
+    #undef MO
+};
+
+/// @summary Defines the data associated with a priority queue of files. This queue
+/// is used to determine which files get a chance to submit I/O operations.
+struct vfs_io_fpq_t
+{
+    #define MF         MAX_OPEN_FILES
+    int32_t            Count;        /// The number of items in the queue.
+    uint32_t           Priority;     /// The priority value for each file.
+    uint16_t           RecIndex[MF]; /// The index of the file record.
+    #undef MF
 };
 
 /// @summary Defines the state data maintained by a VFS driver instance.
@@ -275,14 +307,15 @@ struct vfs_state_t
 {
     #define MF         MAX_OPEN_FILES
     #define NT         FILE_TYPE_COUNT
-    vfs_ofq_t          OpenQueue;    /// The queue for open file requests.
-    vfs_rfq_t          ReadQueue;    /// The queue for file segment read requests.
-    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
     vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
+    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
     size_t             ActiveCount;  /// The number of open files.
-    intptr_t           AFIDList[MF]; /// The list of application-defined file IDs.
-    int32_t            TypeList[MF]; /// The list of file types for each file.
-    vfs_fdinfo_t       InfoList[MF]; /// The list of base file info for each file.
+    intptr_t           FileAFID[MF]; /// An application-defined ID for each active file.
+    int32_t            FileType[MF]; /// One of file_mode_e for each active file.
+    int32_t            FileMode[MF]; /// One of vfs_mode_e for each active file.
+    uint32_t           Priority[MF]; /// The access priority for each active file.
+    vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
+    vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
     #undef NT
     #undef MF
 };
@@ -822,6 +855,251 @@ static inline size_t iobuf_buffers_used(iobuf_alloc_t const &alloc)
     return (nallocs - nunused);
 }
 
+/// @summary Perform a comparison between two elements in an I/O operation priority queue.
+/// @param pq The I/O operation priority queue.
+/// @param priority The priority of the item being inserted.
+/// @param idx The zero-based index of the item in the queue to compare against.
+/// @return -1 if item a should appear before item b, +1 if item a should appear after item b.
+static inline int io_opq_cmp_put(vfs_io_opq_t const *pq, uint32_t priority, int32_t idx)
+{   // when inserting, the new item is always ordered after the existing item
+    // if the priority values of the two items are the same.
+    uint32_t const p_a  = priority;
+    uint32_t const p_b  = pq->Priority[idx];
+    return ((p_a < p_b) ? -1 : +1);
+}
+
+/// @summary Perform a comparison between two elements in an I/O operation priority queue.
+/// @param pq The I/O operation priority queue.
+/// @param a The zero-based index of the first element.
+/// @param b The zero-based index of the second element.
+/// @return -1 if item a should appear before item b, +1 if item a should appear after item b.
+static inline int io_opq_cmp_get(vfs_io_opq_t const *pq, int32_t a, int32_t b)
+{   // first order by priority. if priority is equal, the operations should
+    // appear in the order they were inserted into the queue.
+    uint32_t const p_a  = pq->Priority[a];
+    uint32_t const p_b  = pq->Priority[b];
+    uint32_t const i_a  = pq->InsertId[a];
+    uint32_t const i_b  = pq->InsertId[b];
+    if (p_a < p_b) return -1;
+    if (p_a > p_b) return +1;
+    if (i_a < i_b) return -1;
+    else           return +1; // i_a > i_b; i_a can never equal i_b.
+}
+
+/// @summary Resets a I/O operation priority queue to empty.
+/// @param pq The priority queue to clear.
+static void io_opq_clear(vfs_io_opq_t *pq)
+{
+    pq->Count = 0;
+}
+
+/// @summary Attempts to insert an I/O operation in the priority queue.
+/// @param pq The I/O operation priority queue to update.
+/// @param priority The priority value associated with the item being inserted.
+/// @return The AIO request to populate, or NULL if the queue is full.
+static aio_req_t* io_opq_put(vfs_io_opq_t *pq, uint32_t priority)
+{   // note that the InsertionId counter is enough to represent the transfer
+    // of 128TB of data (at 32KB/request) which is enough for ~39 hours of
+    // constant streaming at a rate of 980MB/s before the counter wraps around.
+    if (pq->Count < AIO_MAX_ACTIVE)
+    {   // there's room in the queue for this operation.
+        int32_t pos = pq->Count++;
+        int32_t idx =(pos - 1) / 2;
+        while  (pos > 0 && io_opq_cmp_put(pq, priority, idx) < 0)
+        {
+            pq->Priority[pos] = pq->Priority[idx];
+            pq->InsertId[pos] = pq->InsertId[idx];
+            pq->Request [pos] = pq->Request [idx];
+            pos = idx;
+            idx =(idx - 1) / 2;
+        }
+        pq->Priority[pos] = priority;
+        pq->InsertId[pos] = pq->InsertionId++;
+        return &pq->Request[pos];
+    }
+    else return NULL;
+}
+
+/// @summary Retrieves the highest priority pending AIO operation without removing it from the queue.
+/// @param pq The I/O operation priority queue to update.
+/// @param request On return, the AIO request is copied to this location.
+/// @return true if an operation was retrieved for false if the queue is empty.
+static inline bool io_opq_top(vfs_io_opq_t *pq, aio_req_t &request)
+{
+    if (pq->Count > 0)
+    {   // the highest-priority operation is located at index 0.
+        request = pq->Request[0];
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Retrieves the highest priority pending AIO operation.
+/// @param pq The I/O operation priority queue to update.
+/// @param request On return, the AIO request is copied to this location.
+/// @return true if an operation was retrieved, or false if the queue is empty.
+static bool io_opq_get(vfs_io_opq_t *pq, aio_req_t &request)
+{
+    if (pq->Count > 0)
+    {   // the highest-priority operation is located at index 0.
+        request = pq->Request[0];
+
+        // swap the last item into the position vacated by the first item.
+        int32_t       n  = pq->Count - 1;
+        pq->Priority[0]  = pq->Priority[n];
+        pq->InsertId[0]  = pq->InsertId[n];
+        pq->Request [0]  = pq->Request [n];
+        pq->Count        = n;
+
+        // now re-heapify and restore the heap order.
+        int32_t pos = 0;
+        for ( ; ; )
+        {
+            int32_t l = (2 * pos) + 1; // left child
+            int32_t r = (2 * pos) + 2; // right child
+            int32_t m; // the child with the lowest frequency.
+
+            // determine the child node with the lowest frequency.
+            if  (l >= n) break; // node at pos has no children.
+            if  (r >= n) m = l; // node at pos has no right child.
+            else m  = io_opq_cmp_get(pq, l, r) < 0 ? l : r;
+
+            // now compare the node at pos with the highest priority child, m.
+            if (io_opq_cmp_get(pq, pos, m) < 0)
+            {   // children have lower priority than parent. order restored.
+                break;
+            }
+
+            // swap the parent with the largest child.
+            uint32_t  temp_p     = pq->Priority[pos];
+            uint32_t  temp_i     = pq->InsertId[pos];
+            aio_req_t temp_r     = pq->Request [pos];
+            pq->Priority[pos]    = pq->Priority[m];
+            pq->InsertId[pos]    = pq->InsertId[m];
+            pq->Request [pos]    = pq->Request [m];
+            pq->Priority[m]      = temp_p;
+            pq->InsertId[m]      = temp_i;
+            pq->Request [m]      = temp_r;
+            pos = m;
+        }
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Resets a file priority queue to empty.
+/// @param pq The priority queue to clear.
+static void io_fpq_clear(vfs_io_fpq_t *pq)
+{
+    pq->Count = 0;
+}
+
+/// @summary Attempts to insert a file into the file priority queue.
+/// @param pq The priority queue to update.
+/// @param priority The priority value associated with the item being inserted.
+/// @param index The zero-based index of the file record being inserted.
+/// @return true if the item was inserted in the queue, or false if the queue is full.
+static bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
+{
+    if (pq->Count < MAX_OPEN_FILES)
+    {   // there's room in the queue for this operation.
+        int32_t pos = pq->Count++;
+        int32_t idx =(pos - 1) / 2;
+        while  (pos > 0 && priority < pq->Priority[idx])
+        {
+            pq->Priority[pos] = pq->Priority[idx];
+            pq->RecIndex[pos] = pq->RecIndex[idx];
+            pos = idx;
+            idx =(idx - 1) / 2;
+        }
+        pq->Priority[pos] = priority;
+        pq->RecIndex[pos] = index;
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Retrieves the highest priority active file.
+/// @param pq The priority queue to update.
+/// @param index On return, this location is updated with the file record index.
+/// @param priority On return, this location is updated with the file priority.
+/// @return true if a file was retrieved, or false if the queue is empty.
+static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
+{
+    if (pq->Count > 0)
+    {   // the highest-priority operation is located at index 0.
+        priority  = pq->Priority[0];
+        index     = pq->RecIndex[0];
+
+        // swap the last item into the position vacated by the first item.
+        int32_t       n  = pq->Count - 1;
+        pq->Priority[0]  = pq->Priority[n];
+        pq->RecIndex[0]  = pq->RecIndex[n];
+        pq->Count        = n;
+
+        // now re-heapify and restore the heap order.
+        int32_t pos = 0;
+        for ( ; ; )
+        {
+            int32_t l = (2 * pos) + 1; // left child
+            int32_t r = (2 * pos) + 2; // right child
+            int32_t m; // the child with the lowest frequency.
+
+            // determine the child node with the lowest frequency.
+            if  (l >= n) break; // node at pos has no children.
+            if  (r >= n) m = l; // node at pos has no right child.
+            else m  = pq->Priority[l] < pq->Priority[r] ? l : r;
+
+            // now compare the node at pos with the highest priority child, m.
+            if (pq->Priority[pos] < pq->Priority[m] < 0)
+            {   // children have lower priority than parent. order restored.
+                break;
+            }
+
+            // swap the parent with the largest child.
+            uint32_t temp_p   = pq->Priority[pos];
+            uint16_t temp_i   = pq->RecIndex[pos];
+            pq->Priority[pos] = pq->Priority[m];
+            pq->RecIndex[pos] = pq->RecIndex[m];
+            pq->Priority[m]   = temp_p;
+            pq->RecIndex[m]   = temp_i;
+            pos = m;
+        }
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Builds a list of record indices for all files with a given mode.
+/// @param list The output record index array of MAX_OPEN_FILES items.
+/// @param vfs The VFS driver state maintaining the input file list.
+/// @param mode One of vfs_mode_e indicating the filter mode.
+/// @return The number of files in the output list.
+static size_t map_files_by_mode(uint16_t *list, vfs_state_t const *vfs, int32_t mode)
+{
+    size_t         nfilter = 0;
+    uint16_t const nactive = uint16_t(vfs->ActiveCount);
+    for (uint16_t i = 0; i < nactive; ++i)
+    {
+        if (vfs->FileMode[i] == mode)
+            list[nfilter++]   = i;
+    }
+    return nfilter;
+}
+
+/// @summary Builds a file priority queue for a file index list.
+/// @param pq The priority queue to populate. Existing contents are overwritten.
+/// @param vfs The VFS driver state maintaining the active file information.
+/// @param list The list of input file record indices.
+/// @param n The number of elements in the file record index list.
+static void build_file_queue(vfs_io_fpq_t *pq, vfs_state_t const *vfs, uint16_t *list, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+    {
+        io_fpq_put(pq, vfs->Priority[list[i]], list[i]);
+    }
+}
+
 /// @summary Synchronously opens a file, creates an eventfd, and retrieves
 /// various information about the file.
 /// @param path The path of the file to open.
@@ -1336,34 +1614,323 @@ static bool aio_request_close(aio_state_t *aio, int fd, int efd, intptr_t afid, 
     return srsw_fifo_put(&aio->RequestQueue, req);
 }
 
+/// @summary Determine whether a path references a file within an archive, (and
+/// if so, which one) or whether it references a native file. Open the file if
+/// necessary, and return basic file information to the caller. This function
+/// should only be used for read-only files, files cannot be written in an archive.
+/// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param fd On return, stores the file descriptor of the archive or native file.
+/// @param efd On return, stores the eventfd descriptor of the archive or native file.
+/// @param lsize On return, stores the logical size of the file, in bytes. This is the
+/// size of the file after all size-changing transformations (decompression) is performed.
+/// For native files, the logical and physical file size are the same.
+/// @param psize On return, stores the physical size of the file, in bytes. This is the
+/// corresponds to the number of bytes that must be read to read all file data on disk.
+/// For native files, the logical  and physical file size are the same.
+/// @param offset On return, stores the byte offset of the first byte of the file.
+/// @param sector_size On return, stores the physical sector size of the disk.
+/// @return true if the file could be resolved.
+static bool vfs_resolve_file(char const *path, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+{
+    // TODO: determine whether this path references a file contained within an archive.
+    // for now, we only handle native file paths, which may be absolute or relative.
+    bool native_path = true;
+    if  (native_path)
+    {
+        int flags = O_RDONLY | O_LARGEFILE | O_DIRECT;
+        if (open_file_raw(path, flags, fd, efd, psize, sector_size))
+        {   // native files always begin at the first byte.
+            // logical and physical size are the same.
+            lsize  = psize;
+            offset = 0;
+            return true;
+        }
+        else
+        {   // unable to open the file, so fail immediately.
+            fd = efd = -1; lsize = psize = offset = sector_size = 0;
+            return false;
+        }
+    }
+}
+
+/// @summary Processes queued file load operations.
+/// @param vfs The VFS driver state.
+static void vfs_process_loads(vfs_state_t *vfs)
+{
+    while (vfs->ActiveCount < MAX_OPEN_FILES)
+    {
+        vfs_lfreq_t   req;
+        if (srmw_fifo_get(&vfs->LoadQueue, req) == false)
+        {   // there are no pending loads, so we're done.
+            break;
+        }
+
+        // the file is already open; it was opened during platform_load_file().
+        // all we need to do is update our internal active file list.
+        size_t index = vfs->ActiveCount++;
+        vfs->FileAFID[index]            = req.AFID;
+        vfs->FileType[index]            = req.Type;
+        vfs->FileMode[index]            = READ_LOAD;
+        vfs->Priority[index]            = req.Priority;
+        vfs->RdOffset[index]            = 0;  // the *relative* offset
+        vfs->FileInfo[index].Fildes     = req.Fildes;
+        vfs->FileInfo[index].Eventfd    = req.Eventfd;
+        vfs->FileInfo[index].FileSize   = req.FileSize;
+        vfs->FileInfo[index].DataSize   = req.DataSize;
+        vfs->FileInfo[index].FileOffset = req.FileOffset;
+        vfs->FileInfo[index].SectorSize = req.SectorSize;
+    }
+}
+
+/// @summary Processes any pending file close requests.
+/// @param vfs The VFS driver state.
+static void vfs_process_closes(vfs_state_t *vfs)
+{
+    while (vfs->ActiveCount > 0)
+    {   // grab the next close command from the queue.
+        vfs_cfreq_t   req;
+        if (srmw_fifo_get(&vfs->CloseQueue, req) == false)
+        {   // there are no more pending closes, so we're done.
+            break;
+        }
+
+        // locate the corresponding file record and queue a close to VFS.
+        // it's important that the operation go through the VFS queue, so
+        // that we can be sure any pending I/O operations on the file have
+        // been submitted prior to the file being closed.
+        intptr_t const  AFID     = req.AFID;
+        intptr_t const *AFIDList = vfs->FileAFID;
+        for (size_t  i = 0 ; i < vfs->ActiveCount; ++i)
+        {
+            if (AFIDList[i] == AFID)
+            {
+                aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[i]);
+                if (aio_req != NULL)
+                {   // fill out the request. it will be processed at a later time.
+                    aio_req.Command    = AIO_COMMAND_CLOSE;
+                    aio_req.Fildes     = vfs->FileInfo[i].Fildes;
+                    aio_req.Eventfd    = vfs->FileInfo[i].Eventfd;
+                    aio_req.DataAmount = 0;
+                    aio_req.FileOffset = 0;
+                    aio_req.DataBuffer = NULL;
+                    aio_req.QTimeNanos = nanotime();
+                    aio_req.ATimeNanos = 0;
+                    aio_req.AFID       = AFID;
+                    aio_req.Type       = vfs->FileType[i];
+                    aio_req.Reserved   = 0;
+
+                    // delete the file from our internal state immediately.
+                    size_t const last = vfs->ActiveCount - 1;
+                    vfs->FileAFID[i]  = vfs->FileAFID[last];
+                    vfs->FileType[i]  = vfs->FileType[last];
+                    vfs->FileMode[i]  = vfs->FileMode[last];
+                    vfs->Priority[i]  = vfs->Priority[last];
+                    vfs->RdOffset[i]  = vfs->RdOffset[last];
+                    vfs->FileInfo[i]  = vfs->FileInfo[last];
+                    vfs->ActiveCount  = last;
+                    break; // dequeue the next request.
+                }
+                else
+                {   // there's no more space in the pending I/O operation queue.
+                    // put this request back in the queue and try again later.
+                    // no point in continuing on with further processing.
+                    // TODO: track this statistic somewhere.
+                    srmw_fifo_put(&vfs->CloseQueue, req);
+                    return;
+                }
+            } // if (AFIDList[i] == AFID)
+        } // for (each active file)
+    } // while (active files)
+}
+
+/// @summary Processes all completed file close notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
+{   // poll aio->CloseResults and perform any necessary operations.
+    // our internal file state has already been deleted.
+    // there's probably nothing to do here.
+}
+
+/// @summary Processes all completed file read notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
+{   // poll aio->ReadResults and perform any necessary operations.
+    // for each read, call the appropriate callback based on type,
+    // and then return the allocated buffer to the free pool.
+}
+
+/// @summary Processes all completed file write notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
+{   // poll aio->WriteResults and perform any necessary operations.
+    // for each write, call the appropriate callback based on type,
+    // and then return the allocated buffer to the free pool.
+}
+
+/// @summary Processes all completed file flush notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
+{   // poll aio->FlushResults and perform any necessary operations.
+    // there's probably nothing to do here.
+}
+
+/// @summary Process all completion events coming from the AIO driver.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completions(vfs_state_t *vfs, aio_state_t *aio)
+{
+    vfs_process_completed_reads  (vfs, aio);
+    vfs_process_completed_writes (vfs, aio);
+    vfs_process_completed_flushes(vfs, aio);
+    vfs_process_completed_closes (vfs, aio);
+}
+
+/// @summary Updates the status of all active file loads, and submits I/O operations.
+/// @param vfs The VFS driver state.
+static bool vfs_update_loads(vfs_state_t *vfs)
+{
+    iobuf_alloc_t &allocator = vfs->IoAllocator;
+    size_t const read_amount = allocator.AllocSize;
+    size_t       file_count  = 0;
+    uint32_t     priority    = 0;
+    uint16_t     index       = 0;
+    uint16_t     index_list[MAX_OPEN_FILES];
+    vfs_io_fpq_t file_queue;
+
+    io_fpq_clear(&file_queue);
+    file_count = map_files_by_mode(index_list, vfs, READ_LOAD);
+    build_file_queue(&file_queue, vfs, index_list, file_count);
+    while(io_fpq_get(&file_queue, index, priority))
+    {
+        size_t nqueued = 0;
+        while (iobuf_bytes_free(allocator) > 0)
+        {   // allocate a new request in our internal operation queue.
+            aio_req_t *req  = io_opq_put(&vfs->IoOperations, priority);
+            if (req != NULL)
+            {
+                req->Command    = AIO_COMMAND_READ;
+                req->Fildes     = vfs->FileInfo[index].Fildes;
+                req->Eventfd    = vfs->FileInfo[index].Eventfd;
+                req->DataAmount = read_amount;
+                req->FileOffset = vfs->FileInfo[index].FileOffset + vfs->RdOffset[index];
+                req->DataBuffer = iobuf_get(allocator);
+                req->QTimeNanos = nanotime();
+                req->ATimeNanos = 0;
+                req->AFID       = vfs->FileAFID[index];
+                req->Type       = vfs->FileType[index];
+                req->Reserved   = 0;
+                nqueued++;
+
+                // update the byte offset to the next read.
+                int64_t newofs  = vfs->RdOffset[index] + read_amount;
+                vfs->RdOffset[index] = newofs;
+                if (newofs >= vfs->FileInfo[index].FileSize)
+                {   // reached or passed end-of-file; queue a close.
+                    // we will continue on with the next queued file.
+                    vfs_cfreq_t creq;
+                    creq.AFID = vfs->FileAFID[index];
+                    srmw_fifo_put(&vfs->CloseQueue, creq);
+                    break;
+                }
+            }
+            // we ran out of I/O queue space; no point in continuing.
+            // TODO: track this statistic somewhere, we want to know
+            // how often this happens.
+            else return false;
+        }
+        if (nqueued == 0)
+        {   // we ran out of I/O buffer space; no point in continuing.
+            // TODO: track this statistic somewhere, we want to know
+            // how often this happens.
+            return false;
+        }
+    }
+    return true;
+}
+
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_req_t request;
+    // we're done generating operations for the tick, so push to AIO.
+    while (io_opq_top(&vfs->IoOperations, request))
+    {   // we were able to retrieve an operation from our internal queue.
+        if (srsw_fifo_put(&aio->RequestQueue, request))
+        {   // we were able to push it to AIO, so remove it from our queue.
+            io_opq_get(&vfs->IoOperations, request);
+        }
+    }
+}
+struct vfs_state_t
+{
+    #define MF         MAX_OPEN_FILES
+    #define NT         FILE_TYPE_COUNT
+    vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
+    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
+    iobuf_alloc_t      IoAllocator;  /// The I/O buffer allocator.
+    size_t             ActiveCount;  /// The number of open files.
+    intptr_t           FileAFID[MF]; /// An application-defined ID for each active file.
+    int32_t            FileType[MF]; /// One of file_mode_e for each active file.
+    int32_t            FileMode[MF]; /// One of vfs_mode_e for each active file.
+    uint32_t           Priority[MF]; /// The access priority for each active file.
+    int64_t            RdOffset[MF]; /// The current read offset for each active file.
+    vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
+    vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
+    #undef NT
+    #undef MF
+};
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-static inline vfs_ofrq_t maken(char const *v)
+/// @summary Queues a file for loading. The file is read from beginning to end and
+/// data is returned to the application on the thread appropriate for the given type.
+/// @param path The NULL-terminated UTF-8 path of the file to load.
+/// @param id The application-defined identifier for the load request.
+/// @param type One of file_type_e indicating the type of file being loaded. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file loading priority, with 0 indicating the highest possible priority.
+/// @param file_size On return, this location is updated with the logical size of the file.
+/// @return true if the file was successfully opened and the load was queued.
+bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size)
 {
-    vfs_ofrq_t rq = {
-        NULL, 0, (char*) v, 0
-    };
-    return rq;
+    int     fd     = -1;
+    int     efd    = -1;
+    size_t  ssize  =  0;
+    int64_t lsize  =  0;
+    int64_t psize  =  0;
+    int64_t offset =  0;
+    if (vfs_resolve_file(path, fd, efd, lsize, psize, offset, ssize))
+    {   // queue a load file request to be processed by the VFS driver.
+        vfs_lfreq_t req;
+        req.Next       = NULL;
+        req.Fildes     = fd;
+        req.Eventfd    = efd;
+        req.DataSize   = lsize;  // size of the file after decompression
+        req.FileSize   = psize;  // number of bytes to read from the file
+        req.FileOffset = offset; // offset of first byte relative to fd 0, SEEK_SET
+        req.AFID       = id;
+        req.Type       = type;
+        req.Priority   = priority;
+        req.SectorSize = ssize;
+        file_size      = lsize;  // return the logical size to the caller
+        srmw_fifo_put(&VFS_STATE.LoadQueue, req);
+        return true;
+    }
+    else
+    {   // unable to open the file, so fail immediately.
+        file_size = 0;
+        return false;
+    }
 }
 
 int main(int argc, char **argv)
 {
-    srmw_fifo_t<vfs_ofrq_t> fifo;
-    create_srmw_fifo(&fifo, 100);
-    srmw_fifo_put(&fifo, maken("1"));
-    srmw_fifo_put(&fifo, maken("2"));
-    srmw_fifo_put(&fifo, maken("3"));
-    srmw_fifo_put(&fifo, maken("A"));
-    srmw_fifo_put(&fifo, maken("B"));
-    srmw_fifo_put(&fifo, maken("C"));
-    vfs_ofrq_t v;
-    while (srmw_fifo_get(&fifo, v))
-    {
-        fprintf(stdout, "%s\n", v.Path);
-    }
-    delete_srmw_fifo(&fifo);
-    aio_poll(NULL);
     exit(EXIT_SUCCESS);
 }
 
