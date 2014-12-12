@@ -1756,35 +1756,59 @@ static void vfs_process_closes(vfs_state_t *vfs)
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
-{   // poll aio->CloseResults and perform any necessary operations.
-    // our internal file state has already been deleted.
-    // there's probably nothing to do here.
+{
+    aio_res_t res;
+    // there's nothing that the VFS driver needs to do here for the application.
+    while (srsw_fifo_get(&aio->CloseResults, res))
+    {
+        /* empty */
+    }
 }
 
 /// @summary Processes all completed file read notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
-{   // poll aio->ReadResults and perform any necessary operations.
-    // for each read, call the appropriate callback based on type,
-    // and then return the allocated buffer to the free pool.
+{
+    aio_res_t res;
+    while (srsw_fifo_get(&aio->ReadResults, res))
+    {   // we won't be invoking a callback here; rather we will update
+        // any internal state, find the appropriate target queue based
+        // on res.Type, and then move res to that queue.
+    }
 }
 
 /// @summary Processes all completed file write notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
-{   // poll aio->WriteResults and perform any necessary operations.
-    // for each write, call the appropriate callback based on type,
-    // and then return the allocated buffer to the free pool.
+{
+    aio_res_t res;
+    while (srsw_fifo_get(&aio->WriteResults, res))
+    {   // we won't be invoking a callback here; rather we will update
+        // any internal state, find the appropriate target queue based
+        // on res.Type, and then move res to that queue.
+    }
 }
 
 /// @summary Processes all completed file flush notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
-{   // poll aio->FlushResults and perform any necessary operations.
-    // there's probably nothing to do here.
+{
+    aio_res_t res;
+    // there's nothing that the VFS driver needs to do here for the application.
+    while (srsw_fifo_get(&aio->FlushResults, res))
+    {
+        /* empty */
+    }
+}
+
+/// @summary Processes all pending buffer returns and releases memory back to the pool.
+/// @param vfs The VFS driver state.
+static void vfs_process_buffer_returns(vfs_state_t *vfs)
+{
+    // TODO: poll the return queue for each file type, and iobuf_put() it.
 }
 
 /// @summary Updates the status of all active file loads, and submits I/O operations.
@@ -1877,11 +1901,8 @@ static bool vfs_process_writes(vfs_state_t *vfs)
 /// @param aio The AIO driver state.
 static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
 {
-    // process completions and free up as much buffer state as possible.
-    vfs_process_completed_reads  (vfs, aio);
-    vfs_process_completed_writes (vfs, aio);
-    vfs_process_completed_flushes(vfs, aio);
-    vfs_process_completed_closes (vfs, aio);
+    // free up as much buffer state as possible.
+    vfs_process_buffer_returns(vfs);
 
     // generate read and write I/O operations.
     vfs_update_loads(vfs);
@@ -1901,6 +1922,13 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
             io_opq_get(&vfs->IoOperations, request);
         }
     }
+
+    // dispatch any completed I/O operations to the per-type queues for
+    // processing by the platform layer and dispatching to the application.
+    vfs_process_completed_reads  (vfs, aio);
+    vfs_process_completed_writes (vfs, aio);
+    vfs_process_completed_flushes(vfs, aio);
+    vfs_process_completed_closes (vfs, aio);
 
     // open file requests should be processed after all close requests.
     vfs_process_opens(vfs);
@@ -1924,6 +1952,23 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
     #undef NT
     #undef MF
 };*/
+// need one srsw_fifo_t<void*> for each file_type_e to be buffer return queues.
+// need one srsw_fifo_t<aio_res_t> for each file_type_e.
+// when processing completions:
+// aio_res_t res;
+// while (srsw_fifo_get(&aio->QueueName, res))
+// {
+//     // perform any processing required by VFS here.
+//     // get the srsw_fifo_t<aio_res_t> for the file type, res.Type.
+//     // push res onto the type FIFO. the platform layer will decide
+//     // where to process the queue for that type.
+// }
+// Each aio_res_t is 72 bytes currently. Each type queue needs to be at least
+// 2x the maximum number of pending AIO ops (=1024 items) to hopefully avoid
+// any potential overflows; this would only be enough for 32MB of data transfer.
+// at 72 bytes/entry, each queue is slightly larger than 72KB. this overhead
+// seems acceptable, of course the number of entries can be adjusted for lower
+// end systems.
 
 /*////////////////////////
 //   Public Functions   //
