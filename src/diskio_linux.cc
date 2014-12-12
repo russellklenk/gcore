@@ -184,6 +184,7 @@ struct aio_req_t
     int                Fildes;       /// The file descriptor of the file. Required.
     int                Eventfd;      /// The eventfd descriptor for epoll signaling, or -1.
     uint32_t           DataAmount;   /// The amount of data to transfer, or 0.
+    int64_t            BaseOffset;   /// The absolute byte offset of the start of the file, or 0.
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation, or 0.
     void              *DataBuffer;   /// The source or target buffer, or NULL.
     uint64_t           QTimeNanos;   /// The request submission timestamp, in nanoseconds.
@@ -263,8 +264,22 @@ struct vfs_cfreq_t
     intptr_t           AFID;         /// The application-defined ID for the file.
 };
 
-typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t; /// Load file request queue.
-typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t; /// Close file request queue.
+/// @summary Defines the data associated with a completed I/O (read or write) operation.
+struct vfs_res_t
+{
+    intptr_t           AFID;         /// The application-defined ID for the file.
+    void              *DataBuffer;   /// The source or target buffer.
+    int64_t            FileOffset;   /// The absolute byte offset of the start of the operation. (CONVERT BACK TO RELATIVE!)
+    uint32_t           DataAmount;   /// The amount of data transferred.
+    int                OSError;      /// The error code returned by the operation, or 0.
+};
+
+#define QC  (AIO_MAX_ACTIVE * 2)
+typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t;     /// Load file request queue.
+typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t;     /// Close file request queue.
+typedef srsw_fifo_t<vfs_res_t, QC>   vfs_resultq_t; /// AIO result queue.
+typedef srsw_fifo_t<void*, QC>       vfs_returnq_t; /// I/O buffer return queue.
+#undef  QC
 
 /// @summary Information that remains constant from the point that a file is opened for reading.
 struct vfs_fdinfo_t
@@ -319,6 +334,8 @@ struct vfs_state_t
     int64_t            RdOffset[MF]; /// The current read offset for each active file.
     vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
     vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
+    vfs_resultq_t      IoResult[NT]; /// The per-file type queue for I/O results.
+    vfs_returnq_t      IoReturn[NT]; /// The per-file type queue for I/O buffer returns.
     #undef NT
     #undef MF
 };
@@ -1195,13 +1212,14 @@ static inline void iocb_put(aio_state_t *aio, struct iocb *iocb)
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
 static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, int &error)
 {
-    struct iocb *iocb    = iocb_get(aio);    // allocate from the free list
+    int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
+    struct iocb    *iocb = iocb_get(aio);    // allocate from the free list
     iocb->data           = (void*)req.AFID;  // for sanity checking on completion
     iocb->aio_lio_opcode = IO_CMD_PREAD;     // we're reading from the file
     iocb->aio_fildes     = req.Fildes;       // the file descriptor to read from
     iocb->u.c.buf        = req.DataBuffer;   // the buffer to read into
     iocb->u.c.nbytes     = req.DataAmount;   // the maximum number of bytes to read
-    iocb->u.c.offset     = req.FileOffset;   // the absolute byte offset of the first byte to read
+    iocb->u.c.offset     = absolute_ofs;     // the absolute byte offset of the write location
     int res  = io_submit(aio->AIOContext, 1, &iocb);
     if (res >= 0)
     {   // the operation was queued by kernel AIO. append to the active list.
@@ -1226,13 +1244,14 @@ static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, int &error)
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
 static int aio_submit_write(aio_state_t *aio, aio_req_t const &req, int &error)
 {
-    struct iocb *iocb    = iocb_get(aio);    // allocate from the free list
+    int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
+    struct iocb    *iocb = iocb_get(aio);    // allocate from the free list
     iocb->data           = (void*)req.AFID;  // for sanity checking on completion
     iocb->aio_lio_opcode = IO_CMD_PWRITE;    // we're writing to the the file
     iocb->aio_fildes     = req.Fildes;       // the file descriptor to write to
     iocb->u.c.buf        = req.DataBuffer;   // the buffer to read from
     iocb->u.c.nbytes     = req.DataAmount;   // the number of bytes to write
-    iocb->u.c.offset     = req.FileOffset;   // the absolute byte offset of the write location
+    iocb->u.c.offset     = absolute_ofs;     // the absolute byte offset of the write location
     int res  = io_submit(aio->AIOContext, 1, &iocb);
     if (res >= 0)
     {   // the operation was queued by kernel AIO. append to the active list.
@@ -1385,7 +1404,7 @@ static void aio_tick(aio_state_t *aio, struct timespec *timeout)
                 res.Eventfd     = req.Eventfd;
                 res.OSError     = evt.res <  0 ? -evt.res : 0;
                 res.DataAmount  = evt.res >= 0 ?  evt.res : 0;
-                res.FileOffset  = req.FileOffset;
+                res.FileOffset  = req.FileOffset; // relative
                 res.DataBuffer  = req.DataBuffer;
                 res.QTimeNanos  = req.QTimeNanos;
                 res.CTimeNanos  = nanotime();
@@ -1509,114 +1528,6 @@ static void delete_aio_state(aio_state_t *aio)
     flush_srsw_fifo(&aio->CloseResults);
 }
 
-/// @summary Submits a file read request to the AIO pending operation queue.
-/// @param aio The AIO context that will be processing the I/O.
-/// @param fd The file descriptor of the file to read from.
-/// @param efd The eventfd file descriptor to associate with the request, or -1.
-/// @param offset The absolute byte offset within the file at which to being reading data.
-/// The caller is responsible for ensuring that alignment requirements are met.
-/// @param amount The maximum number of bytes to read. The caller is responsible for
-/// ensuring that this size meets any alignment requirements (sector size multiple, etc.)
-/// @param iobuf The buffer in which to place data read from the file. The caller is
-/// responsible for ensuring that this buffer meets any alignment requirements.
-/// @param afid The application-defined file ID to pass along to the result.
-/// @param type The file type, one of file_type_e, to pass along to the result.
-/// @return true if the request was accepted.
-static bool aio_request_read(aio_state_t *aio, int fd, int efd, int64_t offset, uint32_t amount, void *iobuf, intptr_t afid, int32_t type)
-{
-    aio_req_t req;
-    req.Command    = AIO_COMMAND_READ;
-    req.Fildes     = fd;
-    req.Eventfd    = efd;
-    req.DataAmount = amount;
-    req.FileOffset = offset;
-    req.DataBuffer = iobuf;
-    req.QTimeNanos = nanotime();
-    req.ATimeNanos = 0;
-    req.AFID       = afid;
-    req.Type       = type;
-    req.Reserved   = 0;
-    return srsw_fifo_put(&aio->RequestQueue, req);
-}
-
-/// @summary Submits a file write request to the AIO pending operation queue.
-/// @param aio The AIO context that will be processing the I/O.
-/// @param fd The file descriptor of the file to write to.
-/// @param efd The eventfd file descriptor to associate with the request, or -1.
-/// @param offset The absolute byte offset within the file at which to being writing data.
-/// The caller is responsible for ensuring that alignment requirements are met.
-/// @param amount The number of bytes to write. The caller is responsible for ensuring
-/// that this size meets any alignment requirements (sector size multiple, etc.)
-/// @param iobuf The buffer containing the data to write to the file. The caller is
-/// responsible for ensuring that this buffer meets any alignment requirements.
-/// @param afid The application-defined file ID to pass along to the result.
-/// @param type The file type, one of file_type_e, to pass along to the result.
-/// @return true if the request was accepted.
-static bool aio_request_write(aio_state_t *aio, int fd, int efd, int64_t offset, uint32_t amount, void *iobuf, intptr_t afid, int32_t type)
-{
-    aio_req_t req;
-    req.Command    = AIO_COMMAND_WRITE;
-    req.Fildes     = fd;
-    req.Eventfd    = efd;
-    req.DataAmount = amount;
-    req.FileOffset = offset;
-    req.DataBuffer = iobuf;
-    req.QTimeNanos = nanotime();
-    req.ATimeNanos = 0;
-    req.AFID       = afid;
-    req.Type       = type;
-    req.Reserved   = 0;
-    return srsw_fifo_put(&aio->RequestQueue, req);
-}
-
-/// @summary Submits a file flush request to the AIO pending operation queue.
-/// @param aio The AIO context that will be processing the I/O.
-/// @param fd The file descriptor of the file to flush.
-/// @param efd The eventfd file descriptor to associate with the request, or -1.
-/// @param afid The application-defined file ID to pass along to the result.
-/// @param type The file type, one of file_type_e, to pass along to the result.
-/// @return true if the request was accepted.
-static bool aio_request_flush(aio_state_t *aio, int fd, int efd, intptr_t afid, int32_t type)
-{
-    aio_req_t req;
-    req.Command    = AIO_COMMAND_FLUSH;
-    req.Fildes     = fd;
-    req.Eventfd    = efd;
-    req.DataAmount = 0;
-    req.FileOffset = 0;
-    req.DataBuffer = 0;
-    req.QTimeNanos = nanotime();
-    req.ATimeNanos = 0;
-    req.AFID       = afid;
-    req.Type       = type;
-    req.Reserved   = 0;
-    return srsw_fifo_put(&aio->RequestQueue, req);
-}
-
-/// @summary Submits a file close request to the AIO pending operation queue.
-/// @param aio The AIO context that will be processing the I/O.
-/// @param fd The file descriptor of the file to close.
-/// @param efd The eventfd file descriptor to associate with the request, or -1.
-/// @param afid The application-defined file ID to pass along to the result.
-/// @param type The file type, one of file_type_e, to pass along to the result.
-/// @return true if the request was accepted.
-static bool aio_request_close(aio_state_t *aio, int fd, int efd, intptr_t afid, int32_t type)
-{
-    aio_req_t req;
-    req.Command    = AIO_COMMAND_CLOSE;
-    req.Fildes     = fd;
-    req.Eventfd    = efd;
-    req.DataAmount = 0;
-    req.FileOffset = 0;
-    req.DataBuffer = 0;
-    req.QTimeNanos = nanotime();
-    req.ATimeNanos = 0;
-    req.AFID       = afid;
-    req.Type       = type;
-    req.Reserved   = 0;
-    return srsw_fifo_put(&aio->RequestQueue, req);
-}
-
 /// @summary Determine whether a path references a file within an archive, (and
 /// if so, which one) or whether it references a native file. Open the file if
 /// necessary, and return basic file information to the caller. This function
@@ -1634,8 +1545,7 @@ static bool aio_request_close(aio_state_t *aio, int fd, int efd, intptr_t afid, 
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @return true if the file could be resolved.
 static bool vfs_resolve_file(char const *path, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
-{
-    // TODO: determine whether this path references a file contained within an archive.
+{   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
     if  (native_path)
@@ -1681,7 +1591,7 @@ static void vfs_process_loads(vfs_state_t *vfs)
         vfs->FileType[index]            = req.Type;
         vfs->FileMode[index]            = READ_LOAD;
         vfs->Priority[index]            = req.Priority;
-        vfs->RdOffset[index]            = 0;  // the *relative* offset
+        vfs->RdOffset[index]            = 0;
         vfs->FileInfo[index].Fildes     = req.Fildes;
         vfs->FileInfo[index].Eventfd    = req.Eventfd;
         vfs->FileInfo[index].FileSize   = req.FileSize;
@@ -1720,6 +1630,7 @@ static void vfs_process_closes(vfs_state_t *vfs)
                     aio_req->Fildes     = vfs->FileInfo[i].Fildes;
                     aio_req->Eventfd    = vfs->FileInfo[i].Eventfd;
                     aio_req->DataAmount = 0;
+                    aio_req->BaseOffset = vfs->FileInfo[i].FileOffset;
                     aio_req->FileOffset = 0;
                     aio_req->DataBuffer = NULL;
                     aio_req->QTimeNanos = nanotime();
@@ -1772,9 +1683,17 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     while (srsw_fifo_get(&aio->ReadResults, res))
-    {   // we won't be invoking a callback here; rather we will update
-        // any internal state, find the appropriate target queue based
-        // on res.Type, and then move res to that queue.
+    {   // convert the AIO result into something useful for the platform layer.
+        vfs_res_t iores;
+        iores.AFID       = res.AFID;
+        iores.DataBuffer = res.DataBuffer;
+        iores.FileOffset = res.FileOffset; // this is the relative offset
+        iores.DataAmount = res.DataAmount;
+        iores.OSError    = res.OSError;
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        {   // TODO: track this statistic somewhere.
+            // This should not be happening.
+        }
     }
 }
 
@@ -1785,9 +1704,17 @@ static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     while (srsw_fifo_get(&aio->WriteResults, res))
-    {   // we won't be invoking a callback here; rather we will update
-        // any internal state, find the appropriate target queue based
-        // on res.Type, and then move res to that queue.
+    {   // convert the AIO result into something useful for the platform layer.
+        vfs_res_t iores;
+        iores.AFID       = res.AFID;
+        iores.DataBuffer = res.DataBuffer;
+        iores.FileOffset = res.FileOffset; // this is the relative offset
+        iores.DataAmount = res.DataAmount;
+        iores.OSError    = res.OSError;
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        {   // TODO: track this statistic somewhere.
+            // This should not be happening.
+        }
     }
 }
 
@@ -1808,7 +1735,16 @@ static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
 /// @param vfs The VFS driver state.
 static void vfs_process_buffer_returns(vfs_state_t *vfs)
 {
-    // TODO: poll the return queue for each file type, and iobuf_put() it.
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        void          *buffer;
+        vfs_returnq_t *returnq   = &vfs->IoReturn[i];
+        iobuf_alloc_t &allocator =  vfs->IoAllocator;
+        while (srsw_fifo_get(returnq, buffer))
+        {
+            iobuf_put(allocator, buffer);
+        }
+    }
 }
 
 /// @summary Updates the status of all active file loads, and submits I/O operations.
@@ -1840,7 +1776,8 @@ static bool vfs_update_loads(vfs_state_t *vfs)
                 req->Fildes     = vfs->FileInfo[index].Fildes;
                 req->Eventfd    = vfs->FileInfo[index].Eventfd;
                 req->DataAmount = read_amount;
-                req->FileOffset = vfs->FileInfo[index].FileOffset + vfs->RdOffset[index];
+                req->BaseOffset = vfs->FileInfo[index].FileOffset;
+                req->FileOffset = vfs->RdOffset[index];
                 req->DataBuffer = iobuf_get(allocator);
                 req->QTimeNanos = nanotime();
                 req->ATimeNanos = 0;
@@ -1934,6 +1871,16 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
     vfs_process_opens(vfs);
     vfs_process_loads(vfs);
 }
+
+/// @summary Returns an I/O buffer to the pool. This function should be called
+/// for every read or write result that the platform layer dequeues.
+/// @param vfs The VFS state that posted the I/O result.
+/// @param type One of file_type_e indicating the type of file being processed.
+/// @param buffer The buffer to return. This value may be NULL.
+static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
+{
+    if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
+}
 /*struct vfs_state_t
 {
     #define MF         MAX_OPEN_FILES
@@ -1949,6 +1896,8 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
     int64_t            RdOffset[MF]; /// The current read offset for each active file.
     vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
     vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
+    vfs_resultq_t      IoResult[NT]; /// The per-file type queue for I/O results.
+    vfs_returnq_t      IoReturn[NT]; /// The per-file type queue for I/O buffer returns.
     #undef NT
     #undef MF
 };*/
@@ -1959,7 +1908,7 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
 // while (srsw_fifo_get(&aio->QueueName, res))
 // {
 //     // perform any processing required by VFS here.
-//     // get the srsw_fifo_t<aio_res_t> for the file type, res.Type.
+//     // get the srsw_fifo_t<vfs_res_t> for the file type, res.Type.
 //     // push res onto the type FIFO. the platform layer will decide
 //     // where to process the queue for that type.
 // }
