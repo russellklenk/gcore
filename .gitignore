@@ -38,6 +38,7 @@
 build-Debug
 build-Release
 projects/*/
+attic
 bin
 obj
 
