@@ -1,5 +1,8 @@
 /*/////////////////////////////////////////////////////////////////////////////
 /// @summary Implements the entry point of the application.
+/// developer.apple.com/library/ios/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/TechniquesforReadingandWritingCustomFiles/TechniquesforReadingandWritingCustomFiles.html
+/// developer.apple.com/library/ios/documentation/Performance/Reference/GCD_libdispatch_Ref/index.html
+/// developer.apple.com/library/mac/documentation/Darwin/Reference/ManPages/man3/dispatch_io_read.3.html
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*////////////////////
