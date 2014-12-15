@@ -1587,7 +1587,7 @@ static void vfs_process_loads(vfs_state_t *vfs)
         size_t index = vfs->ActiveCount++;
         vfs->FileAFID[index]            = req.AFID;
         vfs->FileType[index]            = req.Type;
-        vfs->FileMode[index]            = READ_LOAD;
+        vfs->FileMode[index]            = VFS_MODE_LOAD;
         vfs->Priority[index]            = req.Priority;
         vfs->RdOffset[index]            = 0;
         vfs->FileInfo[index].Fildes     = req.Fildes;
@@ -1760,7 +1760,7 @@ static bool vfs_update_loads(vfs_state_t *vfs)
     vfs_io_fpq_t file_queue;
 
     io_fpq_clear(&file_queue);
-    file_count = map_files_by_mode(index_list, vfs, READ_LOAD);
+    file_count = map_files_by_mode(index_list, vfs, VFS_MODE_LOAD);
     build_file_queue(&file_queue, vfs, index_list, file_count);
     while(io_fpq_get(&file_queue, index, priority))
     {
