@@ -1469,6 +1469,8 @@ static void aio_tick(aio_state_t *aio, struct timespec *timeout)
                 error  = EINVAL;
                 break;
         }
+
+        // TODO: Need to complete the request with error if result == -1.
     }
 }
 

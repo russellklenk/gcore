@@ -11,14 +11,115 @@
 #define never_inline               __declspec(noinline)
 
 #ifdef __GNUC__
-    #ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
-        #define QUOTA_LIMITS_HARDWS_MIN_ENABLE     0x00000001
-    #endif
-
-    #ifndef QUOTA_LIMITS_HARDWS_MAX_DISABLE
-        #define QUOTA_LIMITS_HARDWS_MAX_DISABLE    0x00000008
-    #endif
+#ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
+    #define QUOTA_LIMITS_HARDWS_MIN_ENABLE     0x00000001
 #endif
+
+#ifndef QUOTA_LIMITS_HARDWS_MAX_DISABLE
+    #define QUOTA_LIMITS_HARDWS_MAX_DISABLE    0x00000008
+#endif
+#ifndef METHOD_BUFFERED
+    #define METHOD_BUFFERED                    0
+#endif
+#ifndef FILE_ANY_ACCESS
+    #define FILE_ANY_ACCESS                    0
+#endif
+
+#ifndef FILE_DEVICE_MASS_STORAGE
+    #define FILE_DEVICE_MASS_STORAGE           0x0000002d
+#endif
+
+#ifndef CTL_CODE
+    #define CTL_CODE(DeviceType, Function, Method, Access )                      \
+        (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+#endif
+
+#ifndef IOCTL_STORAGE_BASE
+    #define IOCTL_STORAGE_BASE                 FILE_DEVICE_MASS_STORAGE
+#endif
+
+#ifndef IOCTL_STORAGE_QUERY_PROPERTY
+    #define IOCTL_STORAGE_QUERY_PROPERTY CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#if   (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ <= 8)
+typedef enum _STORAGE_PROPERTY_ID {
+    StorageDeviceProperty = 0,
+    StorageAdapterProperty,
+    StorageDeviceIdProperty,
+    StorageDeviceUniqueIdProperty,
+    StorageDeviceWriteCacheProperty,
+    StorageMiniportProperty,
+    StorageAccessAlignmentProperty,
+    StorageDeviceSeekPenaltyProperty,
+    StorageDeviceTrimProperty,
+    StorageDeviceWriteAggregationProperty,
+    StorageDeviceTelemetryProperty,
+    StorageDeviceLBProvisioningProperty,
+    StorageDevicePowerProperty,
+    StorageDeviceCopyOffloadProperty,
+    StorageDeviceResiliencyPropery
+} STORAGE_PROPERTY_ID, *PSTORAGE_PROPERTY_ID;
+
+typedef enum _STORAGE_QUERY_TYPE {
+    PropertyStandardQuery = 0,
+    propertyExistsQuery,
+    PropertyMaskQuery,
+    PropertyQueryMaxDefined
+} STORAGE_QUERY_TYPE, *PSTORAGE_QUERY_TYPE;
+
+typedef struct _STORAGE_PROPERTY_QUERY {
+    STORAGE_PROPERTY_ID PropertyId;
+    STORAGE_QUERY_TYPE  QueryType;
+    UCHAR               AdditionalParameters[1];
+} STORAGE_PROPERTY_QUERY, *PSTORAGE_PROPERTY_QUERY;
+#endif /* __GNUC__ < 4.9 */
+
+#if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ <= 9)
+typedef enum _FILE_INFO_BY_HANDLE_CLASS {
+    FileBasicInfo = 0,
+    FileStandardInfo = 1,
+    FileNameInfo = 2,
+    FileRenameInfo = 3,
+    FileDispositionInfo = 4,
+    FileAllocationInfo = 5,
+    FileEndOfFileInfo = 6,
+    FileStreamInfo = 7,
+    FileCompressionInfo = 8,
+    FileAttributeTagInfo = 9,
+    FileIdBothDirectoryInfo = 10,
+    FileIdBothDirectoryRestartInfo = 11,
+    FileIoPriorityHintInfo = 12,
+    FileRemoteProtocolInfo = 13,
+    FileFullDirectoryInfo = 14,
+    FileFullDirectoryRestartInfo = 15,
+    FileStorageInfo = 16,
+    FileAlignmentInfo = 17,
+    FileIdInfo = 18,
+    FileIdExtdDirectoryInfo = 19,
+    FileIdExtdDirectoryRestartInfo = 20,
+    MaximumFileInfoByHandlesClass
+} FILE_INFO_BY_HANDLE_CLASS, *PFILE_INFO_BY_HANDLE_CLASS;
+
+typedef struct _STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR {
+    DWORD Version;
+    DWORD Size;
+    DWORD BytesPerCacheLine;
+    DWORD BytesOffsetForCacheAlignment;
+    DWORD BytesPerLogicalSector;
+    DWORD BytesPerPhysicalSector;
+    DWORD BytesOffsetForSectorAlignment;
+} STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, *PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR;
+
+typedef struct _FILE_ALLOCATION_INFO {
+    LARGE_INTEGER AllocationSize;
+} FILE_ALLOCATION_INFO, *PFILE_ALLOCATION_INFO;
+
+typedef struct _FILE_END_OF_FILE_INFO {
+    LARGE_INTEGER EndOfFile;
+} FILE_END_OF_FILE_INFO, *PFILE_END_OF_FILE_INFO;
+#endif /* __GNUC__ <= 4.9 - MinGW */
+#endif /* __GNUC__ comple - MinGW */
 
 /*////////////////
 //   Includes   //
@@ -160,8 +261,7 @@ struct iobuf_alloc_t
 struct aio_req_t
 {
     int32_t            Command;      /// The AIO command type, one of aio_command_e.
-    int                Fildes;       /// The file descriptor of the file. Required.
-    int                Eventfd;      /// The eventfd descriptor for epoll signaling, or -1.
+    HANDLE             Fildes;       /// The file descriptor of the file. Required.
     uint32_t           DataAmount;   /// The amount of data to transfer, or 0.
     int64_t            BaseOffset;   /// The absolute byte offset of the start of the file, or 0.
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation, or 0.
@@ -177,9 +277,8 @@ struct aio_req_t
 /// results are populated by the AIO driver and posted to queues polled by the VFS driver.
 struct aio_res_t
 {
-    int                Fildes;       /// The file descriptor of the file.
-    int                Eventfd;      /// The eventfd descriptor for epoll signaling, or -1.
-    int                OSError;      /// The error code returned by the operation, or 0.
+    HANDLE             Fildes;       /// The file descriptor of the file.
+    DWORD              OSError;      /// The error code returned by the operation, or 0.
     uint32_t           DataAmount;   /// The amount of data transferred.
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation, or 0.
     void              *DataBuffer;   /// The source or target buffer, or NULL.
@@ -224,8 +323,7 @@ struct aio_state_t
 struct vfs_lfreq_t
 {
     vfs_lfreq_t       *Next;         /// Pointer to the next node in the queue.
-    int                Fildes;       /// The file descriptor of the opened file.
-    int                Eventfd;      /// The eventfd descriptor of the opened file.
+    HANDLE             Fildes;       /// The file descriptor of the opened file.
     int64_t            DataSize;     /// The logical size of the file, in bytes.
     int64_t            FileSize;     /// The physical size of the file, in bytes.
     int64_t            FileOffset;   /// The byte offset of the start of the file data.
@@ -263,8 +361,7 @@ typedef srsw_fifo_t<void*, QC>       vfs_returnq_t; /// I/O buffer return queue.
 /// @summary Information that remains constant from the point that a file is opened for reading.
 struct vfs_fdinfo_t
 {
-    int                Fildes;       /// The file descriptor for the file.
-    int                Eventfd;      /// The eventfd descriptor for the file, or -1.
+    HANDLE             Fildes;       /// The file descriptor for the file.
     int64_t            FileSize;     /// The physical file size, in bytes.
     int64_t            DataSize;     /// The file size after any size-changing transforms.
     int64_t            FileOffset;   /// The absolute byte offset of the start of the file data.
@@ -337,9 +434,11 @@ static file_type_e   FILE_TYPE_LIST[] = {
 // loaded and these functions will be resolved manually.
 typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
 typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
+typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
 
 static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
 static SetProcessWorkingSetSizeExFn SetProcessWorkingSetSizeEx_Func = NULL;
+static SetFileInformationByHandleFn SetFileInformationByHandle_Func = NULL;
 
 /*///////////////////////
 //   Local Functions   //
@@ -375,6 +474,7 @@ static void resolve_kernel_apis(void)
     {
         GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
         SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        SetFileInformationByHandle_Func = (SetFileInformationByHandleFn) GetProcAddress(kernel, "SetFileInformationByHandle");
     }
     // fallback if any of these APIs are not available.
     if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
@@ -1183,6 +1283,880 @@ static void build_file_queue(vfs_io_fpq_t *pq, vfs_state_t const *vfs, uint16_t 
     }
 }
 
+/// @summary Retrieve the physical sector size for a block-access device.
+/// @param file The handle to an open file on the device.
+/// @return The size of a physical sector on the specified device.
+static size_t physical_sector_size(HANDLE file)
+{   // http://msdn.microsoft.com/en-us/library/ff800831(v=vs.85).aspx
+    // for structure STORAGE_ACCESS_ALIGNMENT
+    // Vista and Server 2008+ only - XP not supported.
+    size_t const DefaultPhysicalSectorSize = 4096;
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR desc;
+    STORAGE_PROPERTY_QUERY              query;
+    memset(&desc , 0, sizeof(desc));
+    memset(&query, 0, sizeof(query));
+
+    query.QueryType  = PropertyStandardQuery;
+    query.PropertyId = StorageAccessAlignmentProperty;
+    DWORD bytes = 0;
+    BOOL result = DeviceIoControl(
+        file,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        &query, sizeof(query),
+        &desc , sizeof(desc),
+        &bytes, NULL);
+    if (!result)
+    {
+        return DefaultPhysicalSectorSize;
+    }
+    else return desc.BytesPerPhysicalSector;
+}
+
+/// @summary Synchronously opens a file and retrieves various information.
+/// @param path The path of the file to open.
+/// @param access Usually GENERIC_READ, GENERIC_WRITE, or GENERIC_READ|GENERIC_WRITE.
+/// See MSDN documentation for CreateFile, dwDesiredAccess parameter.
+/// @param share Usually FILE_SHARE_READ, FILE_SHARE_WRITE, or FILE_SHARE_READ|FILE_SHARE_WRITE.
+/// See MSDN documentation for CreateFile, dwShareMode parameter.
+/// @param create Usually OPEN_EXISTNG or OPEN_ALWAYS. See MSDN documentation
+/// for CreateFile, dwCreationDisposition parameter.
+/// @param flags Usually FILE_FLAG_NO_BUFFERING|FILE_FLAG_OVERLAPPED. See MSDN
+/// documentation for CreateFile, dwFlagsAndAttributes parameter.
+/// @param fd On return, this location is set to the file handle, or INVALID_HANDLE_VALUE.
+/// @param file_size On return, this value is set to the current size of the file, in bytes.
+/// @param sector_size On return, this value is set to the size of the physical disk sector, in bytes.
+/// @return true if all operations were successful.
+static bool open_file_raw(char const *path, DWORD access, DWORD share, DWORD create, DWORD flags, HANDLE &fd, int64_t &file_size, size_t &sector_size)
+{
+    LARGE_INTEGER fsize   = {0};
+    HANDLE        hFile   = INVALID_HANDLE_VALUE;
+    WCHAR        *pathbuf = NULL;
+    size_t        ssize   = 0;
+    int           nchars  = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+
+    // convert the path from UTF-8 to UCS-2, which Windows requires.
+    if (nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+
+    pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+
+    // open the file as specified by the caller.
+    hFile = CreateFile(pathbuf, access, share, NULL, create, flags, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {   // the file cannot be opened.
+        goto error_cleanup;
+    }
+
+    // retrieve basic file attributes.
+    ssize = physical_sector_size(hFile);
+    if (!GetFileSizeEx(hFile, &fsize))
+    {   // the file size cannot be retrieved.
+        goto error_cleanup;
+    }
+
+    // set output parameters and clean up.
+    fd          = hFile;
+    file_size   = fsize.QuadPart;
+    sector_size = ssize;
+    free(pathbuf);
+    return true;
+
+error_cleanup:
+    if (hFile   != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    if (pathbuf != NULL) free(pathbuf);
+    fd = INVALID_HANDLE_VALUE;
+    file_size = 0;
+    sector_size = 0;
+    return false;
+}
+
+/// @summary Closes the file descriptors associated with a file.
+/// @param fd The raw file descriptor of the underlying file. On return, set to INVALID_HANDLE_VALUE.
+static void close_file_raw(HANDLE &fd)
+{
+    if (fd != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(fd);
+        fd = INVALID_HANDLE_VALUE;
+    }
+}
+
+/// @summary Allocates an iocb instance from the free list.
+/// @param aio The AIO driver state managing the free list.
+/// @return The next available iocb structure.
+static inline OVERLAPPED* asio_get(aio_state_t *aio)
+{
+    assert(aio->ASIOFreeCount > 0);
+    return aio->ASIOFree[--aio->ASIOFreeCount];
+}
+
+/// @summary Returns an iocb instance to the free list.
+/// @param aio The AIO driver state managing the free list.
+/// @param asio The OVERLAPPED instance to return to the free list.
+static inline void asio_put(aio_state_t *aio, OVERLAPPED *asio)
+{
+    assert(aio->ASIOFreeCount < AIO_MAX_ACTIVE);
+    aio->ASIOFree[aio->ASIOFreeCount++] = asio;
+}
+
+/// @summary Builds a read operation and submits it to the kernel.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the read operation.
+/// @param error On return, this location stores the error return value.
+/// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
+static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+{
+    int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
+    OVERLAPPED     *asio = asio_get(aio);
+    DWORD           xfer = 0;
+    asio->Internal       = 0;
+    asio->InternalHigh   = 0;
+    asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
+    asio->OffsetHigh     = DWORD((absolute_ofs & 0xFFFFFFFFFFFFFFFFULL) >> 32);
+    BOOL res = ReadFile(req.Fildes, req.DataBuffer, req.DataAmount, &xfer, asio);
+    if (!res || xfer == 0)
+    {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
+        // which means that the operation will complete asynchronously.
+        DWORD err  = GetLastError();
+        if   (err == ERROR_IO_PENDING)
+        {   // the operation was queued by kernel AIO. append to the active list.
+            size_t index = aio->ActiveCount++;
+            aio->AAIOList[index] = req;
+            aio->AAIOList[index].ATimeNanos = nanotime();
+            aio->ASIOList[index] = asio;
+            error = ERROR_SUCCESS;
+            return (0);
+        }
+        else if (err == ERROR_HANDLE_EOF)
+        {   // this is not considered to be an error. complete immediately.
+            aio_res_t res = {
+                req.Fildes,
+                ERROR_SUCCESS,  /* OSError    */
+                0,              /* DataAmount */
+                req.FileOffset,
+                req.DataBuffer,
+                req.QTimeNanos,
+                nanotime(),     /* CTimeNanos */
+                req.AFID,
+                req.Type,
+                0               /* Reserved   */
+            };
+            error = ERROR_SUCCESS;
+            return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
+        }
+        else
+        {   // an error has occurred. the drive loop will take care of reporting.
+            error = err;
+            return (-1);
+        }
+    }
+    else
+    {   // the read operation has completed synchronously. complete immediately.
+        aio_res_t res = {
+            req.Fildes,
+            ERROR_SUCCESS,
+            xfer,
+            req.FileOffset,
+            req.DataBuffer,
+            req.QTimeNanos,
+            nanotime(),
+            req.AFID,
+            req.Type,
+            0
+        };
+        error = ERROR_SUCCESS;
+        return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
+    }
+}
+
+/// @summary Builds a write operation and submits it to the kernel.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the read operation.
+/// @param error On return, this location stores the error return value.
+/// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
+static int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+{
+    int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
+    OVERLAPPED     *asio = asio_get(aio);
+    DWORD           xfer = 0;
+    asio->Internal       = 0;
+    asio->InternalHigh   = 0;
+    asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
+    asio->OffsetHigh     = DWORD((absolute_ofs & 0xFFFFFFFFFFFFFFFFULL) >> 32);
+    BOOL res = WriteFile(req.Fildes, req.DataBuffer, req.DataAmount, &xfer, asio);
+    if (!res || xfer == 0)
+    {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
+        // which means that the operation will complete asynchronously.
+        DWORD err  = GetLastError();
+        if   (err == ERROR_IO_PENDING)
+        {   // the operation was queued by kernel AIO. append to the active list.
+            size_t index = aio->ActiveCount++;
+            aio->AAIOList[index] = req;
+            aio->AAIOList[index].ATimeNanos = nanotime();
+            aio->ASIOList[index] = asio;
+            error = ERROR_SUCCESS;
+            return (0);
+        }
+        else if (err == ERROR_HANDLE_EOF)
+        {   // this is not considered to be an error. complete immediately
+            // with a successful read of zero bytes.
+            aio_res_t res = {
+                req.Fildes,
+                ERROR_SUCCESS,
+                0,
+                req.FileOffset,
+                req.DataBuffer,
+                req.QTimeNanos,
+                nanotime(),
+                req.AFID,
+                req.Type,
+                0
+            };
+            error = ERROR_SUCCESS;
+            return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
+        }
+        else
+        {   // an error has occurred. the drive loop will take care of reporting.
+            error = err;
+            return (-1);
+        }
+    }
+    else
+    {   // the write operation has completed synchronously. complete immediately.
+        aio_res_t res = {
+            req.Fildes,
+            ERROR_SUCCESS,
+            xfer,
+            req.FileOffset,
+            req.DataBuffer,
+            req.QTimeNanos,
+            nanotime(),
+            req.AFID,
+            req.Type,
+            0
+        };
+        error = ERROR_SUCCESS;
+        return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
+    }
+}
+
+/// @summary Synchronously processes a file flush operation.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the read operation.
+/// @param error On return, this location stores the error return value.
+/// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
+static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+{   // synchronously flush all pending writes to the file.
+    BOOL result = FlushFileBuffers(req.Fildes);
+    if (!result)  error = GetLastError();
+    else error = ERROR_SUCCESS;
+
+    // generate the completion result and push it to the queue.
+    aio_res_t res = {
+        req.Fildes,
+        error,
+        0,              /* DataAmount */
+        0,              /* FileOffset */
+        NULL,           /* DataBuffer */
+        req.QTimeNanos,
+        nanotime(),
+        req.AFID,
+        req.Type,
+        0               /* Reserved   */
+    };
+    return srsw_fifo_put(&aio->FlushResults, res) ? 0 : -1;
+}
+
+/// @summary Synchronously processes a file close operation.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the close operation.
+/// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
+static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
+{   // close the file descriptors associated with the file.
+    if (req.Fildes != INVALID_FILE_HANDLE)
+    {
+        CloseHandle(req.Fildes);
+        req.Fildes  = INVALID_FILE_HANDLE;
+    }
+
+    // generate the completion result and push it to the queue.
+    aio_res_t res = {
+        req.Fildes,
+        0,            /* OSError    */
+        0,            /* DataAmount */
+        0,            /* FileOffset */
+        NULL,         /* DataBuffer */
+        req.QTimeNanos,
+        nanotime(),   /* CTimeNanos */
+        req.AFID,
+        req.Type,
+        0             /* Reserved   */
+    };
+    return srsw_fifo_put(&aio->CloseResults, res) ? 0 : -1;
+}
+
+/// @summary Implements the main loop of the AIO driver using a polling mechanism.
+/// @param aio The AIO driver state to update.
+/// @param timeout The timeout value indicating the amount of time to wait, or
+/// INFINITE to block indefinitely. Note that aio_poll() just calls aio_tick() with
+/// a timeout of zero, which will return immediately if no events are available.
+static void aio_tick(aio_state_t *aio, DWORD timeout)
+{   // poll kernel AIO for any completed events, and process them first.
+    OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];
+    ULONG nevents = 0;
+    BOOL  iocpres = GetQueuedCompletionStatusEx(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
+    if (iocpres && nevents > 0)
+    {   // kernel AIO reported one or more events are ready.
+        for (int i = 0; i < nevents; ++i)
+        {
+            OVERLAPPED_ENTRY &evt = events[i];
+            OVERLAPPED      *asio = evt.lpOverlapped;
+            size_t            idx = 0;
+            bool            found = false;
+
+            // search for the current index of this operation by
+            // locating the OVERLAPPED pointer in the active list. this
+            // is necessary because the active list gets reordered.
+            size_t const nlive = aio->ActiveCount;
+            OVERLAPPED  **list = aio->ASIOList;
+            for (size_t op = 0 ; op < nlive; ++op)
+            {
+                if (list[op] == asio)
+                {   // found the item we're looking for.
+                    found = true;
+                    idx   = op;
+                    break;
+                }
+            }
+            if (found)
+            {
+                aio_res_t res;                      // response, populated below
+                aio_req_t req = aio->AAIOList[idx]; // make a copy of the request
+
+                // swap the last active request into this slot.
+                aio->AAIOList[idx] = aio->AAIOList[nlive-1];
+                aio->ASIOList[idx] = aio->ASIOList[nlive-1];
+                aio->ActiveCount--;
+
+                // populate the result descriptor.
+                res.Fildes      = req.Fildes;
+                res.OSError     = HRESULT_FROM_NT(evt.Internal);
+                res.DataAmount  = evt.dwNumberOfBytesTransferred;
+                res.FileOffset  = req.FileOffset; // relative
+                res.DataBuffer  = req.DataBuffer;
+                res.QTimeNanos  = req.QTimeNanos;
+                res.CTimeNanos  = nanotime();
+                res.AFID        = req.AFID;
+                res.Type        = req.Type;
+                res.Reserved    = req.Reserved;
+
+                // create the result and enqueue it in the appropriate queue.
+                // AIO_COMMAND_CLOSE is always processed synchronously and
+                // will never be completed through GetQueuedCompletionStatusEx().
+                // AIO_COMMAND_FLUSH is always processed synchronously and
+                // will never be completed through GetQueuedCompletionStatusEx().
+                switch (req.Command)
+                {
+                    case AIO_COMMAND_READ:
+                        srsw_fifo_put(&aio->ReadResults , res);
+                        break;
+                    case AIO_COMMAND_WRITE:
+                        srsw_fifo_put(&aio->WriteResults, res);
+                        break;
+                    default:
+                        break;
+                }
+
+                // return the OVERLAPPED instance to the free list.
+                asio_put(aio, asio);
+            }
+        }
+    }
+
+    // now dequeue and submit as many AIO requests as we can.
+    DWORD error  = ERROR_SUCCESS;
+    DWORD result = 0;
+    while (aio->ActiveCount < AIO_MAX_ACTIVE)
+    {   // grab the next request from the queue.
+        aio_req_t req;
+        if (srsw_fifo_get(&aio->RequestQueue, req) == false)
+        {   // there are no more requests waiting in the queue.
+            break;
+        }
+
+        // update the activation time for the request.
+        req.ATimeNanos = nanotime();
+
+        // dispatch the request based on its type.
+        switch (req.Command)
+        {
+            case AIO_COMMAND_READ:
+                result = aio_submit_read (aio, req, error);
+                break;
+            case AIO_COMMAND_WRITE:
+                result = aio_submit_write(aio, req, error);
+                break;
+            case AIO_COMMAND_FLUSH:
+                result = aio_process_flush(aio, req, error);
+                break;
+            case AIO_COMMAND_CLOSE:
+                result = aio_process_close(aio, req);
+                break;
+            default:
+                result = -1;
+                error  = ERROR_INVALID_PARAMETER;
+                break;
+        }
+
+        // TODO: need to complete the request with error if result == -1.
+    }
+}
+
+/// @summary Implements the main loop of the AIO driver.
+/// @param aio The AIO driver state to update.
+static inline void aio_poll(aio_state_t *aio)
+{   // configure a zero timeout so we won't block.
+    aio_tick(aio , 0);
+}
+
+/// @summary Allocates a new AIO context and initializes the AIO state.
+/// @param aio The AIO state to allocate and initialize.
+/// @return 0 if the operation completed successfully; otherwise, the GetLastError value.
+static DWORD create_aio_state(aio_state_t *aio)
+{
+    HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+    if (iocp == NULL)
+    {   // unable to create the AIO context; everything else fails.
+        return GetLastError();
+    }
+    // setup the iocb free list. all items are initially available.
+    for (size_t i = 0, n =  AIO_MAX_ACTIVE; i < n; ++i)
+    {
+        aio->ASIOFree[i] = &aio->ASIOPool[i];
+    }
+    aio->ASIOContext   = iocp;
+    aio->ActiveCount   = 0;
+    aio->ASIOFreeCount = AIO_MAX_ACTIVE;
+    flush_srsw_fifo(&aio->RequestQueue);
+    flush_srsw_fifo(&aio->ReadResults );
+    flush_srsw_fifo(&aio->WriteResults);
+    flush_srsw_fifo(&aio->CloseResults);
+    return 0;
+}
+
+/// @summary Cancels all pending AIO operations and frees associated resources.
+/// This call may block until pending operations have completed.
+/// @param aio The AIO state to delete.
+static void delete_aio_state(aio_state_t *aio)
+{
+    if (aio->ASIOContext != NULL)
+    {
+        CloseHandle(aio->ASIOContext);
+    }
+    aio->ASIOContext   = NULL;
+    aio->ActiveCount   = 0;
+    aio->ASIOFreeCount = 0;
+    flush_srsw_fifo(&aio->RequestQueue);
+    flush_srsw_fifo(&aio->ReadResults );
+    flush_srsw_fifo(&aio->WriteResults);
+    flush_srsw_fifo(&aio->CloseResults);
+}
+
+/// @summary Determine whether a path references a file within an archive, (and
+/// if so, which one) or whether it references a native file. Open the file if
+/// necessary, and return basic file information to the caller. This function
+/// should only be used for read-only files, files cannot be written in an archive.
+/// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param fd On return, stores the file descriptor of the archive or native file.
+/// @param efd On return, stores the eventfd descriptor of the archive or native file.
+/// @param lsize On return, stores the logical size of the file, in bytes. This is the
+/// size of the file after all size-changing transformations (decompression) is performed.
+/// For native files, the logical and physical file size are the same.
+/// @param psize On return, stores the physical size of the file, in bytes. This is the
+/// corresponds to the number of bytes that must be read to read all file data on disk.
+/// For native files, the logical  and physical file size are the same.
+/// @param offset On return, stores the byte offset of the first byte of the file.
+/// @param sector_size On return, stores the physical sector size of the disk.
+/// @return true if the file could be resolved.
+static bool vfs_resolve_file(char const *path, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+{   // TODO: determine whether this path references a file contained within an archive.
+    // for now, we only handle native file paths, which may be absolute or relative.
+    // TODO: need to associate the returned file handle with the IOCP handle!
+    bool native_path = true;
+    if  (native_path)
+    {
+        DWORD access = GENERIC_READ;
+        DWORD share  = FILE_SHARE_READ;
+        DWORD create = OPEN_EXISTING;
+        DWORD flags  = FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
+        if (open_file_raw(path, access, share, create, flags, fd, psize, sector_size))
+        {   // native files always begin at the first byte.
+            // logical and physical size are the same.
+            lsize  = psize;
+            offset = 0;
+            return true;
+        }
+        else
+        {   // unable to open the file, so fail immediately.
+            fd = INVALID_HANDLE_VALUE; lsize = psize = offset = sector_size = 0;
+            return false;
+        }
+    }
+}
+
+/// @summary Processes queued file open operations.
+/// @param vfs The VFS driver state.
+static void vfs_process_opens(vfs_state_t *vfs)
+{   // TODO: process pending explicit file open requests.
+}
+
+/// @summary Processes queued file load operations.
+/// @param vfs The VFS driver state.
+static void vfs_process_loads(vfs_state_t *vfs)
+{
+    while (vfs->ActiveCount < MAX_OPEN_FILES)
+    {
+        vfs_lfreq_t   req;
+        if (srmw_fifo_get(&vfs->LoadQueue, req) == false)
+        {   // there are no pending loads, so we're done.
+            break;
+        }
+
+        // the file is already open; it was opened during platform_load_file().
+        // all we need to do is update our internal active file list.
+        size_t index = vfs->ActiveCount++;
+        vfs->FileAFID[index]            = req.AFID;
+        vfs->FileType[index]            = req.Type;
+        vfs->FileMode[index]            = VFS_MODE_LOAD;
+        vfs->Priority[index]            = req.Priority;
+        vfs->RdOffset[index]            = 0;
+        vfs->FileInfo[index].Fildes     = req.Fildes;
+        vfs->FileInfo[index].FileSize   = req.FileSize;
+        vfs->FileInfo[index].DataSize   = req.DataSize;
+        vfs->FileInfo[index].FileOffset = req.FileOffset;
+        vfs->FileInfo[index].SectorSize = req.SectorSize;
+    }
+}
+
+/// @summary Processes any pending file close requests.
+/// @param vfs The VFS driver state.
+static void vfs_process_closes(vfs_state_t *vfs)
+{
+    while (vfs->ActiveCount > 0)
+    {   // grab the next close command from the queue.
+        vfs_cfreq_t   req;
+        if (srmw_fifo_get(&vfs->CloseQueue, req) == false)
+        {   // there are no more pending closes, so we're done.
+            break;
+        }
+
+        // locate the corresponding file record and queue a close to VFS.
+        // it's important that the operation go through the VFS queue, so
+        // that we can be sure any pending I/O operations on the file have
+        // been submitted prior to the file being closed.
+        intptr_t const  AFID     = req.AFID;
+        intptr_t const *AFIDList = vfs->FileAFID;
+        for (size_t  i = 0 ; i < vfs->ActiveCount; ++i)
+        {
+            if (AFIDList[i] == AFID)
+            {
+                aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[i]);
+                if (aio_req != NULL)
+                {   // fill out the request. it will be processed at a later time.
+                    aio_req->Command    = AIO_COMMAND_CLOSE;
+                    aio_req->Fildes     = vfs->FileInfo[i].Fildes;
+                    aio_req->DataAmount = 0;
+                    aio_req->BaseOffset = vfs->FileInfo[i].FileOffset;
+                    aio_req->FileOffset = 0;
+                    aio_req->DataBuffer = NULL;
+                    aio_req->QTimeNanos = nanotime();
+                    aio_req->ATimeNanos = 0;
+                    aio_req->AFID       = AFID;
+                    aio_req->Type       = vfs->FileType[i];
+                    aio_req->Reserved   = 0;
+
+                    // delete the file from our internal state immediately.
+                    size_t const last   = vfs->ActiveCount - 1;
+                    vfs->FileAFID[i]    = vfs->FileAFID[last];
+                    vfs->FileType[i]    = vfs->FileType[last];
+                    vfs->FileMode[i]    = vfs->FileMode[last];
+                    vfs->Priority[i]    = vfs->Priority[last];
+                    vfs->RdOffset[i]    = vfs->RdOffset[last];
+                    vfs->FileInfo[i]    = vfs->FileInfo[last];
+                    vfs->ActiveCount    = last;
+                    break; // dequeue the next request.
+                }
+                else
+                {   // there's no more space in the pending I/O operation queue.
+                    // put this request back in the queue and try again later.
+                    // no point in continuing on with further processing.
+                    // TODO: track this statistic somewhere.
+                    srmw_fifo_put(&vfs->CloseQueue, req);
+                    return;
+                }
+            } // if (AFIDList[i] == AFID)
+        } // for (each active file)
+    } // while (active files)
+}
+
+/// @summary Processes all completed file close notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    // there's nothing that the VFS driver needs to do here for the application.
+    while (srsw_fifo_get(&aio->CloseResults, res))
+    {
+        /* empty */
+    }
+}
+
+/// @summary Processes all completed file read notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    while (srsw_fifo_get(&aio->ReadResults, res))
+    {   // convert the AIO result into something useful for the platform layer.
+        vfs_res_t iores;
+        iores.AFID       = res.AFID;
+        iores.DataBuffer = res.DataBuffer;
+        iores.FileOffset = res.FileOffset; // this is the relative offset
+        iores.DataAmount = res.DataAmount;
+        iores.OSError    = res.OSError;
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        {   // TODO: track this statistic somewhere.
+            // This should not be happening.
+        }
+    }
+}
+
+/// @summary Processes all completed file write notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    while (srsw_fifo_get(&aio->WriteResults, res))
+    {   // convert the AIO result into something useful for the platform layer.
+        vfs_res_t iores;
+        iores.AFID       = res.AFID;
+        iores.DataBuffer = res.DataBuffer;
+        iores.FileOffset = res.FileOffset; // this is the relative offset
+        iores.DataAmount = res.DataAmount;
+        iores.OSError    = res.OSError;
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        {   // TODO: track this statistic somewhere.
+            // This should not be happening.
+        }
+    }
+}
+
+/// @summary Processes all completed file flush notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    // there's nothing that the VFS driver needs to do here for the application.
+    while (srsw_fifo_get(&aio->FlushResults, res))
+    {
+        /* empty */
+    }
+}
+
+/// @summary Processes all pending buffer returns and releases memory back to the pool.
+/// @param vfs The VFS driver state.
+static void vfs_process_buffer_returns(vfs_state_t *vfs)
+{
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        void          *buffer;
+        vfs_returnq_t *returnq   = &vfs->IoReturn[i];
+        iobuf_alloc_t &allocator =  vfs->IoAllocator;
+        while (srsw_fifo_get(returnq, buffer))
+        {
+            iobuf_put(allocator, buffer);
+        }
+    }
+}
+
+/// @summary Updates the status of all active file loads, and submits I/O operations.
+/// @param vfs The VFS driver state.
+/// @return true if the tick should continue submitting I/O operations, or false if
+/// either buffer space is full or the I/O operation queue is full.
+static bool vfs_update_loads(vfs_state_t *vfs)
+{
+    iobuf_alloc_t &allocator = vfs->IoAllocator;
+    size_t const read_amount = allocator.AllocSize;
+    size_t       file_count  = 0;
+    uint32_t     priority    = 0;
+    uint16_t     index       = 0;
+    uint16_t     index_list[MAX_OPEN_FILES];
+    vfs_io_fpq_t file_queue;
+
+    io_fpq_clear(&file_queue);
+    file_count = map_files_by_mode(index_list, vfs, VFS_MODE_LOAD);
+    build_file_queue(&file_queue, vfs, index_list, file_count);
+    while(io_fpq_get(&file_queue, index, priority))
+    {
+        size_t nqueued = 0;
+        while (iobuf_bytes_free(allocator) > 0)
+        {   // allocate a new request in our internal operation queue.
+            aio_req_t *req  = io_opq_put(&vfs->IoOperations, priority);
+            if (req != NULL)
+            {
+                req->Command    = AIO_COMMAND_READ;
+                req->Fildes     = vfs->FileInfo[index].Fildes;
+                req->DataAmount = read_amount;
+                req->BaseOffset = vfs->FileInfo[index].FileOffset;
+                req->FileOffset = vfs->RdOffset[index];
+                req->DataBuffer = iobuf_get(allocator);
+                req->QTimeNanos = nanotime();
+                req->ATimeNanos = 0;
+                req->AFID       = vfs->FileAFID[index];
+                req->Type       = vfs->FileType[index];
+                req->Reserved   = 0;
+                nqueued++;
+
+                // update the byte offset to the next read.
+                int64_t newofs  = vfs->RdOffset[index] + read_amount;
+                vfs->RdOffset[index] = newofs;
+                if (newofs >= vfs->FileInfo[index].FileSize)
+                {   // reached or passed end-of-file; queue a close.
+                    // we will continue on with the next queued file.
+                    vfs_cfreq_t creq;
+                    creq.AFID = vfs->FileAFID[index];
+                    srmw_fifo_put(&vfs->CloseQueue, creq);
+                    break;
+                }
+            }
+            // we ran out of I/O queue space; no point in continuing.
+            // TODO: track this statistic somewhere, we want to know
+            // how often this happens.
+            else return false;
+        }
+        if (nqueued == 0)
+        {   // we ran out of I/O buffer space; no point in continuing.
+            // TODO: track this statistic somewhere, we want to know
+            // how often this happens.
+            return false;
+        }
+    }
+    return true;
+}
+
+/// @summary Processes all queued explicit read operations.
+/// @param vfs The VFS driver state.
+/// @return true if the tick should continue submitting I/O operations, or false if
+/// either buffer space is full or the I/O operation queue is full.
+static bool vfs_process_reads(vfs_state_t *vfs)
+{   // TODO: process any pending explicit read operations.
+    return true;
+}
+
+/// @summary Processes all queued explicit write operations.
+/// @param vfs The VFS driver state.
+/// @return true if the tick should continue submitting I/O operations, or false if
+/// either buffer space is full or the I/O operation queue is full.
+static bool vfs_process_writes(vfs_state_t *vfs)
+{   // TODO: process any pending explicit write operations.
+    return true;
+}
+
+/// @summary Implements the main body of the VFS update loop, which processes
+/// requests from the application layer, submits I/O requests to the AIO driver,
+/// and dispatches completion notifications from the AIO layer back to the application.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
+{
+    // free up as much buffer state as possible.
+    vfs_process_buffer_returns(vfs);
+
+    // generate read and write I/O operations.
+    vfs_update_loads(vfs);
+    vfs_process_reads(vfs);
+    vfs_process_writes(vfs);
+
+    // close file requests should be processed after all read and write requests.
+    // this ensures that all I/O has been submitted before closing the file.
+    vfs_process_closes(vfs);
+
+    // we're done generating operations, so push as much as possible to AIO.
+    aio_req_t request;
+    while (io_opq_top(&vfs->IoOperations, request))
+    {   // we were able to retrieve an operation from our internal queue.
+        if (srsw_fifo_put(&aio->RequestQueue, request))
+        {   // we were able to push it to AIO, so remove it from our queue.
+            io_opq_get(&vfs->IoOperations, request);
+        }
+    }
+
+    // dispatch any completed I/O operations to the per-type queues for
+    // processing by the platform layer and dispatching to the application.
+    vfs_process_completed_reads  (vfs, aio);
+    vfs_process_completed_writes (vfs, aio);
+    vfs_process_completed_flushes(vfs, aio);
+    vfs_process_completed_closes (vfs, aio);
+
+    // open file requests should be processed after all close requests.
+    vfs_process_opens(vfs);
+    vfs_process_loads(vfs);
+}
+
+/// @summary Returns an I/O buffer to the pool. This function should be called
+/// for every read or write result that the platform layer dequeues.
+/// @param vfs The VFS state that posted the I/O result.
+/// @param type One of file_type_e indicating the type of file being processed.
+/// @param buffer The buffer to return. This value may be NULL.
+static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
+{
+    if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
+}
+
+/// @summary Initialize a VFS driver state object and allocate any I/O resources.
+/// @param vfs The VFS driver state to initialize.
+/// @return true if the VFS driver state is initialized.
+static bool create_vfs_state(vfs_state_t *vfs)
+{   // TODO: some error handling would be nice.
+    create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
+    create_srmw_fifo(&vfs->CloseQueue, 10); // TODO: figure out capacity
+    create_srmw_fifo(&vfs->LoadQueue , 10); // TODO: figure out capacity
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        flush_srsw_fifo(&vfs->IoResult[i]);
+        flush_srsw_fifo(&vfs->IoReturn[i]);
+    }
+    io_opq_clear(&vfs->IoOperations);
+    vfs->ActiveCount = 0;
+    return true;
+}
+
+/// @summary Free resources associated with a VFS driver state.
+/// @param vfs The VFS driver state to delete.
+static void delete_vfs_state(vfs_state_t *vfs)
+{
+    vfs->ActiveCount = 0;
+    io_opq_clear(&vfs->IoOperations);
+    delete_srmw_fifo(&vfs->LoadQueue);
+    delete_srmw_fifo(&vfs->CloseQueue);
+    delete_iobuf_allocator(vfs->IoAllocator);
+    for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+    {
+        flush_srsw_fifo(&vfs->IoResult[i]);
+        flush_srsw_fifo(&vfs->IoReturn[i]);
+    }
+}
+
 /// @summary Checks a file type value to make sure it is known.
 /// @param file_type One of the values of the file_type_e enumeration.
 /// @return true if the file type is known.
@@ -1217,7 +2191,7 @@ int main(int argc, char **argv)
 
     // initialize the high-resolution timer on the system.
     inittime();
-    
+
     // resolve entry points in dynamic libraries.
     // TODO: this will probably need to return success/failure.
     resolve_kernel_apis();
