@@ -18,7 +18,7 @@ PROJ_LDFLAGS  = -s -Wl,--subsystem,console
 
 all:: ${TARGET}
 
-${TARGET}: ${OBJECTS} ${RSRC_OBJECTS}
+${TARGET}: ${OBJECTS}
 	${CC} ${LDFLAGS} ${PROJ_LDFLAGS} -o $@ $^ ${LIBRARIES}
 
 ${OBJECTS}: %.o: %.cc ${DEPENDENCIES}
