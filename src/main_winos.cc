@@ -402,6 +402,17 @@ struct vfs_io_fpq_t
     #undef MF
 };
 
+/// @summary Statistics tracked by the platform I/O system.
+struct io_stats_t
+{
+    #define NT         FILE_TYPE_COUNT
+    uint64_t           NStallsAIOQ;  /// Stalls due to full AIO operation queue.
+    uint64_t           NStallsVFSQ;  /// Stalls due to full VFS operation queue.
+    uint64_t           NStallsIOBuf; /// Stalls due to exhausted I/O buffer space.
+    uint64_t           NStallsFT[NT];/// Stalls due to slow file data processing.
+    #undef NT
+};
+
 /// @summary Defines the state data maintained by a VFS driver instance.
 struct vfs_state_t
 {
@@ -2189,8 +2200,8 @@ static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 static bool create_vfs_state(vfs_state_t *vfs)
 {   // TODO: some error handling would be nice.
     create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
-    create_srmw_fifo(&vfs->CloseQueue, 10); // TODO: figure out capacity
-    create_srmw_fifo(&vfs->LoadQueue , 10); // TODO: figure out capacity
+    create_srmw_fifo(&vfs->CloseQueue, MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->LoadQueue , MAX_OPEN_FILES);
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
         flush_srsw_fifo(&vfs->IoResult[i]);
@@ -2214,6 +2225,22 @@ static void delete_vfs_state(vfs_state_t *vfs)
     {
         flush_srsw_fifo(&vfs->IoResult[i]);
         flush_srsw_fifo(&vfs->IoReturn[i]);
+    }
+}
+
+/// @summary Resets the platform I/O statistics to zero.
+/// @param stats The counters to reset.
+static void init_io_stats(io_stats_t *stats)
+{
+    if (stats != NULL)
+    {
+        stats->NStallsAIOQ   = 0;
+        stats->NStallsVFSQ   = 0;
+        stats->NStallsIOBuf  = 0;
+        for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+        {
+            stats->NStallsFT[i] = 0;
+        }
     }
 }
 
