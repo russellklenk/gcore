@@ -1069,7 +1069,7 @@ static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
             else m  = pq->Priority[l] < pq->Priority[r] ? l : r;
 
             // now compare the node at pos with the highest priority child, m.
-            if (pq->Priority[pos] < pq->Priority[m] < 0)
+            if (pq->Priority[pos] < pq->Priority[m])
             {   // children have lower priority than parent. order restored.
                 break;
             }
@@ -2010,6 +2010,7 @@ int main(int argc, char **argv)
             offset += res.DataAmount;
         }
     }
+    vfs_tick(&VFS_STATE); // process any final returns
 
 cleanup:
     delete_aio_state(&AIO_STATE);
