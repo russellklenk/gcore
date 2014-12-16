@@ -138,35 +138,43 @@ typedef struct _FILE_END_OF_FILE_INFO {
 //   Constants   //
 /////////////////*/
 /// The scale used to convert from seconds into nanoseconds.
-static uint64_t const SEC_TO_NANOSEC = 1000000000ULL;
+static uint64_t  const SEC_TO_NANOSEC = 1000000000ULL;
 
 /// @summary Define the number of times per-second we want the I/O system to
 /// update (assuming it's on a background thread and we have that control).
 /// The lower the update rate of the I/O system, the more latency there is in
 /// processing and completing I/O requests, and the lower the I/O thoroughput.
-static size_t   const IO_SYSTEM_RATE = 60;
+static size_t    const IO_SYSTEM_RATE = 60;
 
 /// @summary Define the maximum number of concurrently open files.
-static size_t   const MAX_OPEN_FILES = 128;
+static size_t    const MAX_OPEN_FILES = 128;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
 /// poll during each tick, and the maximum number the underlying OS can handle.
-/// TODO: Make this overridable at compile time.
-static size_t   const AIO_MAX_ACTIVE = 512;
+#ifndef WINOS_AIO_MAX_ACTIVE    // can override at compile time
+#define WINOS_AIO_MAX_ACTIVE    512
+#endif
+static size_t    const AIO_MAX_ACTIVE = WINOS_AIO_MAX_ACTIVE;
 
 /// @summary Define the size of the I/O buffer. This is calculated based on an
 /// maximum I/O transfer rate of 960MB/s, and an I/O system tick rate of 60Hz;
 /// 960MB/sec divided across 60 ticks/sec gives 16MB/tick maximum transfer rate.
-/// TODO: Make this overridable at compile time.
-static size_t   const VFS_IOBUF_SIZE = 16 * 1024 * 1024;
+#ifndef WINOS_VFS_IOBUF_SIZE    // can override at compile time
+#define WINOS_VFS_IOBUF_SIZE   (16 * 1024 * 1024)
+#endif
+static size_t    const VFS_IOBUF_SIZE = WINOS_VFS_IOBUF_SIZE;
 
 /// @summary Define the size of the buffer allocated for each I/O request.
-static size_t   const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
+static size_t    const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
 
 /// @summary The spin count used on critical sections protecting shared resources
 /// of srmw_freelist_t and srmw_fifo_t.
-static DWORD    const SPIN_COUNT_Q   = 4096;
+static DWORD     const SPIN_COUNT_Q   = 4096;
+
+/// @summary The special I/O completion port completion key used to notify the
+/// AIO driver to begin its shutdown process.
+static ULONG_PTR const AIO_SHUTDOWN   = ULONG_PTR(-1);
 
 /*///////////////////
 //   Local Types   //
@@ -479,6 +487,37 @@ static void resolve_kernel_apis(void)
     // fallback if any of these APIs are not available.
     if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
     if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
+}
+
+/// @summary Elevates the privileges for the process to include the privilege
+/// SE_MANAGE_VOLUME_NAME, so that SetFileValidData() can be used to initialize
+/// a file without having to zero-fill the underlying sectors. This is optional,
+/// and we don't want it failing to prevent the application from launching.
+static void elevate_process_privileges(void)
+{
+    TOKEN_PRIVILEGES tp;
+    HANDLE        token;
+    LUID           luid;
+
+    OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &token);
+    if (LookupPrivilegeValue(NULL, SE_MANAGE_VOLUME_NAME, &luid))
+    {
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL))
+        {   // Privilege adjustment succeeded.
+            CloseHandle(token);
+        }
+        else
+        {   // Privilege adjustment failed.
+            CloseHandle(token);
+        }
+    }
+    else
+    {   // lookup of SE_MANAGE_VOLUME_NAME failed.
+        CloseHandle(token);
+    }
 }
 
 /// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
@@ -1314,6 +1353,7 @@ static size_t physical_sector_size(HANDLE file)
 
 /// @summary Synchronously opens a file and retrieves various information.
 /// @param path The path of the file to open.
+/// @param iocp The I/O completion port to associate with the file handle, or NULL.
 /// @param access Usually GENERIC_READ, GENERIC_WRITE, or GENERIC_READ|GENERIC_WRITE.
 /// See MSDN documentation for CreateFile, dwDesiredAccess parameter.
 /// @param share Usually FILE_SHARE_READ, FILE_SHARE_WRITE, or FILE_SHARE_READ|FILE_SHARE_WRITE.
@@ -1326,7 +1366,7 @@ static size_t physical_sector_size(HANDLE file)
 /// @param file_size On return, this value is set to the current size of the file, in bytes.
 /// @param sector_size On return, this value is set to the size of the physical disk sector, in bytes.
 /// @return true if all operations were successful.
-static bool open_file_raw(char const *path, DWORD access, DWORD share, DWORD create, DWORD flags, HANDLE &fd, int64_t &file_size, size_t &sector_size)
+static bool open_file_raw(char const *path, HANDLE iocp, DWORD access, DWORD share, DWORD create, DWORD flags, HANDLE &fd, int64_t &file_size, size_t &sector_size)
 {
     LARGE_INTEGER fsize   = {0};
     HANDLE        hFile   = INVALID_HANDLE_VALUE;
@@ -1357,6 +1397,12 @@ static bool open_file_raw(char const *path, DWORD access, DWORD share, DWORD cre
     ssize = physical_sector_size(hFile);
     if (!GetFileSizeEx(hFile, &fsize))
     {   // the file size cannot be retrieved.
+        goto error_cleanup;
+    }
+
+    // associate the file handle to the I/O completion port.
+    if (iocp != NULL && CreateIoCompletionPort(hFile, iocp, 0, 0) != iocp)
+    {   // the file handle could not be associated with the IOCP.
         goto error_cleanup;
     }
 
@@ -1405,6 +1451,28 @@ static inline void asio_put(aio_state_t *aio, OVERLAPPED *asio)
     aio->ASIOFree[aio->ASIOFreeCount++] = asio;
 }
 
+/// @summary Helper function to build an AIO result packet.
+/// @param error The error code to return.
+/// @param amount The amount of data returned.
+/// @param req The request associated with the result.
+/// @return The populated AIO result packet.
+static inline aio_res_t aio_result(DWORD error, uint32_t amount, aio_req_t const &req)
+{
+    aio_res_t res = {
+        req.Fildes,      /* Fildes     */
+        error,           /* OSError    */
+        amount,          /* DataAmount */
+        req.FileOffset,  /* FileOffset */ /* the relative offset */
+        req.DataBuffer,  /* DataBuffer */
+        req.QTimeNanos,  /* QTimeNanos */
+        nanotime(),      /* CTimeNanos */
+        req.AFID,        /* AFID       */
+        req.Type,        /* Type       */
+        0                /* Reserved   */
+    };
+    return res;
+}
+
 /// @summary Builds a read operation and submits it to the kernel.
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the read operation.
@@ -1435,42 +1503,22 @@ static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
         }
         else if (err == ERROR_HANDLE_EOF)
         {   // this is not considered to be an error. complete immediately.
-            aio_res_t res = {
-                req.Fildes,
-                ERROR_SUCCESS,  /* OSError    */
-                0,              /* DataAmount */
-                req.FileOffset,
-                req.DataBuffer,
-                req.QTimeNanos,
-                nanotime(),     /* CTimeNanos */
-                req.AFID,
-                req.Type,
-                0               /* Reserved   */
-            };
             error = ERROR_SUCCESS;
+            aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
             return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
         }
         else
-        {   // an error has occurred. the drive loop will take care of reporting.
+        {   // an error has occurred. complete immediately with error.
             error = err;
+            aio_res_t res = aio_result(err, 0, req);
+            srsw_fifo_put(&aio->ReadResults, res);
             return (-1);
         }
     }
     else
     {   // the read operation has completed synchronously. complete immediately.
-        aio_res_t res = {
-            req.Fildes,
-            ERROR_SUCCESS,
-            xfer,
-            req.FileOffset,
-            req.DataBuffer,
-            req.QTimeNanos,
-            nanotime(),
-            req.AFID,
-            req.Type,
-            0
-        };
         error = ERROR_SUCCESS;
+        aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
     }
 }
@@ -1504,44 +1552,23 @@ static int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error
             return (0);
         }
         else if (err == ERROR_HANDLE_EOF)
-        {   // this is not considered to be an error. complete immediately
-            // with a successful read of zero bytes.
-            aio_res_t res = {
-                req.Fildes,
-                ERROR_SUCCESS,
-                0,
-                req.FileOffset,
-                req.DataBuffer,
-                req.QTimeNanos,
-                nanotime(),
-                req.AFID,
-                req.Type,
-                0
-            };
+        {   // this is not considered to be an error. complete immediately.
             error = ERROR_SUCCESS;
+            aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
             return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
         }
         else
-        {   // an error has occurred. the drive loop will take care of reporting.
+        {   // an error has occurred. complete immediately.
             error = err;
+            aio_res_t res = aio_result(err, 0, req);
+            srsw_fifo_put(&aio->WriteResults, res);
             return (-1);
         }
     }
     else
     {   // the write operation has completed synchronously. complete immediately.
-        aio_res_t res = {
-            req.Fildes,
-            ERROR_SUCCESS,
-            xfer,
-            req.FileOffset,
-            req.DataBuffer,
-            req.QTimeNanos,
-            nanotime(),
-            req.AFID,
-            req.Type,
-            0
-        };
         error = ERROR_SUCCESS;
+        aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
     }
 }
@@ -1558,18 +1585,7 @@ static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &erro
     else error = ERROR_SUCCESS;
 
     // generate the completion result and push it to the queue.
-    aio_res_t res = {
-        req.Fildes,
-        error,
-        0,              /* DataAmount */
-        0,              /* FileOffset */
-        NULL,           /* DataBuffer */
-        req.QTimeNanos,
-        nanotime(),
-        req.AFID,
-        req.Type,
-        0               /* Reserved   */
-    };
+    aio_res_t res = aio_result(error, 0, req);
     return srsw_fifo_put(&aio->FlushResults, res) ? 0 : -1;
 }
 
@@ -1579,25 +1595,14 @@ static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &erro
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
 static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 {   // close the file descriptors associated with the file.
-    if (req.Fildes != INVALID_FILE_HANDLE)
+    if (req.Fildes != INVALID_HANDLE_VALUE)
     {
         CloseHandle(req.Fildes);
-        req.Fildes  = INVALID_FILE_HANDLE;
+        req.Fildes  = INVALID_HANDLE_VALUE;
     }
 
     // generate the completion result and push it to the queue.
-    aio_res_t res = {
-        req.Fildes,
-        0,            /* OSError    */
-        0,            /* DataAmount */
-        0,            /* FileOffset */
-        NULL,         /* DataBuffer */
-        req.QTimeNanos,
-        nanotime(),   /* CTimeNanos */
-        req.AFID,
-        req.Type,
-        0             /* Reserved   */
-    };
+    aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
     return srsw_fifo_put(&aio->CloseResults, res) ? 0 : -1;
 }
 
@@ -1606,9 +1611,10 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 /// @param timeout The timeout value indicating the amount of time to wait, or
 /// INFINITE to block indefinitely. Note that aio_poll() just calls aio_tick() with
 /// a timeout of zero, which will return immediately if no events are available.
-static void aio_tick(aio_state_t *aio, DWORD timeout)
+/// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
+static int aio_tick(aio_state_t *aio, DWORD timeout)
 {   // poll kernel AIO for any completed events, and process them first.
-    OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];
+    OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];  // STACK: 8-16KB depending on OS.
     ULONG nevents = 0;
     BOOL  iocpres = GetQueuedCompletionStatusEx(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
     if (iocpres && nevents > 0)
@@ -1636,25 +1642,13 @@ static void aio_tick(aio_state_t *aio, DWORD timeout)
             }
             if (found)
             {
-                aio_res_t res;                      // response, populated below
                 aio_req_t req = aio->AAIOList[idx]; // make a copy of the request
+                aio_res_t res = aio_result(HRESULT_FROM_NT(evt.Internal), evt.dwNumberOfBytesTransferred, req);
 
                 // swap the last active request into this slot.
                 aio->AAIOList[idx] = aio->AAIOList[nlive-1];
                 aio->ASIOList[idx] = aio->ASIOList[nlive-1];
                 aio->ActiveCount--;
-
-                // populate the result descriptor.
-                res.Fildes      = req.Fildes;
-                res.OSError     = HRESULT_FROM_NT(evt.Internal);
-                res.DataAmount  = evt.dwNumberOfBytesTransferred;
-                res.FileOffset  = req.FileOffset; // relative
-                res.DataBuffer  = req.DataBuffer;
-                res.QTimeNanos  = req.QTimeNanos;
-                res.CTimeNanos  = nanotime();
-                res.AFID        = req.AFID;
-                res.Type        = req.Type;
-                res.Reserved    = req.Reserved;
 
                 // create the result and enqueue it in the appropriate queue.
                 // AIO_COMMAND_CLOSE is always processed synchronously and
@@ -1675,6 +1669,14 @@ static void aio_tick(aio_state_t *aio, DWORD timeout)
 
                 // return the OVERLAPPED instance to the free list.
                 asio_put(aio, asio);
+            }
+            else if (evt.lpCompletionKey == AIO_SHUTDOWN)
+            {   // this is the shutdown signal.
+                return 1;
+            }
+            else
+            {   // TODO: track this statistic somewhere.
+                // this should not happen.
             }
         }
     }
@@ -1713,16 +1715,16 @@ static void aio_tick(aio_state_t *aio, DWORD timeout)
                 error  = ERROR_INVALID_PARAMETER;
                 break;
         }
-
-        // TODO: need to complete the request with error if result == -1.
     }
+    return 0;
 }
 
 /// @summary Implements the main loop of the AIO driver.
 /// @param aio The AIO driver state to update.
-static inline void aio_poll(aio_state_t *aio)
+/// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
+static inline int aio_poll(aio_state_t *aio)
 {   // configure a zero timeout so we won't block.
-    aio_tick(aio , 0);
+    return aio_tick(aio , 0);
 }
 
 /// @summary Allocates a new AIO context and initializes the AIO state.
@@ -1773,8 +1775,9 @@ static void delete_aio_state(aio_state_t *aio)
 /// necessary, and return basic file information to the caller. This function
 /// should only be used for read-only files, files cannot be written in an archive.
 /// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param iocp The I/O completion port from the AIO driver to associate with the
+/// file handle, or NULL if no I/O completion port is being used for I/O requests.
 /// @param fd On return, stores the file descriptor of the archive or native file.
-/// @param efd On return, stores the eventfd descriptor of the archive or native file.
 /// @param lsize On return, stores the logical size of the file, in bytes. This is the
 /// size of the file after all size-changing transformations (decompression) is performed.
 /// For native files, the logical and physical file size are the same.
@@ -1784,10 +1787,9 @@ static void delete_aio_state(aio_state_t *aio)
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @return true if the file could be resolved.
-static bool vfs_resolve_file(char const *path, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+static bool vfs_resolve_file_read(char const *path, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
-    // TODO: need to associate the returned file handle with the IOCP handle!
     bool native_path = true;
     if  (native_path)
     {
@@ -1795,7 +1797,7 @@ static bool vfs_resolve_file(char const *path, HANDLE &fd, int64_t &lsize, int64
         DWORD share  = FILE_SHARE_READ;
         DWORD create = OPEN_EXISTING;
         DWORD flags  = FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
-        if (open_file_raw(path, access, share, create, flags, fd, psize, sector_size))
+        if (open_file_raw(path, iocp, access, share, create, flags, fd, psize, sector_size))
         {   // native files always begin at the first byte.
             // logical and physical size are the same.
             lsize  = psize;
@@ -1806,6 +1808,64 @@ static bool vfs_resolve_file(char const *path, HANDLE &fd, int64_t &lsize, int64
         {   // unable to open the file, so fail immediately.
             fd = INVALID_HANDLE_VALUE; lsize = psize = offset = sector_size = 0;
             return false;
+        }
+    }
+}
+
+/// @summary Resolve a path to a path on the native file system, open that file
+/// for writing, and return basic file information to the caller. This function
+/// should be used for files which can be read or written.
+/// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param iocp The I/O completion port from the AIO driver to associate with the
+/// file handle, or NULL if no I/O completion port is being used for I/O requests.
+/// @param fd On return, stores the file descriptor of the archive or native file.
+/// @param lsize On return, stores the logical size of the file, in bytes. If this
+/// value is set to something greater than zero when the function is called, the
+/// file is pre-allocated to be the specified size; otherwise, the file size is
+/// left unchanged (if the file exists), or is zero if the file was just created.
+/// @param psize On return, this is always set to the same value as lsize.
+/// @param offset On return, stores the byte offset of the first byte of the file.
+/// If this value is set to -1 when the function is called, the file pointer is
+/// positioned at the current end-of-file marker (so that data will be appended.)
+/// @param sector_size On return, stores the physical sector size of the disk.
+/// @return true if the file could be resolved.
+static bool vfs_resolve_file_write(char const *path, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+{   // TODO: resolve path to a native path. only files opened on the native
+    // file system can be opened for writing.
+    bool native_path = true;
+    if  (native_path)
+    {
+        DWORD access = GENERIC_READ | GENERIC_WRITE;
+        DWORD share  = 0;          // do not share with anyone
+        DWORD create = OPEN_ALWAYS;// or CREATE_ALWAYS, to truncate?
+        DWORD flags  = FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH;
+        if (open_file_raw(path, iocp, access, share, create, flags, fd, psize, sector_size))
+        {
+            if (lsize > 0)
+            {   // pre-allocate space for the file. this is best-effort.
+                int64_t logical_size  = lsize;
+                int64_t physical_size = align_up(logical_size, sector_size);
+                FILE_END_OF_FILE_INFO eof; eof.EndOfFile.QuadPart      = logical_size;
+                FILE_ALLOCATION_INFO  sec; sec.AllocationSize.QuadPart = physical_size;
+                SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
+                SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
+                SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
+                lsize  = int64_t(logical_size);
+                psize  = int64_t(logical_size);
+            }
+            else
+            {   // no size was specified, so keep whatever the current size is.
+                lsize  = psize;
+            }
+            if (offset < 0)
+            {   // position the file pointer at the current end-of-file.
+                LARGE_INTEGER dist    = {0};
+                LARGE_INTEGER new_ptr = {0};
+                SetFilePointerEx(fd, dist, &new_ptr, FILE_END);
+                offset = new_ptr.QuadPart;
+            }
+            else offset = 0;
+            return true;
         }
     }
 }
@@ -2195,6 +2255,7 @@ int main(int argc, char **argv)
     // resolve entry points in dynamic libraries.
     // TODO: this will probably need to return success/failure.
     resolve_kernel_apis();
+    elevate_process_privileges();
 
     exit(exit_code);
 }
