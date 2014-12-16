@@ -124,6 +124,7 @@ typedef struct _FILE_END_OF_FILE_INFO {
 /*////////////////
 //   Includes   //
 ////////////////*/
+#include <stdio.h>
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -539,6 +540,16 @@ static inline size_t align_up(size_t size, size_t pow2)
 {
     assert((pow2 & (pow2-1)) == 0);
     return (size == 0) ? pow2 : ((size + (pow2-1)) & ~(pow2-1));
+}
+
+/// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
+/// @param size The size value to round up.
+/// @param pow2 The power-of-two alignment.
+/// @return The input size, rounded up to the nearest even multiple of pow2.
+static inline int64_t align_up(int64_t size, size_t pow2)
+{
+    assert((pow2 & (pow2-1)) == 0);
+    return (size == 0) ? int64_t(pow2) : ((size + int64_t(pow2-1)) & ~int64_t(pow2-1));
 }
 
 /// @summary Clamps a value to a given maximum.
@@ -1284,7 +1295,7 @@ static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
             else m  = pq->Priority[l] < pq->Priority[r] ? l : r;
 
             // now compare the node at pos with the highest priority child, m.
-            if (pq->Priority[pos] < pq->Priority[m] < 0)
+            if (pq->Priority[pos] < pq->Priority[m])
             {   // children have lower priority than parent. order restored.
                 break;
             }
@@ -1609,7 +1620,6 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
     if (req.Fildes != INVALID_HANDLE_VALUE)
     {
         CloseHandle(req.Fildes);
-        req.Fildes  = INVALID_HANDLE_VALUE;
     }
 
     // generate the completion result and push it to the queue.
@@ -1630,7 +1640,7 @@ static int aio_tick(aio_state_t *aio, DWORD timeout)
     BOOL  iocpres = GetQueuedCompletionStatusEx(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
     if (iocpres && nevents > 0)
     {   // kernel AIO reported one or more events are ready.
-        for (int i = 0; i < nevents; ++i)
+        for (ULONG i = 0; i < nevents; ++i)
         {
             OVERLAPPED_ENTRY &evt = events[i];
             OVERLAPPED      *asio = evt.lpOverlapped;
@@ -1722,7 +1732,6 @@ static int aio_tick(aio_state_t *aio, DWORD timeout)
                 result = aio_process_close(aio, req);
                 break;
             default:
-                result = -1;
                 error  = ERROR_INVALID_PARAMETER;
                 break;
         }
@@ -2263,6 +2272,40 @@ static bool check_file_type(int32_t file_type)
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+static aio_state_t AIO_STATE;
+static vfs_state_t VFS_STATE;
+
+bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size)
+{
+    HANDLE fd = INVALID_HANDLE_VALUE;
+    HANDLE iocp = AIO_STATE.ASIOContext;
+    size_t ssize = 0;
+    int64_t lsize = 0;
+    int64_t psize = 0;
+    int64_t offset = 0;
+    if (vfs_resolve_file_read(path, iocp, fd, lsize, psize, offset, ssize))
+    {   // queue a file load request to be processed by the VFS driver.
+        vfs_lfreq_t req;
+        req.Next = NULL;
+        req.Fildes = fd;
+        req.DataSize = lsize;
+        req.FileSize = psize;
+        req.FileOffset = offset;
+        req.AFID = id;
+        req.Type = type;
+        req.Priority = priority;
+        req.SectorSize = ssize;
+        file_size = lsize;
+        srmw_fifo_put(&VFS_STATE.LoadQueue, req);
+        return true;
+    }
+    else
+    {
+        file_size = 0;
+        return false;
+    }
+}
+
 /// @summary Entry point of the application.
 /// @param argc The number of command-line arguments.
 /// @param argv An array of NULL-terminated strings specifying command-line arguments.
@@ -2284,6 +2327,40 @@ int main(int argc, char **argv)
     resolve_kernel_apis();
     elevate_process_privileges();
 
+    create_aio_state(&AIO_STATE);
+    create_vfs_state(&VFS_STATE);
+
+    int64_t offset = 0;
+    int64_t file_size = 0;
+    if (!platform_load_file(argv[1], 0, 0, 0, file_size))
+    {
+        fprintf(stdout, "ERROR: Cannot load file %s\n", argv[1]);
+        goto cleanup;
+    }
+
+    while (offset < file_size)
+    {
+        vfs_tick(&VFS_STATE, &AIO_STATE);
+        aio_poll(&AIO_STATE);
+
+        // now poll the read results queue.
+        vfs_res_t res;
+        while (srsw_fifo_get(&VFS_STATE.IoResult[0], res))
+        {   // normally we'd send this to a callback. print it for now!
+            char *ptr = (char*) res.DataBuffer;
+            for (uint32_t i = 0; i < res.DataAmount; ++i)
+            {
+                fputc(*ptr++, stdout);
+            }
+            vfs_return_buffer(&VFS_STATE, 0, res.DataBuffer);
+            offset += res.DataAmount;
+        }
+    }
+    vfs_tick(&VFS_STATE, &AIO_STATE);
+
+cleanup:
+    delete_aio_state(&AIO_STATE);
+    delete_vfs_state(&VFS_STATE);
     exit(exit_code);
 }
 
