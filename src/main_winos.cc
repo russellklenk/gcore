@@ -196,6 +196,13 @@ enum vfs_mode_e
     VFS_MODE_EXPLICIT = 1, /// The file reads are controlled by the user.
 };
 
+/// @summary Defines the supported VFS file status flags.
+enum vfs_status_e
+{
+    VFS_STATUS_NONE   = (0 << 0), /// No special status bits are set.
+    VFS_STATUS_CLOSE  = (1 << 0), /// The file is marked as having a close pending.
+};
+
 /// @summary Defines the data associated with a fixed-size lookaside queue.
 /// Lookaside means that the storage for items are stored and managed outside
 /// of the structure. The queue is safe for concurrent access by a single reader
@@ -377,6 +384,16 @@ struct vfs_fdinfo_t
     size_t             SectorSize;   /// The disk physical sector size, in bytes.
 };
 
+/// @summary Status information associated with an active file. This information is
+/// required to properly process (for example) close operations, where there may be
+/// one or more in-progress AIO operations against the file; the close must be
+/// deferred until all in-progress AIO operations have completed.
+struct vfs_status_t
+{
+    uint64_t           NPendingAIO;  /// The number of pending AIO operations on the file.
+    uint32_t           StatusFlags;  /// A combination of vfs_status_e.
+};
+
 /// @summary Defines the data associated with a priority queue of pending AIO operations.
 /// TODO: Determine if 32-bits for the insertion ID is enough. This would be enough for
 /// 128TB of data, which if you were streaming 32KB chunks continuously at 980MB/sec, is
@@ -403,17 +420,6 @@ struct vfs_io_fpq_t
     #undef MF
 };
 
-/// @summary Statistics tracked by the platform I/O system.
-struct io_stats_t
-{
-    #define NT         FILE_TYPE_COUNT
-    uint64_t           NStallsAIOQ;  /// Stalls due to full AIO operation queue.
-    uint64_t           NStallsVFSQ;  /// Stalls due to full VFS operation queue.
-    uint64_t           NStallsIOBuf; /// Stalls due to exhausted I/O buffer space.
-    uint64_t           NStallsFT[NT];/// Stalls due to slow file data processing.
-    #undef NT
-};
-
 /// @summary Defines the state data maintained by a VFS driver instance.
 struct vfs_state_t
 {
@@ -429,11 +435,23 @@ struct vfs_state_t
     uint32_t           Priority[MF]; /// The access priority for each active file.
     int64_t            RdOffset[MF]; /// The current read offset for each active file.
     vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
+    vfs_status_t       FileStat[MF]; /// Pending AIO status for each active file.
     vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
     vfs_resultq_t      IoResult[NT]; /// The per-file type queue for I/O results.
     vfs_returnq_t      IoReturn[NT]; /// The per-file type queue for I/O buffer returns.
     #undef NT
     #undef MF
+};
+
+/// @summary Statistics tracked by the platform I/O system.
+struct io_stats_t
+{
+    #define NT         FILE_TYPE_COUNT
+    uint64_t           NStallsAIOQ;  /// Stalls due to full AIO operation queue.
+    uint64_t           NStallsVFSQ;  /// Stalls due to full VFS operation queue.
+    uint64_t           NStallsIOBuf; /// Stalls due to exhausted I/O buffer space.
+    uint64_t           NStallsFT[NT];/// Stalls due to slow file data processing.
+    #undef NT
 };
 
 /*///////////////
@@ -1455,6 +1473,22 @@ static void close_file_raw(HANDLE &fd)
     }
 }
 
+/// @summary Resets the platform I/O statistics to zero.
+/// @param stats The counters to reset.
+static void init_io_stats(io_stats_t *stats)
+{
+    if (stats != NULL)
+    {
+        stats->NStallsAIOQ   = 0;
+        stats->NStallsVFSQ   = 0;
+        stats->NStallsIOBuf  = 0;
+        for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+        {
+            stats->NStallsFT[i] = 0;
+        }
+    }
+}
+
 /// @summary Allocates an iocb instance from the free list.
 /// @param aio The AIO driver state managing the free list.
 /// @return The next available iocb structure.
@@ -1790,6 +1824,29 @@ static void delete_aio_state(aio_state_t *aio)
     flush_srsw_fifo(&aio->CloseResults);
 }
 
+/// @summary Searches the VFS driver state to determine the current index of an
+/// active file given the file's application-defined file ID.
+/// @param vfs The VFS driver state to search.
+/// @param afid The application-defined file ID to locate.
+/// @param index On return, this value is set to the zero-based index of the
+/// current slot in the active file list associated with the input AFID.
+/// @return true if the AFID was located in the list.
+static inline bool vfs_find_by_afid(vfs_state_t const *vfs, intptr_t afid, size_t &index)
+{
+    intptr_t const  AFID      = afid;
+    intptr_t const *AFIDList  = vfs->FileAFID;
+    size_t   const  AFIDCount = vfs->ActiveCount;
+    for (size_t i = 0; i < AFIDCount; ++i)
+    {
+        if (AFIDList[i] == AFID)
+        {
+            index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 /// @summary Determine whether a path references a file within an archive, (and
 /// if so, which one) or whether it references a native file. Open the file if
 /// necessary, and return basic file information to the caller. This function
@@ -1911,23 +1968,74 @@ static void vfs_process_loads(vfs_state_t *vfs)
         // the file is already open; it was opened during platform_load_file().
         // all we need to do is update our internal active file list.
         size_t index = vfs->ActiveCount++;
-        vfs->FileAFID[index]            = req.AFID;
-        vfs->FileType[index]            = req.Type;
-        vfs->FileMode[index]            = VFS_MODE_LOAD;
-        vfs->Priority[index]            = req.Priority;
-        vfs->RdOffset[index]            = 0;
-        vfs->FileInfo[index].Fildes     = req.Fildes;
-        vfs->FileInfo[index].FileSize   = req.FileSize;
-        vfs->FileInfo[index].DataSize   = req.DataSize;
-        vfs->FileInfo[index].FileOffset = req.FileOffset;
-        vfs->FileInfo[index].SectorSize = req.SectorSize;
+        vfs->FileAFID[index]             = req.AFID;
+        vfs->FileType[index]             = req.Type;
+        vfs->FileMode[index]             = VFS_MODE_LOAD;
+        vfs->Priority[index]             = req.Priority;
+        vfs->RdOffset[index]             = 0;
+        vfs->FileInfo[index].Fildes      = req.Fildes;
+        vfs->FileInfo[index].FileSize    = req.FileSize;
+        vfs->FileInfo[index].DataSize    = req.DataSize;
+        vfs->FileInfo[index].FileOffset  = req.FileOffset;
+        vfs->FileInfo[index].SectorSize  = req.SectorSize;
+        vfs->FileStat[index].NPendingAIO = 0;
+        vfs->FileStat[index].StatusFlags = VFS_STATUS_NONE;
+    }
+}
+
+/// @summary Attempts to queue a file close request for the AIO driver.
+/// @param vfs The VFS driver state to update.
+/// @param i The zero-based index of the active file to close.
+/// @return The zero-based index of the next record to check.
+static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
+{
+    if (vfs->FileStat[i].NPendingAIO > 0)
+    {   // there are pending AIO operations against this file.
+        // the file cannot be closed until all operations have completed.
+        // the file close will be queued after the last operation completes.
+        vfs->FileStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+        return (i + 1);
+    }
+
+    // queue the file close operation for the AIO driver.
+    aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[i]);
+    if (aio_req != NULL)
+    {   // fill out the request. it will be processed at a later time.
+        aio_req->Command    = AIO_COMMAND_CLOSE;
+        aio_req->Fildes     = vfs->FileInfo[i].Fildes;
+        aio_req->DataAmount = 0;
+        aio_req->BaseOffset = vfs->FileInfo[i].FileOffset;
+        aio_req->FileOffset = 0;
+        aio_req->DataBuffer = NULL;
+        aio_req->QTimeNanos = nanotime();
+        aio_req->ATimeNanos = 0;
+        aio_req->AFID       = vfs->FileAFID[i];
+        aio_req->Type       = vfs->FileType[i];
+        aio_req->Reserved   = 0;
+
+        // delete the file from our internal state immediately.
+        size_t const last   = vfs->ActiveCount - 1;
+        vfs->FileAFID[i]    = vfs->FileAFID[last];
+        vfs->FileType[i]    = vfs->FileType[last];
+        vfs->FileMode[i]    = vfs->FileMode[last];
+        vfs->Priority[i]    = vfs->Priority[last];
+        vfs->RdOffset[i]    = vfs->RdOffset[last];
+        vfs->FileInfo[i]    = vfs->FileInfo[last];
+        vfs->ActiveCount    = last;
+        return i;
+    }
+    else
+    {   // there's no more space in the pending I/O operation queue.
+        // we'll try closing the file again when there's space.
+        vfs->FileStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+        return (i + 1);
     }
 }
 
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
 static void vfs_process_closes(vfs_state_t *vfs)
-{
+{   // process explicit close requests.
     while (vfs->ActiveCount > 0)
     {   // grab the next close command from the queue.
         vfs_cfreq_t   req;
@@ -1940,49 +2048,29 @@ static void vfs_process_closes(vfs_state_t *vfs)
         // it's important that the operation go through the VFS queue, so
         // that we can be sure any pending I/O operations on the file have
         // been submitted prior to the file being closed.
-        intptr_t const  AFID     = req.AFID;
-        intptr_t const *AFIDList = vfs->FileAFID;
-        for (size_t  i = 0 ; i < vfs->ActiveCount; ++i)
-        {
-            if (AFIDList[i] == AFID)
-            {
-                aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[i]);
-                if (aio_req != NULL)
-                {   // fill out the request. it will be processed at a later time.
-                    aio_req->Command    = AIO_COMMAND_CLOSE;
-                    aio_req->Fildes     = vfs->FileInfo[i].Fildes;
-                    aio_req->DataAmount = 0;
-                    aio_req->BaseOffset = vfs->FileInfo[i].FileOffset;
-                    aio_req->FileOffset = 0;
-                    aio_req->DataBuffer = NULL;
-                    aio_req->QTimeNanos = nanotime();
-                    aio_req->ATimeNanos = 0;
-                    aio_req->AFID       = AFID;
-                    aio_req->Type       = vfs->FileType[i];
-                    aio_req->Reserved   = 0;
+        size_t index = 0;
+        if (vfs_find_by_afid(vfs, req.AFID, index))
+        {   // attempt to queue the close. note that the operation
+            // might not get queued immediately, because we could
+            // have run out of space in the pending operation queue,
+            // or there could be outstanding I/O operations.
+            vfs_queue_close(vfs, index);
+        }
+    }
 
-                    // delete the file from our internal state immediately.
-                    size_t const last   = vfs->ActiveCount - 1;
-                    vfs->FileAFID[i]    = vfs->FileAFID[last];
-                    vfs->FileType[i]    = vfs->FileType[last];
-                    vfs->FileMode[i]    = vfs->FileMode[last];
-                    vfs->Priority[i]    = vfs->Priority[last];
-                    vfs->RdOffset[i]    = vfs->RdOffset[last];
-                    vfs->FileInfo[i]    = vfs->FileInfo[last];
-                    vfs->ActiveCount    = last;
-                    break; // dequeue the next request.
-                }
-                else
-                {   // there's no more space in the pending I/O operation queue.
-                    // put this request back in the queue and try again later.
-                    // no point in continuing on with further processing.
-                    // TODO: track this statistic somewhere.
-                    srmw_fifo_put(&vfs->CloseQueue, req);
-                    return;
-                }
-            } // if (AFIDList[i] == AFID)
-        } // for (each active file)
-    } // while (active files)
+    // process deferred close requests.
+    for (size_t i = 0; i < vfs->ActiveCount; )
+    {
+        if (vfs->FileStat[i].StatusFlags & VFS_STATUS_CLOSE)
+        {   // there's a pending close operation against this file.
+            // vfs_queue_close() returns the next index to check;
+            // either i (if a close was queued), or i + 1.
+            // note that VFS_STATUS_CLOSE is never explicitly cleared,
+            // as when the close is queued, the record is overwritten.
+            i = vfs_queue_close(vfs, i);
+        }
+        else i++; // no pending close; check the next file.
+    }
 }
 
 /// @summary Processes all completed file close notifications from AIO.
@@ -2004,6 +2092,7 @@ static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
 static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
+    size_t    index = 0;
     while (srsw_fifo_get(&aio->ReadResults, res))
     {   // convert the AIO result into something useful for the platform layer.
         vfs_res_t iores;
@@ -2012,7 +2101,14 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
         iores.FileOffset = res.FileOffset; // this is the relative offset
         iores.DataAmount = res.DataAmount;
         iores.OSError    = res.OSError;
-        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores))
+        {   // a single read operation has completed.
+            if (vfs_find_by_afid(vfs, res.AFID, index))
+            {   // decrement the number of pending I/O operations.
+                vfs->FileStat[index].NPendingAIO--;
+            }
+        }
+        else
         {   // TODO: track this statistic somewhere.
             // This should not be happening.
         }
@@ -2025,15 +2121,24 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
+    size_t    index = 0;
     while (srsw_fifo_get(&aio->WriteResults, res))
     {   // convert the AIO result into something useful for the platform layer.
+        // TODO: writes need to be differentiated from reads, obviously.
         vfs_res_t iores;
         iores.AFID       = res.AFID;
         iores.DataBuffer = res.DataBuffer;
         iores.FileOffset = res.FileOffset; // this is the relative offset
         iores.DataAmount = res.DataAmount;
         iores.OSError    = res.OSError;
-        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores) == false)
+        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores))
+        {   // a single write operation has completed.
+            if (vfs_find_by_afid(vfs, res.AFID, index))
+            {   // decrement the number of pending I/O operations.
+                vfs->FileStat[index].NPendingAIO--;
+            }
+        }
+        else
         {   // TODO: track this statistic somewhere.
             // This should not be happening.
         }
@@ -2047,6 +2152,8 @@ static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     // there's nothing that the VFS driver needs to do here for the application.
+    // note that on Windows, FlushFileBuffers() is always synchronous, so there
+    // is no need to locate and decrement the number of pending AIO operations.
     while (srsw_fifo_get(&aio->FlushResults, res))
     {
         /* empty */
@@ -2083,17 +2190,27 @@ static bool vfs_update_loads(vfs_state_t *vfs)
     uint16_t     index_list[MAX_OPEN_FILES];
     vfs_io_fpq_t file_queue;
 
+    // build a priority queue of files, and then process them one at a time
+    // starting with the highest-priority file. the goal here is to fill up
+    // the queue of pending I/O operations and stay maximally busy.
     io_fpq_clear(&file_queue);
     file_count = map_files_by_mode(index_list, vfs, VFS_MODE_LOAD);
     build_file_queue(&file_queue, vfs, index_list, file_count);
     while(io_fpq_get(&file_queue, index, priority))
-    {
+    {   // we want to submit as many sequential reads against the file as
+        // possible for maximum efficiency. these operations will be
+        // processed in-order, so this minimizes seeking as much as possible.
+        // stop submitting operations for this file under these conditions:
+        // 1. we've reached the end of the file data. continue with the next file.
+        // 2. we've run out of pending queue space. stop processing for the tick.
+        // 3. we've run out of I/O buffer space. stop processing for the tick.
+        // TODO: investigate combining reads to reduce AIO op count?
         size_t nqueued = 0;
         while (iobuf_bytes_free(allocator) > 0)
         {   // allocate a new request in our internal operation queue.
             aio_req_t *req  = io_opq_put(&vfs->IoOperations, priority);
             if (req != NULL)
-            {
+            {   // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
                 req->Fildes     = vfs->FileInfo[index].Fildes;
                 req->DataAmount = read_amount;
@@ -2111,11 +2228,9 @@ static bool vfs_update_loads(vfs_state_t *vfs)
                 int64_t newofs  = vfs->RdOffset[index] + read_amount;
                 vfs->RdOffset[index] = newofs;
                 if (newofs >= vfs->FileInfo[index].FileSize)
-                {   // reached or passed end-of-file; queue a close.
-                    // we will continue on with the next queued file.
-                    vfs_cfreq_t creq;
-                    creq.AFID = vfs->FileAFID[index];
-                    srmw_fifo_put(&vfs->CloseQueue, creq);
+                {   // reached or passed end-of-file; mark as pending close.
+                    // processing will continue on with the next file.
+                    vfs->FileStat[index].StatusFlags |= VFS_STATUS_CLOSE;
                     break;
                 }
             }
@@ -2124,10 +2239,14 @@ static bool vfs_update_loads(vfs_state_t *vfs)
             // how often this happens.
             else return false;
         }
+
+        // update the number of pending AIO operations against the file.
+        // this value is decremented as operations are completed.
+        vfs->FileStat[index].NPendingAIO += nqueued;
+
+        // if we ran out of I/O buffer space, there's no point in continuing.
         if (nqueued == 0)
-        {   // we ran out of I/O buffer space; no point in continuing.
-            // TODO: track this statistic somewhere, we want to know
-            // how often this happens.
+        {   // TODO: track this statistic somewhere.
             return false;
         }
     }
@@ -2140,6 +2259,7 @@ static bool vfs_update_loads(vfs_state_t *vfs)
 /// either buffer space is full or the I/O operation queue is full.
 static bool vfs_process_reads(vfs_state_t *vfs)
 {   // TODO: process any pending explicit read operations.
+    // TODO: be sure to increment the number of outstanding AIO operations!
     return true;
 }
 
@@ -2149,6 +2269,7 @@ static bool vfs_process_reads(vfs_state_t *vfs)
 /// either buffer space is full or the I/O operation queue is full.
 static bool vfs_process_writes(vfs_state_t *vfs)
 {   // TODO: process any pending explicit write operations.
+    // TODO: be sure to increment the number of outstanding AIO operations!
     return true;
 }
 
@@ -2157,19 +2278,24 @@ static bool vfs_process_writes(vfs_state_t *vfs)
 /// and dispatches completion notifications from the AIO layer back to the application.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
+/// @param stats Optional VFS and AIO counters. May be NULL.
+static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
+    io_stats_t null_stats;
+    if (stats == NULL)
+    {   // prevent everything from constantly having to NULL-check this.
+        init_io_stats(&null_stats);
+        stats = &null_stats;
+    }
+
     // free up as much buffer state as possible.
     vfs_process_buffer_returns(vfs);
 
-    // generate read and write I/O operations.
+    // generate read and write I/O operations. this increments the number of
+    // pending I/O operations across the set of active files.
     vfs_update_loads(vfs);
     vfs_process_reads(vfs);
     vfs_process_writes(vfs);
-
-    // close file requests should be processed after all read and write requests.
-    // this ensures that all I/O has been submitted before closing the file.
-    vfs_process_closes(vfs);
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
@@ -2183,12 +2309,19 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
 
     // dispatch any completed I/O operations to the per-type queues for
     // processing by the platform layer and dispatching to the application.
+    // this decrements the number of pending I/O operations across the file set.
     vfs_process_completed_reads  (vfs, aio);
     vfs_process_completed_writes (vfs, aio);
     vfs_process_completed_flushes(vfs, aio);
     vfs_process_completed_closes (vfs, aio);
 
+    // close file requests should be processed after all read and write requests.
+    // this ensures that all I/O has been submitted before closing the file.
+    // files with pending I/O will not be closed until the I/O completes.
+    vfs_process_closes(vfs);
+
     // open file requests should be processed after all close requests.
+    // this increases the likelyhood that we'll have open file slots.
     vfs_process_opens(vfs);
     vfs_process_loads(vfs);
 }
@@ -2199,7 +2332,9 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio)
 /// @param type One of file_type_e indicating the type of file being processed.
 /// @param buffer The buffer to return. This value may be NULL.
 static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
-{
+{   // TODO: it might be better to check that the buffer does come from
+    // the address range of the I/O buffer allocator, to prevent accidental
+    // returns of application-managed buffers (for writes, etc.)
     if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
 }
 
@@ -2237,22 +2372,6 @@ static void delete_vfs_state(vfs_state_t *vfs)
     }
 }
 
-/// @summary Resets the platform I/O statistics to zero.
-/// @param stats The counters to reset.
-static void init_io_stats(io_stats_t *stats)
-{
-    if (stats != NULL)
-    {
-        stats->NStallsAIOQ   = 0;
-        stats->NStallsVFSQ   = 0;
-        stats->NStallsIOBuf  = 0;
-        for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
-        {
-            stats->NStallsFT[i] = 0;
-        }
-    }
-}
-
 /// @summary Checks a file type value to make sure it is known.
 /// @param file_type One of the values of the file_type_e enumeration.
 /// @return true if the file type is known.
@@ -2274,36 +2393,57 @@ static bool check_file_type(int32_t file_type)
 ////////////////////////*/
 static aio_state_t AIO_STATE;
 static vfs_state_t VFS_STATE;
+static io_stats_t  IO_STATS;
 
+/// @summary Queues a file for loading. The file is read from beginning to end and
+/// data is returned to the application on the thread appropriate for the given type.
+/// @param path The NULL-terminated UTF-8 path of the file to load.
+/// @param id The application-defined identifier for the load request.
+/// @param type One of file_type_e indicating the type of file being loaded. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file loading priority, with 0 indicating the highest possible priority.
+/// @param file_size On return, this location is updated with the logical size of the file.
+/// @return true if the file was successfully opened and the load was queued.
 bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size)
 {
-    HANDLE fd = INVALID_HANDLE_VALUE;
-    HANDLE iocp = AIO_STATE.ASIOContext;
-    size_t ssize = 0;
-    int64_t lsize = 0;
-    int64_t psize = 0;
+    HANDLE  fd     = INVALID_HANDLE_VALUE;
+    HANDLE  iocp   = AIO_STATE.ASIOContext;
+    size_t  ssize  = 0;
+    int64_t lsize  = 0;
+    int64_t psize  = 0;
     int64_t offset = 0;
     if (vfs_resolve_file_read(path, iocp, fd, lsize, psize, offset, ssize))
     {   // queue a file load request to be processed by the VFS driver.
         vfs_lfreq_t req;
-        req.Next = NULL;
-        req.Fildes = fd;
-        req.DataSize = lsize;
-        req.FileSize = psize;
-        req.FileOffset = offset;
-        req.AFID = id;
-        req.Type = type;
-        req.Priority = priority;
+        req.Next       = NULL;
+        req.Fildes     = fd;
+        req.DataSize   = lsize;  // size of the file after decompression
+        req.FileSize   = psize;  // number of bytes to read from the file
+        req.FileOffset = offset; // offset of first byte relative to fd 0, SEEK_SET
+        req.AFID       = id;
+        req.Type       = type;
+        req.Priority   = priority;
         req.SectorSize = ssize;
-        file_size = lsize;
+        file_size      = lsize;  // return the logical size to the caller
         srmw_fifo_put(&VFS_STATE.LoadQueue, req);
         return true;
     }
     else
-    {
+    {   // unable to open the file, so fail immediately.
         file_size = 0;
         return false;
     }
+}
+
+/// @summary Closes a file explicitly opened for reading or writing.
+/// @param id The application-defined identifier associated with the file.
+/// @return true if the close request was successfuly queued.
+bool platform_close_file(intptr_t id)
+{
+    vfs_cfreq_t req;
+    req.Next = NULL;
+    req.AFID = id;
+    return srmw_fifo_put(&VFS_STATE.CloseQueue, req);
 }
 
 /// @summary Entry point of the application.
@@ -2316,7 +2456,8 @@ int main(int argc, char **argv)
 
     if (argc > 1)
     {
-        /* USAGE */
+        fprintf(stdout, "USAGE: game.exe path\n");
+        exit(EXIT_FAILURE);
     }
 
     // initialize the high-resolution timer on the system.
@@ -2327,6 +2468,7 @@ int main(int argc, char **argv)
     resolve_kernel_apis();
     elevate_process_privileges();
 
+    init_io_stats(&IO_STATS);
     create_aio_state(&AIO_STATE);
     create_vfs_state(&VFS_STATE);
 
@@ -2340,7 +2482,7 @@ int main(int argc, char **argv)
 
     while (offset < file_size)
     {
-        vfs_tick(&VFS_STATE, &AIO_STATE);
+        vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
         aio_poll(&AIO_STATE);
 
         // now poll the read results queue.
@@ -2356,7 +2498,7 @@ int main(int argc, char **argv)
             offset += res.DataAmount;
         }
     }
-    vfs_tick(&VFS_STATE, &AIO_STATE);
+    vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
 
 cleanup:
     delete_aio_state(&AIO_STATE);
