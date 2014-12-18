@@ -1,6 +1,7 @@
 /*/////////////////////////////////////////////////////////////////////////////
-/// @summary Forward-declares the types and functions between the platform and
-/// game layers of the system. This file is for forward declarations only.
+/// @summary Forward-declares the types and functions shared between the
+/// platform and game layers of the system. This file is for forward
+/// declarations only. The platform layer will dynamically load the game layer.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 #ifndef BRIDGE_H
@@ -46,7 +47,7 @@ static intptr_t const INVALID_ID = (intptr_t) -1;
 /// @param data Pointer to the data buffer. The data to read starts at offset 0.
 /// @param offset The starting offset of the buffered data within the file.
 /// @param size The number of valid bytes in the buffer.
-typedef void (*read_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
+typedef void (*al_read_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
 
 /// @summary Function signature for the callback function invoked when the
 /// platform I/O system has completed writing some data to a file.
@@ -55,7 +56,7 @@ typedef void (*read_callback_fn)(intptr_t app_id, int32_t type, void const *data
 /// @param data Pointer to the data buffer. The data written starts at offset 0.
 /// @param offset The byte offset of the start of the write operation within the file.
 /// @param size The number of bytes written to the file.
-typedef void (*write_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
+typedef void (*al_write_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
 
 /// @summary Function signature for a callback function invoked when an error
 /// occurs while the platform I/O system encounters an error during a file operation.
@@ -63,38 +64,14 @@ typedef void (*write_callback_fn)(intptr_t app_id, int32_t type, void const *dat
 /// @param type One of the values of the file_type_e enumeration.
 /// @param error_code The system error code value.
 /// @param error_message An optional string description of the error.
-typedef void (*file_error_fn)(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
+typedef void (*al_file_error_fn)(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
 
-/// @summary Defines the set of callback functions into the application code
-/// used for handling data read from files. There is one callback for each
-/// defined value of the file_type_e enumeration.
-struct io_callbacks_t
-{
-    read_callback_fn  DataForDDS;  /// Callback invoked when data is read from a DDS file.
-    read_callback_fn  DataForTGA;  /// Callback invoked when data is read from a TGA file.
-    read_callback_fn  DataForWAV;  /// Callback invoked when data is read from a WAV file.
-    read_callback_fn  DataForJSON; /// Callback invoked when data is read from a JSON file.
-    file_error_fn     IoError;     /// Callback invoked when a system I/O error occurs.
-};
-
-// TODO: The application should call platform_init() and pass the io_callbacks_t
-// to the platform layer. In return, the platform layer will populate a structure
-// with function pointers to platform functions. This allows for hot-loading code,
-// and gets rid of several globals on both sides of the fence.
-
-/// @summary A single module in the application code must define an instance of
-/// io_callbacks_t named IoCallback and initialize it.
-extern io_callbacks_t IoCallback;
-
-/*/////////////////
-//   Functions   //
-/////////////////*/
 /// @summary Formats and writes an I/O error description to stderr.
 /// @param app_id The application-defined identifier of the file being accessed when the error occurred.
 /// @param type The of the values of the file_type_e enumeration.
 /// @param error_code The system error code value.
 /// @param error_message An optional string description of the error.
-extern void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
+typedef void (*pl_print_ioerror_fn)(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
 
 /// @summary Queues a file for loading. The file is read from beginning to end and
 /// data is returned to the application on the thread appropriate for the given type.
@@ -106,68 +83,104 @@ extern void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error
 /// @param priority The file loading priority, with 0 indicating the highest possible priority.
 /// @param file_size On return, this location is updated with the logical size of the file.
 /// @return true if the file was successfully opened and the load was queued.
-extern bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size);
+typedef bool (*pl_load_file_fn)(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size);
 
-/// @summary Closes a file previously opened with platform_read_file. This
-/// should be called when the application has finished processing the file
-/// data, or when the platform has reported an error while reading the file.
-/// @param file_type One of the values of the file_type_e enumeration.
-/// @param app_id The application-defined identifier of the file to close.
-extern void platform_close_file(int32_t file_type, uint32_t app_id);
+/// @summary Saves a file to disk. If the file exists, it is overwritten. This
+/// operation is performed entirely synchronously and will block the calling
+/// thread until the file is written. The file is guaranteed to have been either
+/// written successfully, or not at all.
+/// @param path The path of the file to write.
+/// @param data The contents of the file.
+/// @param size The number of bytes to read from data and write to the file.
+/// @return true if the operation was successful.
+typedef bool (*pl_save_file_fn)(char const *path, void const *data, int64_t size);
 
-// TODO: So the big question here is I/O, and whether or not we even want to
-// expose the internals of the I/O system to the 'application' layer, having
-// queues and whatnot to communicate back and forth, or whether we instead
-// want to have the platform layer perform *all* of the I/O, including parsing
-// data and creating device objects, etc. and then just notifying the application
-// when the operation has succeeded or failed.
-//
-// The latter option seems better, because only the platform layer knows how the
-// application is structured, what runs on what threads, etc. In this case, we
-// would have a pretty simple interface, something like this:
-//
-// bool result = platform_load_file(path, type, app_id);
-//
-// If type is unknown, the call would fail immediately. Notifying the application
-// layer that the operation has completed is kind of tricky. Basically we need a
-// callback per-type of file, that the platform layer will call at the appropriate
-// time (see next paragraph.)
-//
-// when the load has completed, the platform has to decide what thread to process
-// the completion notification on, since loading some types of files may need to
-// complete on a particular thread to access GPU data, etc. most likely, each
-// type of file will have its own completion queue that serviced by the platform
-// layer in the appropriate location.
-//
-// virtual file systems are handled internally by the platform layer, since they
-// involve filesystem enumeration, path parsing, and so on. internally, everything
-// resolves to an AIO operation. at startup, before control was ever transferred
-// to the application layer, the platform layer would set up the VFS.
-//
-// PLAN:
-// Prerequisite: The bridge module defines the file and stream types. These
-// must be known to both sides.
-//
-// Prerequisite: The bridge module defines a series of function pointer types
-// for the I/O callbacks from platform->application, one per file/stream type.
-//
-// On startup, the platform layer sets up the VFS.
-//
-// The application layer submits a request to load a file, or start a stream:
-//   bool result = platform_read_file(path, type, app_id)
-//                 platform_close_file(type, app_id)
-//   bool result = platform_start_stream(path, type, app_id)
-//                 platform_cancel_stream(type, app_id)
-//   bool result = platform_write_file(path, data, data_size) // synchronous, overwrite
-//
-// The platform layer pushes data to the application layer as it becomes
-// available (which means after the raw I/O has completed, and after any
-// decryption, decompression, etc.) through the callback registered for the
-// type. The callback must fully process the data it receives before it returns,
-// which includes performing any application-level parsing. The callback is
-// guaranteed to be invoked on the correct thread by the platform layer. Once
-// the application layer returns, the platform layer can free the buffer passed
-// to the application layer (or return it to the free pool, etc.)
+/// @summary Opens a file for read-write access. The application is responsible
+/// for submitting read and write operations. If the file exists, it is opened
+/// without truncation. If the file does not exist, it is created.
+/// @param path The path of the file to open.
+/// @param id The application-defined identifier of the file.
+/// @param type One of file_type_e indicating the type of file being opened. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file operation priority, with 0 indicating the highest possible priority.
+/// @param read_only Specify true to open a file as read-only.
+/// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
+/// operations more efficient. If an estimate is unknown, specify zero.
+/// @param file_size On return, this value is updated with the current size of the file, in bytes.
+/// @return true if the file was opened successfully.
+typedef bool (*pl_open_file_fn)(char const *path, intptr_t id, int32_t type, uint32_t priority, bool read_only, int64_t reserve_size, int64_t &file_size);
+
+/// @summary Closes a file opened using platform_open_file().
+/// @param id The application-defined identifier associated with the file.
+/// @return true if the close request was successfuly queued.
+typedef bool (*pl_close_file_fn)(intptr_t id);
+
+/// @summary Queues a read operation against an open file. The file should have
+/// previously been opened using platform_open_file(), platform_append_file(),
+/// or platform_create_file(). Reads starting at arbitrary locations are supported,
+/// however, the read may return more or less data than requested.
+/// @param id The application-defined identifier of the file.
+/// @param offset The absolute byte offset within the file at which to being reading data.
+/// @param size The number of bytes to read. The read may return more or less data than requested.
+/// @return true if the read operation was successfully submitted.
+typedef bool (*pl_read_file_fn)(intptr_t id, int64_t offset, uint32_t size);
+
+/// @summary Queues a write operation against an open file. The file should have
+/// previously been opened using platform_open_file(), platform_append_file() or
+/// platform_create_file(). Writes starting at arbitrary locations are not supported;
+/// all writes occur at the end of the file. It is possible that not all data is
+/// immediately flushed to disk; if this behavior is required, use the function
+/// platform_flush_file() to flush any buffered data to disk.
+/// @param id The application-defined identifier of the file.
+/// @param data The data to write. Do not modify the contents of this buffer
+/// until the write completion notification is received.
+/// @param size The number of bytes to write.
+typedef bool (*pl_write_file_fn)(intptr_t id, void const *data, uint32_t size);
+
+/// @summary Flushes any pending writes to disk.
+/// @param id The application-defined identifier of the file to flush.
+/// @return true if the flush operation was successfully queued.
+typedef bool (*pl_flush_file_fn)(intptr_t id);
+
+/// @summary Opens a new temporary file for writing. The file is initially empty.
+/// Data may be written to or read from the file using platform_[read/write]_file().
+/// When finished, call platform_finalize_file() to close the file and move it to
+/// its final destination or delete the file.
+/// @param id The application-defined identifier of the file.
+/// @param type One of file_type_e indicating the type of file being created. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file operation priority, with 0 indicating the highest possible priority.
+/// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
+/// operations more efficient. If an estimate is unknown, specify zero.
+/// @return true if the file is opened and ready for I/O operations.
+typedef bool (*pl_create_file_fn)(intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size);
+
+/// @summary Closes a file previously opened using platform_create_file(), and
+/// atomically renames that file to move it to the specified path. This function
+/// blocks the calling thread until all operations have completed.
+/// @param id The application-defined identifier of the file passed to the create file call.
+/// @param path The target path and filename of the file, or NULL to delete the file.
+/// @return true if the rename or delete was performed successfully.
+typedef bool (*pl_finalize_file_fn)(intptr_t id, char const *path);
+
+/// @summary Defines the interface that the platform layer provides to the application layer.
+struct platform_layer_t
+{   // **** I/O Functions
+    pl_print_ioerror_fn  print_ioerror; /// Print a formatted I/O error to stderr.
+    pl_load_file_fn      load_file;     /// Open a file, read it all, and close it.
+    pl_save_file_fn      save_file;     /// Create a file, write it all, and close it.
+    pl_open_file_fn      open_file;     /// Open a file for explicit I/O.
+    pl_close_file_fn     close_file;    /// Close a file opened for explicit I/O.
+    pl_read_file_fn      read_file;     /// Explicitly read data from a file.
+    pl_write_file_fn     write_file;    /// Explicitly append data to a file.
+    pl_flush_file_fn     flush_file;    /// Explicitly flush all pending writes.
+    pl_create_file_fn    create_file;   /// Create a new file for explicit I/O.
+    pl_finalize_file_fn  finalize_file; /// Close a newly created file.
+};
+
+/*/////////////////
+//   Functions   //
+/////////////////*/
 
 #endif /* !defined(BRIDGE_H) */
 
