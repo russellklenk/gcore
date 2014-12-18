@@ -46,7 +46,16 @@ static intptr_t const INVALID_ID = (intptr_t) -1;
 /// @param data Pointer to the data buffer. The data to read starts at offset 0.
 /// @param offset The starting offset of the buffered data within the file.
 /// @param size The number of valid bytes in the buffer.
-typedef void (*data_callback_fn)(uint32_t app_id, int32_t type, void const *data, uint64_t offset, size_t size);
+typedef void (*read_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
+
+/// @summary Function signature for the callback function invoked when the
+/// platform I/O system has completed writing some data to a file.
+/// @param app_id The application-defined identifier of the target file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param data Pointer to the data buffer. The data written starts at offset 0.
+/// @param offset The byte offset of the start of the write operation within the file.
+/// @param size The number of bytes written to the file.
+typedef void (*write_callback_fn)(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size);
 
 /// @summary Function signature for a callback function invoked when an error
 /// occurs while the platform I/O system encounters an error during a file operation.
@@ -54,19 +63,24 @@ typedef void (*data_callback_fn)(uint32_t app_id, int32_t type, void const *data
 /// @param type One of the values of the file_type_e enumeration.
 /// @param error_code The system error code value.
 /// @param error_message An optional string description of the error.
-typedef void (*file_error_fn)(uint32_t app_id, int32_t type, int64_t error_code, char const *error_message);
+typedef void (*file_error_fn)(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
 
 /// @summary Defines the set of callback functions into the application code
 /// used for handling data read from files. There is one callback for each
 /// defined value of the file_type_e enumeration.
 struct io_callbacks_t
 {
-    data_callback_fn DataForDDS;  /// Callback invoked when data is read from a DDS file.
-    data_callback_fn DataForTGA;  /// Callback invoked when data is read from a TGA file.
-    data_callback_fn DataForWAV;  /// Callback invoked when data is read from a WAV file.
-    data_callback_fn DataForJSON; /// Callback invoked when data is read from a JSON file.
-    file_error_fn    IoError;     /// Callback invoked when a system I/O error occurs.
+    read_callback_fn  DataForDDS;  /// Callback invoked when data is read from a DDS file.
+    read_callback_fn  DataForTGA;  /// Callback invoked when data is read from a TGA file.
+    read_callback_fn  DataForWAV;  /// Callback invoked when data is read from a WAV file.
+    read_callback_fn  DataForJSON; /// Callback invoked when data is read from a JSON file.
+    file_error_fn     IoError;     /// Callback invoked when a system I/O error occurs.
 };
+
+// TODO: The application should call platform_init() and pass the io_callbacks_t
+// to the platform layer. In return, the platform layer will populate a structure
+// with function pointers to platform functions. This allows for hot-loading code,
+// and gets rid of several globals on both sides of the fence.
 
 /// @summary A single module in the application code must define an instance of
 /// io_callbacks_t named IoCallback and initialize it.
@@ -75,11 +89,24 @@ extern io_callbacks_t IoCallback;
 /*/////////////////
 //   Functions   //
 /////////////////*/
-/// @summary attempts to open a file and read it from beginning to end.
-/// @param path the location of the file to load.
-/// @param file_type one of the values of the file_type_e enumeration.
-/// @param app_id the application-defined identifier associated with the file.
-extern bool platform_read_file(char const *path, int32_t file_type, uint32_t app_id);
+/// @summary Formats and writes an I/O error description to stderr.
+/// @param app_id The application-defined identifier of the file being accessed when the error occurred.
+/// @param type The of the values of the file_type_e enumeration.
+/// @param error_code The system error code value.
+/// @param error_message An optional string description of the error.
+extern void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message);
+
+/// @summary Queues a file for loading. The file is read from beginning to end and
+/// data is returned to the application on the thread appropriate for the given type.
+/// The file is close automatically when all data has been read, or an error occurs.
+/// @param path The NULL-terminated UTF-8 path of the file to load.
+/// @param id The application-defined identifier for the load request.
+/// @param type One of file_type_e indicating the type of file being loaded. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file loading priority, with 0 indicating the highest possible priority.
+/// @param file_size On return, this location is updated with the logical size of the file.
+/// @return true if the file was successfully opened and the load was queued.
+extern bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size);
 
 /// @summary Closes a file previously opened with platform_read_file. This
 /// should be called when the application has finished processing the file

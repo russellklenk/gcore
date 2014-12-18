@@ -74,14 +74,20 @@ static size_t   const MAX_OPEN_FILES = 128;
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
 /// poll during each tick, and the maximum number the underlying OS can handle.
-/// TODO: Make this overridable at compile time.
-static size_t   const AIO_MAX_ACTIVE = 512;
+/// To see what the value for this should be on your system:
+/// cat /sys/block/sda/queue/nr_requests
+#ifndef LINUX_AIO_MAX_ACTIVE    // can override at compile time
+#define LINUX_AIO_MAX_ACTIVE    128
+#endif
+static size_t   const AIO_MAX_ACTIVE = LINUX_AIO_MAX_ACTIVE;
 
 /// @summary Define the size of the I/O buffer. This is calculated based on an
 /// maximum I/O transfer rate of 960MB/s, and an I/O system tick rate of 60Hz;
 /// 960MB/sec divided across 60 ticks/sec gives 16MB/tick maximum transfer rate.
-/// TODO: Make this overridable at compile time.
-static size_t   const VFS_IOBUF_SIZE = 16 * 1024 * 1024;
+#ifndef LINUX_VFS_IOBUF_SIZE    // can override at compile time
+#define LINUX_VFS_IOBUF_SIZE   (16 * 1024 * 1024)
+#endif
+static size_t   const VFS_IOBUF_SIZE = LINUX_VFS_IOBUF_SIZE;
 
 /// @summary Define the size of the buffer allocated for each I/O request.
 static size_t   const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
@@ -371,11 +377,19 @@ struct io_stats_t
 //   Globals   //
 ///////////////*/
 /// @summary A list of all of the file type identifiers we consider to be valid.
-static file_type_e FILE_TYPE_LIST[] = {
+static file_type_e FILE_TYPE_LIST[FILE_TYPE_COUNT] = {
     FILE_TYPE_DDS,
     FILE_TYPE_TGA,
     FILE_TYPE_WAV,
     FILE_TYPE_JSON
+};
+
+/// @summary A list of printable names for each valid file type identifier.
+static char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
+    "DDS" , /* FILE_TYPE_DDS  */
+    "TGA" , /* FILE_TYPE_TGA  */
+    "WAV" , /* FILE_TYPE_WAV  */
+    "JSON"  /* FILE_TYPE_JSON */
 };
 
 /*///////////////////////
@@ -2079,10 +2093,14 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 /// @param type One of file_type_e indicating the type of file being processed.
 /// @param buffer The buffer to return. This value may be NULL.
 static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
-{   // TODO: it might be better to check that the buffer does come from
-    // the address range of the I/O buffer allocator, to prevent accidental
-    // returns of application-managed buffers (for writes, etc.)
-    if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
+{
+    void const *iobeg = (uint8_t const *)  vfs->IoAllocator.BaseAddress;
+    void const *ioend = (uint8_t const *)  vfs->IoAllocator.BaseAddress + vfs->IoAllocator.TotalSize;
+    if (buffer >= iobeg && buffer < ioend)
+    {   // only return the buffer if it's within the address range handed out
+        // by the I/O buffer allocator. this excludes user-allocated buffers.
+        srsw_fifo_put(&vfs->IoReturn[type], buffer);
+    }
 }
 
 /// @summary Initialize a VFS driver state object and allocate any I/O resources.
@@ -2119,6 +2137,69 @@ static void delete_vfs_state(vfs_state_t *vfs)
     }
 }
 
+/// @summary No-op callback function invoked when the platform I/O system has
+/// some data available for processing by the application.
+/// @param app_id The application-defined identifier of the source file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param data Pointer to the data buffer. The data to read starts at offset 0.
+/// @param offset The starting offset of the buffered data within the file.
+/// @param size The number of valid bytes in the buffer.
+static void null_read_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
+{   // all parameters are unused. suppress compiler warnings.
+    (void) sizeof(app_id);
+    (void) sizeof(type);
+    (void) sizeof(data);
+    (void) sizeof(offset);
+    (void) sizeof(size);
+}
+
+/// @summary No-op callback function invoked when the platform I/O system has
+/// completed writing some data to a file.
+/// @param app_id The application-defined identifier of the target file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param data Pointer to the data buffer. The data written starts at offset 0.
+/// @param offset The byte offset of the start of the write operation within the file.
+/// @param size The number of bytes written to the file.
+static void null_write_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
+{   // all parameters are unused. suppress compiler warnings.
+    (void) sizeof(app_id);
+    (void) sizeof(type);
+    (void) sizeof(data);
+    (void) sizeof(offset);
+    (void) sizeof(size);
+}
+
+/// @summary No-op callback function invoked when an error occurs while the
+/// platform I/O system encounters an error during a file operation.
+/// @param app_id The application-defined identifier of the source file.
+/// @param type One of the values of the file_type_e enumeration.
+/// @param error_code The system error code value.
+/// @param error_message An optional string description of the error.
+static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
+{
+#ifdef DEBUG
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(error_code));
+#else
+    // in release mode, all parameters are unused. suppress compiler warnings.
+    (void) sizeof(app_id);
+    (void) sizeof(type);
+    (void) sizeof(error_code);
+    (void) sizeof(error_message);
+#endif
+}
+
+/// @summary Initializes an io_callbacks_t instance such that all callbacks
+/// point to a 'no-op' function. This prevents having to NULL-check everywhere.
+/// @param cb The I/O callbacks definition to initialize.
+static void init_io_callbacks(io_callbacks_t *cb)
+{
+    cb->DataForDDS  = null_read_func;
+    cb->DataForTGA  = null_read_func;
+    cb->DataForWAV  = null_read_func;
+    cb->DataForJSON = null_read_func;
+    cb->IoError     = null_error_func;
+}
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -2126,8 +2207,20 @@ static aio_state_t AIO_STATE;
 static vfs_state_t VFS_STATE;
 static io_stats_t  IO_STATS;
 
+/// @summary Formats and writes an I/O error description to stderr.
+/// @param app_id The application-defined identifier of the file being accessed when the error occurred.
+/// @param type The of the values of the file_type_e enumeration.
+/// @param error_code The system error code value.
+/// @param error_message An optional string description of the error.
+void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
+{
+    int errn = int(error_code);
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(errn));
+}
+
 /// @summary Queues a file for loading. The file is read from beginning to end and
 /// data is returned to the application on the thread appropriate for the given type.
+/// The file is close automatically when all data has been read, or an error occurs.
 /// @param path The NULL-terminated UTF-8 path of the file to load.
 /// @param id The application-defined identifier for the load request.
 /// @param type One of file_type_e indicating the type of file being loaded. This allows
@@ -2167,7 +2260,42 @@ bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t pr
     }
 }
 
-/// @summary Closes a file explicitly opened for reading or writing.
+/// @summary Saves a file to disk. If the file exists, it is overwritten. This
+/// operation is performed entirely synchronously and will block the calling
+/// thread until the file is written. The file is guaranteed to have been either
+/// written successfully, or not at all.
+/// @param path The path of the file to write.
+/// @param data The contents of the file.
+/// @param size The number of bytes to read from data and write to the file.
+/// @return true if the operation was successful.
+bool platform_save_file(char const *path, void const *data, int64_t size)
+{
+    // generate a temporary filename (see platform_create_file),
+    // vfs_resolve_file_write that path (preallocate the file),
+    // write the data and close the file,
+    // rename() to the input path
+}
+
+/// @summary Opens a file for read-write access. The application is responsible
+/// for submitting read and write operations. If the file exists, it is opened
+/// without truncation. If the file does not exist, it is created.
+/// @param path The path of the file to open.
+/// @param id The application-defined identifier of the file.
+/// @param type One of file_type_e indicating the type of file being opened. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file operation priority, with 0 indicating the highest possible priority.
+/// @param read_only Specify true to open a file as read-only.
+/// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
+/// operations more efficient. If an estimate is unknown, specify zero.
+/// @param file_size On return, this value is updated with the current size of the file, in bytes.
+/// @return true if the file was opened successfully.
+bool platform_open_file(char const *path, intptr_t id, int32_t type, uint32_t priority, bool read_only, int64_t reserve_size, int64_t &file_size)
+{
+    // if read_only is true, use vfs_resolve_file_read(), and support archive files.
+    // if read_only is false, use vfs_resolve_file_write(), and support native files only.
+}
+
+/// @summary Closes a file opened using platform_open_file().
 /// @param id The application-defined identifier associated with the file.
 /// @return true if the close request was successfuly queued.
 bool platform_close_file(intptr_t id)
@@ -2178,7 +2306,115 @@ bool platform_close_file(intptr_t id)
     return srmw_fifo_put(&VFS_STATE.CloseQueue, req);
 }
 
-int main(int argc, char **argv)
+/// @summary Queues a read operation against an open file. The file should have
+/// previously been opened using platform_open_file(), platform_append_file(),
+/// or platform_create_file(). Reads starting at arbitrary locations are supported,
+/// however, the read may return more or less data than requested.
+/// @param id The application-defined identifier of the file.
+/// @param offset The absolute byte offset within the file at which to being reading data.
+/// @param size The number of bytes to read. The read may return more or less data than requested.
+/// @return true if the read operation was successfully submitted.
+bool platform_read_file(intptr_t id, int64_t offset, uint32_t size)
+{
+    // again, offsets must be sector-aligned. in this case, we can calculate
+    // the nearest sector offset <= offset, offset_aligned, and then calculate
+    // the size as align_to(size + (offset_aligned - offset), sector_size).
+    // when the read completes, we would then have to do some calculations to
+    // determine the starting offset of the data in the buffer, and return that
+    // to the caller; we would *also* have to make sure that the base buffer
+    // pointer is passed through so it can be returned, but all of this complexity
+    // occurs in the platform layer.
+}
+
+/// @summary Queues a write operation against an open file. The file should have
+/// previously been opened using platform_open_file(), platform_append_file() or
+/// platform_create_file(). Writes starting at arbitrary locations are not supported;
+/// all writes occur at the end of the file. It is possible that not all data is
+/// immediately flushed to disk; if this behavior is required, use the function
+/// platform_flush_file() to flush any buffered data to disk.
+/// @param id The application-defined identifier of the file.
+/// @param data The data to write. Do not modify the contents of this buffer
+/// until the write completion notification is received.
+/// @param size The number of bytes to write.
+bool platform_write_file(intptr_t id, void const *data, uint32_t size)
+{
+    // note that we may not be able to support a user-specified offset here,
+    // because offset must be sector-aligned. so we probably should support
+    // only sequential writes to files, and we have to do it in sector-size
+    // multiples, so that means we have to perform some internal buffering.
+    // in order to support arbitrary offsets, we would have to perform a read
+    // followed by the write, which is unacceptable. basically in this case,
+    // we will submit writes up to the sector size multiple <= size, and then
+    // we have to buffer any remaining data. when the file is closed, if there
+    // is any buffered data, we zero-pad up to the nearest sector size multiple,
+    // then ftruncate() to set EOF, and then do the close. this means that for
+    // each open file, we must maintain a one-sector write buffer, which for
+    // the current 128 file limit amounts to up to 512KB of overhead.
+    // if a write request is received and data is currently buffered, and the
+    // write would cross the sector boundary, copy from the user data buffer
+    // to the internal sector buffer, write the sector buffer, and then continue
+    // as usual. we could support offsets by failing if they don't fall on a
+    // sector boundary, but that seems kind of horrible, and unlikely to succeed.
+    // seeking also cannot be supported, because we'd then have to deal with the
+    // same issue as supporting arbitrary offsets (we'd have to read and write
+    // any buffered data, and then seek.)
+    //
+    // writes will be blocking unless the file has been preallocated using
+    // posix_fadvise(), so platform_open_file() and platform_create_file()
+    // should accept an optional file size parameter to perform this
+    // preallocation.
+}
+
+/// @summary Flushes any pending writes to disk.
+/// @param id The application-defined identifier of the file to flush.
+/// @return true if the flush operation was successfully queued.
+bool platform_flush_file(intptr_t id)
+{
+    // this should be pretty straightforward.
+}
+
+/// @summary Opens a new temporary file for writing. The file is initially empty.
+/// Data may be written to or read from the file using platform_[read/write]_file().
+/// When finished, call platform_finalize_file() to close the file and move it to
+/// its final destination or delete the file.
+/// @param id The application-defined identifier of the file.
+/// @param type One of file_type_e indicating the type of file being created. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file operation priority, with 0 indicating the highest possible priority.
+/// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
+/// operations more efficient. If an estimate is unknown, specify zero.
+/// @return true if the file is opened and ready for I/O operations.
+bool platform_create_file(intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size)
+{
+    // generate a filename using mkostemp(), which also opens the file.
+    //
+    // On MacOS, use mktemp() with a template of /tmp/temp.XXXXXX, and then open with O_EXCL.
+    //
+    // On Windows, use GetTempPath() and GetTempFileName().
+}
+
+/// @summary Closes a file previously opened using platform_create_file(), and
+/// atomically renames that file to move it to the specified path. This function
+/// blocks the calling thread until all operations have completed.
+/// @param id The application-defined identifier of the file passed to the create file call.
+/// @param path The target path and filename of the file, or NULL to delete the file.
+/// @return true if the rename or delete was performed successfully.
+bool platform_finalize_file(intptr_t id, char const *path)
+{
+    // rename() or unlink(). we have the problem that we have only a fd, so on Linux:
+    // 1. get the required buffer size using lstat('/proc/self/fd/###') .st_size field.
+    // 2. use ssize_t readlink('/proc/self/fd/###', buffer, bufsz) to read the absolute path.
+    // 3. close the temporary file.
+    // 4. call either rename() or unlink() on the path.
+    //
+    // On MacOS, use fcntl(fd, F_GETPATH, dst[MAXPATHLEN?]) to get the path, and
+    // then use either rename() or unlink().
+    //
+    // On Windows, use GetFileInformationByHandleEx with FileNameInfo, and then
+    // use either MoveFileEx() or DeleteFile().
+}
+
+static void test_platform_io(int argc, char **argv)
 {
     int exit_code = EXIT_SUCCESS;
 
@@ -2224,6 +2460,13 @@ int main(int argc, char **argv)
 cleanup:
     delete_aio_state(&AIO_STATE);
     delete_vfs_state(&VFS_STATE);
+    exit(exit_code);
+}
+
+int main(int argc, char **argv)
+{
+    int exit_code = EXIT_SUCCESS;
+    init_io_callbacks(&IoCallback);
     exit(exit_code);
 }
 
