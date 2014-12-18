@@ -146,6 +146,7 @@ typedef bool (*pl_flush_file_fn)(intptr_t id);
 /// Data may be written to or read from the file using platform_[read/write]_file().
 /// When finished, call platform_finalize_file() to close the file and move it to
 /// its final destination or delete the file.
+/// @param where The directory path where the file will be created, or NULL to use the CWD.
 /// @param id The application-defined identifier of the file.
 /// @param type One of file_type_e indicating the type of file being created. This allows
 /// the platform to decide the thread on which data should be returned to the application.
@@ -153,7 +154,7 @@ typedef bool (*pl_flush_file_fn)(intptr_t id);
 /// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
 /// operations more efficient. If an estimate is unknown, specify zero.
 /// @return true if the file is opened and ready for I/O operations.
-typedef bool (*pl_create_file_fn)(intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size);
+typedef bool (*pl_create_file_fn)(char const *where, intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size);
 
 /// @summary Closes a file previously opened using platform_create_file(), and
 /// atomically renames that file to move it to the specified path. This function

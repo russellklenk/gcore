@@ -48,6 +48,7 @@
 #include <libaio.h>
 #include <pthread.h>
 #include <execinfo.h>
+#include <inttypes.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
@@ -102,6 +103,7 @@ enum aio_command_e
     AIO_COMMAND_WRITE = 1, /// Data should be written to the file.
     AIO_COMMAND_FLUSH = 2, /// Any pending writes should be flushed to disk.
     AIO_COMMAND_CLOSE = 3, /// The file should be closed.
+    AIO_COMMAND_FINAL = 4, /// The file should be closed and renamed.
 };
 
 /// @summary Define the supported VFS access modes for a file.
@@ -267,12 +269,38 @@ struct vfs_lfreq_t
     size_t             SectorSize;   /// The physical sector size of the disk.
 };
 
+/// @summary Defines the data associated with a file open request passed to the
+/// VFS driver. This structure is intended for storage in a srmw_fifo_t. The
+/// data is the same as the load file request, but the internal processing differs.
+struct vfs_ofreq_t
+{
+    vfs_ofreq_t       *Next;         /// Pointer to the next node in the queue.
+    int                Fildes;       /// The file descriptor of the opened file.
+    int                Eventfd;      /// The eventfd descriptor of the opened file.
+    int64_t            DataSize;     /// The logical size of the file, in bytes.
+    int64_t            FileSize;     /// The physical size of the file, in bytes.
+    int64_t            FileOffset;   /// The byte offset of the start of the file data.
+    intptr_t           AFID;         /// The application-defined ID for the file.
+    int32_t            Type;         /// The file type, one of file_type_e.
+    uint32_t           Priority;     /// The file access priority (0 = highest).
+    size_t             SectorSize;   /// The physical sector size of the disk.
+};
+
 /// @summary Defines the data associated with a file close request passed to the
 /// VFS driver. This structure is intended for storage in a srmw_fifo_t.
 struct vfs_cfreq_t
 {
     vfs_cfreq_t       *Next;         /// Pointer to the next node in the queue.
     intptr_t           AFID;         /// The application-defined ID for the file.
+};
+
+/// @summary Defines the data associated with a file finalize request passed to
+/// the VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_sfreq_t
+{
+    vfs_sfreq_t       *Next;         /// Pointer to the next node in the queue.
+    intptr_t           AFID;         /// The application-defined ID for the file.
+    char              *Target;       /// The target path, allocated with strdup().
 };
 
 /// @summary Defines the data associated with a completed I/O (read or write) operation.
@@ -288,6 +316,8 @@ struct vfs_res_t
 #define QC  (AIO_MAX_ACTIVE * 2)
 typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t;     /// Load file request queue.
 typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t;     /// Close file request queue.
+typedef srmw_fifo_t<vfs_ofreq_t>     vfs_ofq_t;     /// Open file request queue.
+typedef srmw_fifo_t<vfs_sfreq_t>     vfs_sfq_t;     /// Finalization request queue.
 typedef srsw_fifo_t<vfs_res_t, QC>   vfs_resultq_t; /// AIO result queue.
 typedef srsw_fifo_t<void*, QC>       vfs_returnq_t; /// I/O buffer return queue.
 #undef  QC
@@ -346,6 +376,8 @@ struct vfs_state_t
     #define NT         FILE_TYPE_COUNT
     vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
     vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
+    vfs_ofq_t          OpenQueue;    /// The queue for explicit file open requests.
+    vfs_sfq_t          FinalizeQueue;/// The queue for finalization requests.
     iobuf_alloc_t      IoAllocator;  /// The I/O buffer allocator.
     size_t             ActiveCount;  /// The number of open files.
     intptr_t           FileAFID[MF]; /// An application-defined ID for each active file.
@@ -391,6 +423,10 @@ static char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
     "WAV" , /* FILE_TYPE_WAV  */
     "JSON"  /* FILE_TYPE_JSON */
 };
+
+static vfs_state_t VFS_STATE;
+static aio_state_t AIO_STATE;
+static io_stats_t  IO_STATS;
 
 /*///////////////////////
 //   Local Functions   //
@@ -1161,6 +1197,71 @@ static void build_file_queue(vfs_io_fpq_t *pq, vfs_state_t const *vfs, uint16_t 
     }
 }
 
+/// @summary Find the end of a volume and directory information portion of a path.
+/// @param path The path string to search.
+/// @param out_pathlen On return, indicates the number of bytes in the volume and
+/// directory information of the path string. If the input path has no volume or
+/// directory information, this value will be set to zero.
+/// @param out_strlen On return, indicates the number of bytes in the input path,
+/// not including the trailing zero byte.
+/// @return A pointer to one past the last volume or directory separator, if present;
+/// otherwise, the input pointer path.
+static char const* pathend(char const *path, size_t &out_pathlen, size_t &out_strlen)
+{
+    if (path == NULL)
+    {
+        out_pathlen = 0;
+        out_strlen  = 0;
+        return path;
+    }
+
+    char        ch   = 0;
+    char const *last = path;
+    char const *iter = path;
+    while ((ch = *iter++) != 0)
+    {
+        if (ch == ':' || ch == '\\' || ch == '/')
+            last = iter;
+    }
+    out_strlen  = size_t(iter - path - 1);
+    out_pathlen = size_t(last - path);
+    return last;
+}
+
+/// @summary Find the extension part of a filename or path string.
+/// @param path The path string to search; ideally just the filename portion.
+/// @param out_extlen On return, indicates the number of bytes of extension information.
+/// @return A pointer to the first character of the extension. Check the value of
+/// out_extlen to be sure that there is extension information.
+static char const* extpart(char const *path, size_t &out_extlen)
+{
+    if (path == NULL)
+    {
+        out_extlen = 0;
+        return path;
+    }
+
+    char        ch    = 0;
+    char const *last  = path;
+    char const *iter  = path;
+    while ((ch = *iter++) != 0)
+    {
+        if (ch == '.')
+            last = iter;
+    }
+    if (last != path)
+    {   // we found an extension separator somewhere in the input path.
+        // @note: this also filters out the case of ex. path = '.gitignore'.
+        out_extlen = size_t(iter - last - 1);
+    }
+    else
+    {
+        // no extension part is present in the input path.
+        out_extlen = 0;
+    }
+    return last;
+}
+
 /// @summary Synchronously opens a file, creates an eventfd, and retrieves
 /// various information about the file.
 /// @param path The path of the file to open.
@@ -1433,6 +1534,88 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
     return srsw_fifo_put(&aio->CloseResults, res) ? 0 : -1;
 }
 
+/// @summary Synchronously processes a finalize request, which closes the temp
+/// file and safely moves it to the destination file path.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the finalize operation.
+/// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
+static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
+{   // TODO: we assume that the flush portion of this operation was
+    // taken care of by the VFS layer when it processed the request.
+    struct stat st;                        // results of lstat; st_size gives the path length.
+    ssize_t nsrc =  0;                     // the number of bytes read by readlink().
+    off_t    eof =  0;                     // the current end-of-file position.
+    char *target = (char*) req.DataBuffer; // either NULL, or allocated by strdup().
+    char *source =  NULL;                  // allocated with malloc().
+    char fdpath[32];                       // the path /proc/self/fd/########.
+
+    // all we have is a file descriptor. in order to use rename() or unlink(),
+    // the file descriptor must be translated into a source path.
+    snprintf (fdpath, 32, "/proc/self/fd/%d", req.Fildes);
+    if (lstat(fdpath,&st) < 0)
+    {   // couldn't retrieve the length of the source path. check errno.
+        goto error_cleanup;
+    }
+    // allocate storage for the source path.
+    if ((source = (char*) malloc(st.st_size + 1)) == NULL)
+    {   // unable to malloc() enough space. check errno.
+        goto error_cleanup;
+    }
+    // zero the buffer, and read the source path from the symlink.
+    memset(source, 0, st.st_size + 1);
+    if ((nsrc = readlink(fdpath, source, st.st_size + 1)) == -1)
+    {   // unable to read the source path from the symlink.
+        goto error_cleanup;
+    }
+    source[st.st_size] = 0;
+
+    // handle the simple case of deleting the temp file.
+    if (target == NULL)
+    {   // use unlink() to delete the temporary file.
+        if (unlink(source) == -1)
+        {   // the file could not be deleted. check errno.
+            goto error_cleanup;
+        }
+        srsw_fifo_put(&aio->CloseResults, aio_result(0, 0, req));
+        if (req.Eventfd != -1) close(req.Eventfd);
+        if (req.Fildes != -1) close(req.Fildes);
+        if (source != NULL) free(source);
+        return 0;
+    }
+
+    // we're saving the file, so save off the current EOF position.
+    // we'll use this to set the 'real' size of the file.
+    eof = lseek(req.Fildes, 0, SEEK_END);
+    if (req.Eventfd != -1) close(req.Eventfd);
+    if (req.Fildes != -1) close(req.Fildes);
+    if (truncate(source, eof) == -1)
+    {   // can't just goto error_cleanup; we've already closed the fd's.
+        srsw_fifo_put(&aio->CloseResults, aio_result(errno, 0, req));
+        free(source);  free(target);
+        return -1;
+    }
+
+    // use rename() to move the temp file to the target path.
+    if (rename(source, target) == -1)
+    {   // can't just goto error_cleanup; we've already closed the fd's.
+        srsw_fifo_put(&aio->CloseResults, aio_result(errno, 0, req));
+        free(source);  free(target);
+        return -1;
+    }
+
+    // finally, we're done. complete the operation successfully.
+    free(source); free(target);
+    return srsw_fifo_put(&aio->CloseResults, aio_result(0, 0, req)) ? 0 : -1;
+
+error_cleanup:
+    srsw_fifo_put(&aio->CloseResults, aio_result(errno, 0, req));
+    if (req.Eventfd != -1) close(req.Eventfd);
+    if (req.Fildes != -1) close(req.Fildes);
+    if (source != NULL) free(source);
+    if (target != NULL) free(target);
+    return -1;
+}
+
 /// @summary Implements the main loop of the AIO driver using a polling mechanism.
 /// @param aio The AIO driver state to update.
 /// @param timeout The timeout value indicating the amount of time to wait, or
@@ -1536,6 +1719,9 @@ static int aio_tick(aio_state_t *aio, struct timespec *timeout)
                 break;
             case AIO_COMMAND_CLOSE:
                 result = aio_process_close(aio, req);
+                break;
+            case AIO_COMMAND_FINAL:
+                result = aio_process_finalize(aio, req);
                 break;
             default:
                 error  = EINVAL;
@@ -1682,7 +1868,7 @@ static bool vfs_resolve_file_write(char const *path, int &fd, int &efd, int64_t 
     bool native_path = true;
     if  (native_path)
     {
-        int flags = O_RDWR | O_LARGEFILE | O_DIRECT | O_CREAT;
+        int flags = O_RDWR | O_LARGEFILE | O_DIRECT | O_CREAT | O_APPEND;
         if (open_file_raw(path, flags, fd, efd, psize, sector_size))
         {
             if (lsize > 0)
@@ -1793,6 +1979,7 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
+/// TODO: Need to check to see if there are any outstanding writes; if so, flush.
 static void vfs_process_closes(vfs_state_t *vfs)
 {   // process explicit close requests.
     while (vfs->ActiveCount > 0)
@@ -2109,8 +2296,10 @@ static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 static bool create_vfs_state(vfs_state_t *vfs)
 {   // TODO: some error handling would be nice.
     create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
-    create_srmw_fifo(&vfs->CloseQueue, MAX_OPEN_FILES);
-    create_srmw_fifo(&vfs->LoadQueue , MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->CloseQueue      , MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->LoadQueue       , MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->OpenQueue       , MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->FinalizeQueue   , MAX_OPEN_FILES);
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
         flush_srsw_fifo(&vfs->IoResult[i]);
@@ -2127,6 +2316,8 @@ static void delete_vfs_state(vfs_state_t *vfs)
 {
     vfs->ActiveCount = 0;
     io_opq_clear(&vfs->IoOperations);
+    delete_srmw_fifo(&vfs->FinalizeQueue);
+    delete_srmw_fifo(&vfs->OpenQueue);
     delete_srmw_fifo(&vfs->LoadQueue);
     delete_srmw_fifo(&vfs->CloseQueue);
     delete_iobuf_allocator(vfs->IoAllocator);
@@ -2251,10 +2442,117 @@ static bool platform_load_file(char const *path, intptr_t id, int32_t type, uint
 /// @return true if the operation was successful.
 static bool platform_save_file(char const *path, void const *data, int64_t size)
 {
-    // generate a temporary filename (see platform_create_file),
-    // vfs_resolve_file_write that path (preallocate the file),
-    // write the data and close the file,
-    // rename() to the input path
+    uint8_t const *buffer        = (uint8_t const*) data;          // the input buffer
+    size_t  const  page_size     = (size_t) sysconf(_SC_PAGESIZE); // the system page size, in bytes
+    int     const  prot          = PROT_READ   | PROT_WRITE;       // we want to be able to read and write
+    int     const  flags         = MAP_PRIVATE | MAP_ANONYMOUS;    // mapping is private and may begin anywhere
+    struct  stat   st            = {0};                            // for retrieving the physical sector size
+    int64_t        fsize         =  0;                             // the file size, rounded up to the nearest sector
+    uint8_t       *sector_buffer = NULL;                           // a one-page buffer for padding, aligned
+    size_t         sector_count  =  0;                             // the number of whole sectors in 'data'
+    size_t         sector_bytes  =  0;                             // the nearest sector-size multiple <= 'size'
+    size_t         sector_over   =  0;                             // how much over a sector boundary 'size' is
+    size_t         pathlen       =  0;                             // the total length of 'path', in bytes
+    size_t         dirlen        =  0;                             // the length of the path part of 'path', in bytes
+    size_t         ssize         =  0;                             // the physical disk sector size, in bytes
+    char          *temp_path     = NULL;                           // buffer for the path of the temporary file
+    int            fd            = -1;                             // file descriptor of the temporary file
+
+    // we need to create this file in the same directory as the output path.
+    // this avoids problems with rename() not being able to work across partitions.
+    // so, generate a unique filename within that same directory.
+    pathend(path, dirlen, pathlen);
+    temp_path  = (char*) malloc(dirlen + 17); // + '/' + 'savefile-XXXXXX'
+    memset(temp_path, 0, dirlen + 17);
+    if (dirlen > 0)
+    {   // the output path has volume and/or directory information specified.
+        // copy it to the temporary path buffer, and append a path separator.
+        memcpy(temp_path, path, dirlen);
+        strcat(temp_path, "/");
+    }
+    // now append the template filename to the temp_path buffer.
+    strcat(temp_path, "savefile-XXXXXX");
+
+    // allocate enough storage for a single block/sector. to support
+    // direct I/O, the buffer must be allocated on an address that is
+    // an even multiple of the disk sector size. allocating a single
+    // page from the VMM will satisfy this requirement, and as an
+    // added bonus, the page contents is zeroed, so we don't have to.
+    if ((sector_buffer = (uint8_t*) mmap(NULL, page_size, prot, flags, -1, 0)) == NULL)
+    {   // unable to allocate the single-sector buffer. check errno.
+        goto error_cleanup;
+    }
+
+    // use mkstemp to generate a temporary filename and open the file.
+    if ((fd = mkstemp(temp_path)) == -1)
+    {   // the file could not be opened at all. check errno.
+        goto error_cleanup;
+    }
+
+    // mkstemp doesn't allow specification of additional flags, so add O_DIRECT.
+    // if this fails, it's not a fatal; we'll still be able to write the file.
+    fcntl(fd, F_SETFL, O_DIRECT);
+
+    // retrieve the physical block size for the disk containing the file.
+    if (fstat(fd, &st) < 0)
+    {   // unable to retrieve file stats; fail.
+        goto error_cleanup;
+    }
+
+    // copy the data extending into the tail sector into our temporary buffer.
+    sector_count =  size_t(size / st.st_blksize);
+    sector_bytes =  size_t(st.st_blksize * sector_count);
+    sector_over  =  size_t(size - sector_bytes);
+    if (sector_over > 0)
+    {   // buffer the overlap amount into our temporary buffer.
+        memcpy(sector_buffer, &buffer[sector_bytes], sector_over);
+    }
+
+    // align the file size up to an even multiple of the physical sector size.
+    // pre-allocate space for the file, without changing the file size.
+    ssize = st.st_blksize;
+    fsize = align_up(size, ssize);
+    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, off_t(fsize)) != 0)
+    {   // unable to pre-allocate space for the file. check errno.
+        goto error_cleanup;
+    }
+
+    // finally, we can write the data to the file.
+    if (sector_bytes > 0)
+    {   // write the bulk of the data, if the data is > 1 sector.
+        write(fd, buffer, sector_bytes);
+    }
+    if (sector_over  > 0)
+    {   // write the remainder of the data.
+        write(fd, sector_buffer, st.st_blksize);
+    }
+
+    // close the file, and then truncate it to the correct size.
+    if (close(fd) == -1 || truncate(temp_path, size) == -1)
+    {   // unable to set the correct file size. check errno.
+        fd = -1; goto error_cleanup;
+    }
+
+    // all of that was successful, to move the temp file to the destination path.
+    if (rename(temp_path, path) == -1)
+    {   // the temp file could not be renamed. check errno.
+        fd = -1; goto error_cleanup;
+    }
+
+    // all done; clean up temporary memory.
+    munmap(sector_buffer, page_size);
+    free(temp_path);
+    return true;
+
+error_cleanup:
+    if (sector_buffer != NULL) munmap(sector_buffer, page_size);
+    if (fd != -1) close(fd);
+    if (temp_path != NULL)
+    {   // be sure to delete the temporary file.
+        unlink(temp_path);
+        free(temp_path);
+    }
+    return false;
 }
 
 /// @summary Opens a file for read-write access. The application is responsible
@@ -2358,6 +2656,7 @@ static bool platform_flush_file(intptr_t id)
 /// Data may be written to or read from the file using platform_[read/write]_file().
 /// When finished, call platform_finalize_file() to close the file and move it to
 /// its final destination or delete the file.
+/// @param where The directory path where the file will be created, or NULL to use the CWD.
 /// @param id The application-defined identifier of the file.
 /// @param type One of file_type_e indicating the type of file being created. This allows
 /// the platform to decide the thread on which data should be returned to the application.
@@ -2365,13 +2664,72 @@ static bool platform_flush_file(intptr_t id)
 /// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
 /// operations more efficient. If an estimate is unknown, specify zero.
 /// @return true if the file is opened and ready for I/O operations.
-static bool platform_create_file(intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size)
+static bool platform_create_file(char const *where, intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size)
 {
-    // generate a filename using mkostemp(), which also opens the file.
-    //
-    // On MacOS, use mktemp() with a template of /tmp/temp.XXXXXX, and then open with O_EXCL.
-    //
-    // On Windows, use GetTempPath() and GetTempFileName().
+    struct  stat st   = {0};  // for retrieving the physical sector size
+    int64_t fsize     =  0;   // the file size, rounded up to the nearest sector
+    size_t  ssize     =  0;   // the physical disk sector size, in bytes
+    size_t  pathlen   =  0;   // the total length of 'path', in bytes
+    size_t  dirlen    =  0;   // the length of the path part of 'path', in bytes
+    char   *temp_path = NULL; // buffer for the path of the temporary file
+    int     fd        = -1;   // file descriptor of the temporary file
+
+    // we need to create this file in the same directory as the output path.
+    // this avoids problems with rename() not being able to work across partitions.
+    // so, generate a unique filename within that same directory.
+    pathend(where, dirlen, pathlen);
+    temp_path  = (char*) malloc(dirlen + 17); // + '/' + 'tempfile-XXXXXX'
+    memset(temp_path, 0, dirlen + 17);
+    if (dirlen > 0)
+    {   // the output path has volume and/or directory information specified.
+        // copy it to the temporary path buffer, and append a path separator.
+        memcpy(temp_path, where, dirlen);
+        strcat(temp_path, "/");
+    }
+    // now append the template filename to the temp_path buffer.
+    strcat(temp_path, "tempfile-XXXXXX");
+
+    // use mkstemp to generate a temporary filename and open the file.
+    if ((fd = mkstemp(temp_path)) == -1)
+    {   // the file could not be opened at all. check errno.
+        free(temp_path);
+        return false;
+    }
+
+    // mkstemp doesn't allow specification of additional flags, so add O_DIRECT.
+    // if this fails, it's not a fatal; we'll still be able to write the file.
+    fcntl(fd, F_SETFL, O_APPEND | O_DIRECT);
+
+    // retrieve the physical block size for the disk containing the file.
+    if (fstat(fd, &st) < 0)
+    {   // unable to retrieve file stats; fail.
+        close(fd);
+        free (temp_path);
+        return false;
+    }
+
+    // align the file size up to an even multiple of the physical sector size.
+    // pre-allocate space for the file, without changing the file size.
+    if (reserve_size > 0)
+    {   // this is best-effort; if it fails, that's okay.
+        ssize = st.st_blksize;
+        fsize = align_up(reserve_size, ssize);
+        fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, off_t(fsize));
+    }
+
+    // all of the critical operations have succeeded; queue the request to VFS.
+    vfs_ofreq_t req;
+    req.Next       = NULL;
+    req.Fildes     = fd;
+    req.Eventfd    = -1;     // no eventfd for these types of files!
+    req.DataSize   =  0;     // the file is initially empty
+    req.FileSize   =  0;     // the file is initially empty
+    req.FileOffset =  0;     // the file is initially empty
+    req.AFID       = id;
+    req.Type       = type;
+    req.Priority   = priority;
+    req.SectorSize = ssize;
+    return srmw_fifo_put(&VFS_STATE.OpenQueue, req);
 }
 
 /// @summary Closes a file previously opened using platform_create_file(), and
@@ -2382,17 +2740,11 @@ static bool platform_create_file(intptr_t id, int32_t type, uint32_t priority, i
 /// @return true if the rename or delete was performed successfully.
 static bool platform_finalize_file(intptr_t id, char const *path)
 {
-    // rename() or unlink(). we have the problem that we have only a fd, so on Linux:
-    // 1. get the required buffer size using lstat('/proc/self/fd/###') .st_size field.
-    // 2. use ssize_t readlink('/proc/self/fd/###', buffer, bufsz) to read the absolute path.
-    // 3. close the temporary file.
-    // 4. call either rename() or unlink() on the path.
-    //
-    // On MacOS, use fcntl(fd, F_GETPATH, dst[MAXPATHLEN?]) to get the path, and
-    // then use either rename() or unlink().
-    //
-    // On Windows, use GetFileInformationByHandleEx with FileNameInfo, and then
-    // use either MoveFileEx() or DeleteFile().
+    vfs_sfreq_t req;
+    req.Next    = NULL;
+    req.AFID    = id;
+    req.Target  = NULL; if (path != NULL) req.Target = strdup(path);
+    return srmw_fifo_put(&VFS_STATE.FinalizeQueue, req);
 }
 
 /*////////////////////////
@@ -2418,6 +2770,7 @@ int main(int argc, char **argv)
     // TODO: other platform init code here.
     //
     // TODO: dynamically load the application code.
+    platform_save_file("abc.txt", "Hello, file I/O!\n\n", 18);
 
     exit(exit_code);
 }
