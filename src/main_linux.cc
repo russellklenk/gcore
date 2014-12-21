@@ -1413,8 +1413,8 @@ static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, int &error)
     else
     {   // the operation was rejected by kernel AIO. return the error.
         error = -res;
-        aio_res_t r =  aio_result(error , 0, req);
-        srsw_fifo_put(&aio->WriteResults, r);
+        aio_res_t r =  aio_result(error, 0, req);
+        srsw_fifo_put(&aio->ReadResults, r);
         return (-1);
     }
 }
@@ -1986,6 +1986,21 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
     }
 }
 
+/// @summary Processes all completed file read notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    while (srsw_fifo_get(&aio->WriteResults, res))
+    {   // no need to return anything to the platform layer.
+        if (res.DataBuffer != NULL)
+        {   // free the fixed-size write buffer.
+            munmap(res.DataBuffer, VFS_WRITE_SIZE);
+        }
+    }
+}
+
 /// @summary Processes all pending buffer returns and releases memory back to the pool.
 /// @param vfs The VFS driver state.
 static void vfs_process_buffer_returns(vfs_state_t *vfs)
@@ -2119,6 +2134,68 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
     return true;
 }
 
+/// @summary Processes as many pending stream-out operations as possible.
+/// @param vfs The VFS driver state to update.
+/// @return true if the tick should continue submitting I/O operations, or false if
+/// the I/O operation queue is full.
+static bool vfs_update_stream_out(vfs_state_t *vfs)
+{
+    vfs_sowr_t write;
+    while (srmw_fifo_get(&vfs->StOutWriteQ, write))
+    {   // allocate a new request in our internal operation queue.
+        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
+        if (req != NULL)
+        {   // populate the (already queued) request.
+            req->Command    = AIO_COMMAND_WRITE;
+            req->Fildes     = write.Fildes;
+            req->Eventfd    = write.Eventfd;
+            req->DataAmount = write.DataSize;
+            req->BaseOffset = 0;
+            req->FileOffset = write.FileOffset;
+            req->DataBuffer = write.DataBuffer;
+            req->QTimeNanos = nanotime();
+            req->ATimeNanos = 0;
+            req->AFID       = write.Fildes;
+            req->Type       = 0;
+            req->Reserved   = 0;
+        }
+        else
+        {   // the internal operation queue is full.
+            // put the write back in the queue, and return.
+            srmw_fifo_put(&vfs->StOutWriteQ, write);
+            return false;
+        }
+    }
+
+    vfs_socs_t close;
+    while (srmw_fifo_get(&vfs->StOutCloseQ, close))
+    {   // allocate a new request in our internal operation queue.
+        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
+        if (req != NULL)
+        {   // populate the (already queued) request.
+            req->Command    = AIO_COMMAND_FINAL;
+            req->Fildes     = write.Fildes;
+            req->Eventfd    = write.Eventfd;
+            req->DataAmount = 0;
+            req->BaseOffset = 0;
+            req->FileOffset = 0;
+            req->DataBuffer = NULL;
+            req->QTimeNanos = nanotime();
+            req->ATimeNanos = 0;
+            req->AFID       = write.Fildes;
+            req->Type       = 0;
+            req->Reserved   = 0;
+        }
+        else
+        {   // the internal operation queue is full.
+            // put the close back in the queue, and return.
+            srmw_fifo_put(&vfs->StOutCloseQ, close);
+            return false;
+        }
+    }
+    return true;
+}
+
 /// @summary Implements the main body of the VFS update loop, which processes
 /// requests from the application layer, submits I/O requests to the AIO driver,
 /// and dispatches completion notifications from the AIO layer back to the application.
@@ -2140,6 +2217,7 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
     // generate read and write I/O operations. this increments the number of
     // pending I/O operations across the set of active files.
     vfs_update_stream_in(vfs);
+    vfs_update_stream_out(vfs);
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
@@ -2154,8 +2232,9 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
     // dispatch any completed I/O operations to the per-type queues for
     // processing by the platform layer and dispatching to the application.
     // this decrements the number of pending I/O operations across the file set.
-    vfs_process_completed_reads  (vfs, aio);
-    vfs_process_completed_closes (vfs, aio);
+    vfs_process_completed_reads (vfs, aio);
+    vfs_process_completed_writes(vfs, aio);
+    vfs_process_completed_closes(vfs, aio);
 
     // close file requests should be processed after all read and write requests.
     // this ensures that all I/O has been submitted before closing the file.
