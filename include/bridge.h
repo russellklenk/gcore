@@ -172,7 +172,7 @@ typedef bool (*pl_write_out_fn)(char const *path, void const *data, int64_t size
 /// operations more efficient. Specify zero if unknown.
 /// @param writer On return, this value will point to the file writer state.
 /// @return true if the file is opened and ready for write operations.
-typedef bool (*pl_create_stream_fn)(char const *where, uint32_t priority, int64_t reserve_size, file_writer_t **writer);
+typedef bool (*pl_create_stream_fn)(char const *where, uint32_t priority, int64_t reserve_size, stream_writer_t **writer);
 
 /// @summary Queues a write operation against an open file. The file should have
 /// previously been opened using create_stream(). The data is always appended to
