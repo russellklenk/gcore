@@ -127,7 +127,8 @@ enum vfs_stream_in_operation_e
     STREAM_IN_PAUSE   = 0, /// Stream loading should be paused.
     STREAM_IN_RESUME  = 1, /// Stream loading should be resumed from the current position.
     STREAM_IN_REWIND  = 2, /// Restart stream loading from the beginning of the stream.
-    STREAM_IN_STOP    = 3, /// Stop stream loading and close the stream.
+    STREAM_IN_SEEK    = 3, /// Seek to a position within the stream and start loading.
+    STREAM_IN_STOP    = 4, /// Stop stream loading and close the stream.
 };
 
 /// @summary Defines the data associated with a fixed-size lookaside queue.
@@ -288,6 +289,7 @@ struct vfs_siop_t
     vfs_siop_t        *Next;         /// Pointer to the next node in the queue.
     intptr_t           ASID;         /// The application-defined ID for the stream.
     int32_t            OpId;         /// The operation ID, one of vfs_stream_in_op_e.
+    int64_t            Argument;     /// Optional data associated with the command.
 };
 
 /// @summary Defines the data associated with a completed stream-in read operation.
@@ -298,6 +300,13 @@ struct vfs_sird_t
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation.
     uint32_t           DataAmount;   /// The amount of data transferred.
     int                OSError;      /// The error code returned by the operation, or 0.
+};
+
+/// @summary Defines the data associated with an end-of-stream notification.
+struct vfs_sies_t
+{
+    intptr_t           ASID;         /// The application-defined ID for the stream.
+    int32_t            Behavior;     /// The configured behavior of the stream.
 };
 
 /// @summary Defines the data associated with a stream-out write request passed
@@ -326,12 +335,15 @@ struct vfs_socs_t
 };
 
 #define QC  (AIO_MAX_ACTIVE * 2)
+#define MS  (MAX_STREAMS_IN)
 typedef srmw_fifo_t<vfs_sowr_t>      vfs_sowriteq_t;   /// A stream-out write queue.
 typedef srmw_fifo_t<vfs_socs_t>      vfs_socloseq_t;   /// A stream-out close queue.
 typedef srmw_fifo_t<vfs_siop_t>      vfs_sicommandq_t; /// A stream-in command queue.
 typedef srmw_fifo_t<vfs_sics_t>      vfs_sicreateq_t;  /// A stream-in create queue.
 typedef srsw_fifo_t<vfs_sird_t, QC>  vfs_siresultq_t;  /// A stream-in result queue.
 typedef srsw_fifo_t<void*     , QC>  vfs_sireturnq_t;  /// A stream-in return queue.
+typedef srsw_fifo_t<vfs_sies_t, MS>  vfs_siendq_t;     /// A stream-in end-of-stream queue.
+#undef  MS
 #undef  QC
 
 /// @summary Information that remains constant from the point that a file is opened for stream-in.
@@ -399,6 +411,7 @@ struct vfs_state_t
     vfs_io_opq_t       IoOperations; /// The priority queue of all pending I/O operations.
     vfs_siresultq_t    SiResult[NT]; /// The per-file type queue for stream-in I/O results.
     vfs_sireturnq_t    SiReturn[NT]; /// The per-file type queue for stream-in I/O buffer returns.
+    vfs_siendq_t       SiEndOfS[NT]; /// The per-file type queue for stream-in end-of-stream events.
     #undef NT
     #undef MS
 };
@@ -1927,7 +1940,6 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
-/// TODO: Need to check to see if there are any outstanding writes; if so, flush.
 static void vfs_process_closes(vfs_state_t *vfs)
 {
     for (size_t i = 0; i < vfs->ActiveCount; )
@@ -2040,14 +2052,25 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
             switch (op.OpId)
             {
                 case STREAM_IN_PAUSE:
-                    vfs->StInStat[i].StatusFlags |= VFS_STATUS_PAUSE;
+                    vfs->StInStat[i].StatusFlags |=  VFS_STATUS_PAUSE;
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_CLOSE);
                     break;
                 case STREAM_IN_RESUME:
-                    vfs->StInStat[i].StatusFlags &=~VFS_STATUS_PAUSE;
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
                     break;
                 case STREAM_IN_REWIND:
-                    vfs->StInStat[i].StatusFlags &=~VFS_STATUS_PAUSE;
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
                     vfs->RdOffset[i] = 0;
+                    break;
+                case STREAM_IN_SEEK:
+                    if ((op.Argument & (vfs->StInInfo[i].SectorSize-1)) != 0)
+                    {   // align up to the nearest sector size multiple.
+                        // then, subtract the sector size to get the next lowest multiple.
+                        op.Argument  = align_up(op.Argument, vfs->StInInfo[i].SectorSize);
+                        op.Argument -= vfs->StInInfo[i].SectorSize;
+                    }
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->RdOffset[i] = op.Argument;
                     break;
                 case STREAM_IN_STOP:
                     vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
@@ -2075,7 +2098,6 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
         // 1. we've reached the end of the file data. continue with the next file.
         // 2. we've run out of pending queue space. stop processing for the tick.
         // 3. we've run out of I/O buffer space. stop processing for the tick.
-        // TODO: investigate combining reads to reduce AIO op count? no need to readv.
         size_t nqueued = 0;
         while (iobuf_bytes_free(allocator) > 0)
         {   // allocate a new request in our internal operation queue.
@@ -2100,17 +2122,7 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
                 int64_t newofs  = vfs->RdOffset[index] + read_amount;
                 vfs->RdOffset[index] = newofs;
                 if (newofs >= vfs->StInInfo[index].FileSize)
-                {   // reached or passed end-of-file; mark as pending close
-                    // or rewind to the beginning of the file.
-                    switch (vfs->StInInfo[index].EndBehavior)
-                    {
-                        case STREAM_IN_ONCE:
-                            vfs->StInStat[index].StatusFlags |= VFS_STATUS_CLOSE;
-                            break;
-                        case STREAM_IN_LOOP:
-                            vfs->RdOffset[index] = 0;
-                            break;
-                    }
+                {   // reached or passed end-of-file.
                     // continue processing the next file.
                     break;
                 }
@@ -2125,9 +2137,27 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
         // this value is decremented as operations are completed.
         vfs->StInStat[index].NPendingAIO += nqueued;
 
-        // if we ran out of I/O buffer space, there's no point in continuing.
-        if (nqueued == 0)
-        {   // TODO: track this statistic somewhere.
+        if (vfs->RdOffset[index] >= vfs->StInInfo[index].FileSize)
+        {   // the end-of-stream notification gives the listener a chance to
+            // take some appropriate action. we could handle it automatically,
+            // but for some usages we might do the wrong thing - for example,
+            // some data is at the end of the stream, but after reading it,
+            // the application wants to seek to some other offset and resume
+            // instead of closing - neither STREAM_IN_ONCE and STREAM_IN_LOOP fit.
+            // the stream remains paused until a STOP, SEEK or REWIND is received.
+            if ((vfs->StInStat[index].StatusFlags & VFS_STATUS_PAUSE) == 0)
+            {
+                vfs_sies_t eos = {
+                    vfs->StInASID[index],
+                    vfs->StInInfo[index].EndBehavior
+                };
+                srsw_fifo_put(&vfs->SiEndOfS[vfs->StInType[index]], eos);
+                vfs->StInStat[index].StatusFlags |= VFS_STATUS_PAUSE;
+            }
+        }
+        else if (nqueued == 0)
+        {   // we ran out of I/O buffer space; there's no point in continuing.
+            // TODO: track this statistic somewhere.
             return false;
         }
     }
@@ -2276,6 +2306,7 @@ static bool create_vfs_state(vfs_state_t *vfs)
     {
         flush_srsw_fifo(&vfs->SiResult[i]);
         flush_srsw_fifo(&vfs->SiReturn[i]);
+        flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
     io_opq_clear(&vfs->IoOperations);
     vfs->ActiveCount = 0;
@@ -2297,6 +2328,7 @@ static void delete_vfs_state(vfs_state_t *vfs)
     {
         flush_srsw_fifo(&vfs->SiResult[i]);
         flush_srsw_fifo(&vfs->SiReturn[i]);
+        flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
 }
 
@@ -2426,10 +2458,11 @@ static bool platform_stream_in(char const *path, intptr_t id, int32_t type, uint
 /// @return true if the stream pause was queued.
 static bool platform_pause_stream(intptr_t id)
 {
-    vfs_siop_t req;
-    req.Next   = NULL;
-    req.ASID   = id;
-    req.OpId   = STREAM_IN_PAUSE;
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_PAUSE;
+    req.Argument = 0;
     return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
 }
 
@@ -2438,10 +2471,11 @@ static bool platform_pause_stream(intptr_t id)
 /// @return true if the stream start was queued.
 static bool platform_resume_stream(intptr_t id)
 {
-    vfs_siop_t req;
-    req.Next   = NULL;
-    req.ASID   = id;
-    req.OpId   = STREAM_IN_RESUME;
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_RESUME;
+    req.Argument = 0;
     return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
 }
 
@@ -2450,10 +2484,26 @@ static bool platform_resume_stream(intptr_t id)
 /// @return true if the stream rewind was queued.
 static bool platform_rewind_stream(intptr_t id)
 {
-    vfs_siop_t req;
-    req.Next   = NULL;
-    req.ASID   = id;
-    req.OpId   = STREAM_IN_REWIND;
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_REWIND;
+    req.Argument = 0;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Positions the read cursor for the stream near a given location and resumes playback of the stream.
+/// @param id The application-defined identifier of the stream.
+/// @param absolute_offset The byte offset of the new playback position from the
+/// start of the stream. The stream loading will resume from at or before this position.
+/// @return true if the stream seek was queued.
+static bool platform_seek_stream(intptr_t id, int64_t absolute_offset)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_SEEK;
+    req.Argument = absolute_offset;
     return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
 }
 
@@ -2462,11 +2512,28 @@ static bool platform_rewind_stream(intptr_t id)
 /// @return true if the stream close was queued.
 static bool platform_stop_stream(intptr_t id)
 {
-    vfs_siop_t req;
-    req.Next   = NULL;
-    req.ASID   = id;
-    req.OpId   = STREAM_IN_STOP;
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_STOP;
+    req.Argument = 0;
     return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Implements the default end-of-stream behavior for basic stream types.
+/// @param id The application-defined identifier of the stream.
+/// @param type One of file_type_e indicating the type of data being streamed in.
+/// @param default_behavior One of stream_in_mode_e indicating the configured default behavior of the stream.
+/// @return true if the behavior was processed.
+static bool platform_default_eos(intptr_t id, int32_t type, int32_t default_behavior)
+{
+    switch (default_behavior)
+    {
+        case STREAM_IN_ONCE: return platform_stop_stream(id);
+        case STREAM_IN_LOOP: return platform_rewind_stream(id);
+        default: break;
+    }
+    return false;
 }
 
 /// @summary Opens a file for reading or writing. The file is opened in buffered

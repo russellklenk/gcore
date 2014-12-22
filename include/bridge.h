@@ -107,6 +107,13 @@ typedef bool (*pl_resume_stream_fn)(intptr_t id);
 /// @return true if the stream rewind was queued.
 typedef bool (*pl_rewind_stream_fn)(intptr_t id);
 
+/// @summary Positions the read cursor for the stream near a given location and resumes playback of the stream.
+/// @param id The application-defined identifier of the stream.
+/// @param absolute_offset The byte offset of the new playback position from the
+/// start of the stream. The stream loading will resume from at or before this position.
+/// @return true if the stream seek was queued.
+typedef bool (*pl_seek_stream_fn)(intptr_t id, int64_t absolute_offset);
+
 /// @summary Stops loading a stream and closes the underlying file.
 /// @param id The application-defined identifier of the stream.
 /// @return true if the stream close was queued.
@@ -200,6 +207,7 @@ struct platform_layer_t
     pl_pause_stream_fn   pause_stream;  /// Streaming read API.
     pl_resume_stream_fn  resume_stream; /// Streaming read API.
     pl_rewind_stream_fn  rewind_stream; /// Streaming read API.
+    pl_seek_stream_fn    seek_stream;   /// Streaming read API.
     pl_stop_stream_fn    stop_stream;   /// Streaming read API.
 
     pl_open_file_fn      open_file;     /// Synchronous buffered I/O API.
