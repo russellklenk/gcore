@@ -1826,6 +1826,8 @@ static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_
 /// necessary, and return basic file information to the caller. This function
 /// should only be used for read-only files, files cannot be written in an archive.
 /// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param direct Specify true to use unbuffered I/O. This is useful for large files,
+/// or files that will only be read once, as it prevents pollution of the page cache.
 /// @param fd On return, stores the file descriptor of the archive or native file.
 /// @param efd On return, stores the eventfd descriptor of the archive or native file.
 /// @param lsize On return, stores the logical size of the file, in bytes. This is the
@@ -1837,13 +1839,14 @@ static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @return true if the file could be resolved.
-static bool vfs_resolve_file_read(char const *path, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+static bool vfs_resolve_file_read(char const *path, bool direct, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
     if  (native_path)
     {
-        int flags = O_RDONLY | O_LARGEFILE | O_DIRECT;
+        int flags = O_RDONLY | O_LARGEFILE;
+        if (direct) flags |= O_DIRECT;
         if (open_file_raw(path, flags, fd, efd, psize, sector_size))
         {   // native files always begin at the first byte.
             // logical and physical size are the same.
@@ -2407,13 +2410,14 @@ static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error
 /// @return true if the file was successfully opened.
 static bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
 {
+    bool    direct = (mode == STREAM_IN_ONCE) ? true : false;
     int     fd     = -1;
     int     efd    = -1;
     size_t  ssize  =  0;
     int64_t lsize  =  0;
     int64_t psize  =  0;
     int64_t offset =  0;
-    if (vfs_resolve_file_read(path, fd, efd, lsize, psize, offset, ssize))
+    if (vfs_resolve_file_read(path, direct, fd, efd, lsize, psize, offset, ssize))
     {   // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
@@ -3026,27 +3030,173 @@ static bool platform_close_stream(stream_writer_t **writer, char const *path)
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+static int test_stream_in(int argc, char **argv, platform_layer_t *p)
+{
+    int64_t ss = 0;
+    int result = EXIT_SUCCESS;
+    bool  done = false;
+
+    init_io_stats(&IO_STATS);
+    create_aio_state(&AIO_STATE);
+    create_vfs_state(&VFS_STATE);
+
+    if (argc < 2)
+    {
+        fprintf(stderr, "ERROR: Missing required argument infile.\n");
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // start a stream-in.
+    if (p->open_stream(argv[1], 1234, 0, 0, STREAM_IN_LOOP, true, ss))
+    {
+        fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", argv[1], ss);
+        result = EXIT_SUCCESS;
+    }
+    else
+    {
+        fprintf(stderr, "ERROR: Unable to load file \'%s\'.\n", argv[1]);
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // run everything on the same thread, which isn't required.
+    // we could run VFS on one thread, AIO on another, or both on the same.
+    while (!done)
+    {   // update the VFS and AIO drivers. this generates AIO operations,
+        // updates stream-in status, and pushes data to the application.
+        vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+        aio_poll(&AIO_STATE);
+
+        if (VFS_STATE.ActiveCount == 0)
+        {   // we could have closed due to an error in this test case.
+            // normally, you wouldn't have this check.
+            done = true;
+        }
+
+        // process data received from the I/O system. normally, different
+        // threads would handle one or more file types, depending on what
+        // needs to be done with the data and who needs access to it.
+        for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+        {
+            int32_t    type = int32_t(i); // the file_type_e.
+            vfs_sird_t read;
+            while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
+            {
+                if (read.OSError == 0)
+                {   // echo the data to stdout.
+                    // normally, you'd push the result to a callback.
+                    fwrite(read.DataBuffer, 1, read.DataAmount, stdout);
+                    // after the application has had a chance to process
+                    // the data, return the buffer so it can be used again.
+                    vfs_return_buffer(&VFS_STATE, type, read.DataBuffer);
+                }
+                else
+                {   // an error occurred, so display it and then exit.
+                    platform_print_ioerror(read.ASID, type, read.OSError, strerror(read.OSError));
+                    p->stop_stream(read.ASID);
+                    result = EXIT_FAILURE;
+                }
+            }
+
+            vfs_sies_t eos;
+            while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
+            {
+                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", eos.ASID);
+                p->rewind_stream(eos.ASID);
+            }
+        }
+    }
+
+cleanup:
+    delete_vfs_state(&VFS_STATE);
+    delete_aio_state(&AIO_STATE);
+    return result;
+}
+
+static int test_fileio_in(int argc, char **argv, platform_layer_t *p)
+{
+    size_t  nr = 0;
+    int64_t fo = 0;
+    int64_t ss = 0;
+    int result = EXIT_SUCCESS;
+    bool  done = false;
+    file_t *fp = NULL;
+    void  *buf = malloc(VFS_ALLOC_SIZE);
+
+    if (argc < 2)
+    {
+        fprintf(stderr, "ERROR: Missing required argument infile.\n");
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // open the file.
+    if (p->open_file(argv[1], true, ss, &fp))
+    {
+        fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", argv[1], ss);
+        result = EXIT_SUCCESS;
+    }
+    else
+    {
+        fprintf(stderr, "ERROR: Unable to load file \'%s\'.\n", argv[1]);
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // read as much data as possible, write to stdout.
+    while (p->read_file(fp, fo, buf, VFS_ALLOC_SIZE, nr))
+    {
+        if (nr == 0)
+        {
+            fo  = 0;
+            continue;
+        }
+        else
+        {
+            fwrite(buf, 1, nr, stdout);
+            fo += nr;
+        }
+    }
+
+cleanup:
+    if (fp != NULL) p->close_file(&fp);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     platform_layer_t platform_layer;
     int exit_code = EXIT_SUCCESS;
 
-    // set up the platform layer callbacks:
-    /*platform_layer.print_ioerror = platform_print_ioerror;
-    platform_layer.load_file     = platform_load_file;
-    platform_layer.save_file     = platform_save_file;
+    // set up the platform layer function pointers:
+    platform_layer.stream_in     = platform_stream_in;
+    platform_layer.open_stream   = platform_open_stream;
+    platform_layer.pause_stream  = platform_pause_stream;
+    platform_layer.resume_stream = platform_resume_stream;
+    platform_layer.rewind_stream = platform_rewind_stream;
+    platform_layer.seek_stream   = platform_seek_stream;
+    platform_layer.stop_stream   = platform_stop_stream;
     platform_layer.open_file     = platform_open_file;
-    platform_layer.close_file    = platform_close_file;
     platform_layer.read_file     = platform_read_file;
     platform_layer.write_file    = platform_write_file;
     platform_layer.flush_file    = platform_flush_file;
-    platform_layer.create_file   = platform_create_file;
-    platform_layer.finalize_file = platform_finalize_file;*/
+    platform_layer.close_file    = platform_close_file;
+    platform_layer.write_out     = platform_write_out;
+    platform_layer.create_stream = platform_create_stream;
+    platform_layer.append_stream = platform_append_stream;
+    platform_layer.close_stream  = platform_close_stream;
 
     // TODO: other platform init code here.
     //
     // TODO: dynamically load the application code.
-    //platform_save_file("abc.txt", "Hello, file I/O!\n\n", 18);
+
+    exit_code = test_stream_in(argc, argv, &platform_layer);
+    //exit_code = test_fileio_in(argc, argv, &platform_layer);
 
     exit(exit_code);
 }

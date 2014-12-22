@@ -7,7 +7,7 @@ DEPENDENCIES  = ${SOURCES:.cc=.dep}
 INCLUDE_DIRS  = -I. -Iinclude
 LIBRARY_DIRS  = -Llib
 PROJ_WARNINGS = -Wall -Wextra
-PROJ_CCFLAGS  = -ggdb -std=c++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS
+PROJ_CCFLAGS  = -ggdb -std=c++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS -D LINUX_AIO_MAX_ACTIVE=128 -D LINUX_VFS_IOBUF_SIZE=16777216 -D LINUX_VFS_WRITE_SIZE=65536
 PROJ_LDFLAGS  =
 
 .PHONY: all clean distclean output
