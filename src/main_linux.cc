@@ -54,6 +54,7 @@
 #include <sys/epoll.h>
 #include <sys/param.h>
 #include <sys/eventfd.h>
+#include <sys/vfs.h>
 
 #include "bridge.h"
 
@@ -100,6 +101,13 @@ static size_t   const VFS_WRITE_SIZE = LINUX_VFS_WRITE_SIZE;
 /// @summary Define the size of the buffer allocated for each I/O request.
 static size_t   const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
 
+/// @summary Define the file size limit for preferring buffered I/O. Large
+/// files can pollute the page cache and will reduce overall I/O throughput.
+#ifndef LINUX_VFS_DIRECT_IO_THRESHOLD
+#define LINUX_VFS_DIRECT_IO_THRESHOLD (16 * 1024 * 1024)
+#endif
+static int64_t  const VFS_DIRECT_IO_THRESHOLD = LINUX_VFS_DIRECT_IO_THRESHOLD;
+
 /*///////////////////
 //   Local Types   //
 ///////////////////*/
@@ -129,6 +137,13 @@ enum vfs_stream_in_operation_e
     STREAM_IN_REWIND  = 2, /// Restart stream loading from the beginning of the stream.
     STREAM_IN_SEEK    = 3, /// Seek to a position within the stream and start loading.
     STREAM_IN_STOP    = 4, /// Stop stream loading and close the stream.
+};
+
+/// @summary Defines the supported file open hints.
+enum vfs_file_hint_e
+{
+    FILE_HINT_NONE    = (0 << 0), /// No special hints are provided.
+    FILE_HINT_DIRECT  = (1 << 0), /// Prefer unbuffered I/O.
 };
 
 /// @summary Defines the data associated with a fixed-size lookaside queue.
@@ -1821,13 +1836,33 @@ static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_
     return false;
 }
 
+/// @summary Check whether a give file descriptor references a file on a remote mount point.
+/// @param fd The file descriptor to check.
+/// @return true if the file exists on a remote mount point.
+static bool is_remote(int fd)
+{
+    struct statfs    st;
+    if (fstatfs(fd, &st) < 0)
+    {   // unable to stat the file.
+        return false;
+    }
+    switch (st.f_type)
+    {
+        case 0xFF534D42: // CIFS_MAGIC_NUMBER: /* 0xFF534D42 */
+        case 0x00006969: // NFS_MAGIC_NUMBER:  /* 0x00006969 */
+            return true;
+        default:
+            break;
+    }
+    return false;
+}
+
 /// @summary Determine whether a path references a file within an archive, (and
 /// if so, which one) or whether it references a native file. Open the file if
 /// necessary, and return basic file information to the caller. This function
 /// should only be used for read-only files, files cannot be written in an archive.
 /// @param path The NULL-terminated UTF-8 path of the file to resolve.
-/// @param direct Specify true to use unbuffered I/O. This is useful for large files,
-/// or files that will only be read once, as it prevents pollution of the page cache.
+/// @param hints A combination of vfs_file_hint_e to control how the file is opened.
 /// @param fd On return, stores the file descriptor of the archive or native file.
 /// @param efd On return, stores the eventfd descriptor of the archive or native file.
 /// @param lsize On return, stores the logical size of the file, in bytes. This is the
@@ -1839,17 +1874,22 @@ static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @return true if the file could be resolved.
-static bool vfs_resolve_file_read(char const *path, bool direct, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+static bool vfs_resolve_file_read(char const *path, int hints, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
     if  (native_path)
     {
         int flags = O_RDONLY | O_LARGEFILE;
-        if (direct) flags |= O_DIRECT;
         if (open_file_raw(path, flags, fd, efd, psize, sector_size))
         {   // native files always begin at the first byte.
             // logical and physical size are the same.
+            if (((hints & FILE_HINT_DIRECT) != 0 || (psize > VFS_DIRECT_IO_THRESHOLD)) && is_remote(fd) == false)
+            {   // fcntl O_DIRECT if buffer_hint is false or the file exceeds a certain size.
+                // if this fails, we will fall back to buffered I/O; it is not a fatal error.
+                // never use O_DIRECT for files mounted with NFS or CIFS; these don't read correctly.
+                fcntl(fd, F_SETFL, O_RDONLY | O_LARGEFILE | O_DIRECT);
+            }
             lsize  = psize;
             offset = 0;
             return true;
@@ -2410,14 +2450,19 @@ static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error
 /// @return true if the file was successfully opened.
 static bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
 {
-    bool    direct = (mode == STREAM_IN_ONCE) ? true : false;
+    bool    hint   = true;
     int     fd     = -1;
     int     efd    = -1;
     size_t  ssize  =  0;
     int64_t lsize  =  0;
     int64_t psize  =  0;
     int64_t offset =  0;
-    if (vfs_resolve_file_read(path, direct, fd, efd, lsize, psize, offset, ssize))
+    if (mode == STREAM_IN_ONCE)
+    {   // for files that will be streamed in only once, prefer unbuffered I/O.
+        // this avoids polluting the page cache with their data.
+        hint  = false;
+    }
+    if (vfs_resolve_file_read(path, hint, fd, efd, lsize, psize, offset, ssize))
     {   // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
