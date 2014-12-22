@@ -118,6 +118,11 @@ typedef struct _FILE_ALLOCATION_INFO {
 typedef struct _FILE_END_OF_FILE_INFO {
     LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFO, *PFILE_END_OF_FILE_INFO;
+
+typedef struct _FILE_NAME_INFO {
+    DWORD FileNameLength;
+    WCHAR FileName[1];
+} FILE_NAME_INFO, *PFILE_NAME_INFO;
 #endif /* __GNUC__ <= 4.9 - MinGW */
 #endif /* __GNUC__ comple - MinGW */
 
@@ -147,14 +152,14 @@ static uint64_t  const SEC_TO_NANOSEC = 1000000000ULL;
 /// processing and completing I/O requests, and the lower the I/O thoroughput.
 static size_t    const IO_SYSTEM_RATE = 60;
 
-/// @summary Define the maximum number of concurrently open files.
-static size_t    const MAX_OPEN_FILES = 128;
+/// @summary Define the maximum number of concurrent stream-in files.
+static size_t    const MAX_STREAMS_IN = 16;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
 /// poll during each tick, and the maximum number the underlying OS can handle.
 #ifndef WINOS_AIO_MAX_ACTIVE    // can override at compile time
-#define WINOS_AIO_MAX_ACTIVE    512
+#define WINOS_AIO_MAX_ACTIVE    128
 #endif
 static size_t    const AIO_MAX_ACTIVE = WINOS_AIO_MAX_ACTIVE;
 
@@ -166,8 +171,22 @@ static size_t    const AIO_MAX_ACTIVE = WINOS_AIO_MAX_ACTIVE;
 #endif
 static size_t    const VFS_IOBUF_SIZE = WINOS_VFS_IOBUF_SIZE;
 
+/// @summary Define the size of the write buffer for output streams. This must
+/// be at least the size of a single page, as buffers are allocated using mmap.
+#ifndef WINOS_VFS_WRITE_SIZE    // can override at compile time
+#define WINOS_VFS_WRITE_SIZE   (64 * 1024)
+#endif
+static size_t   const VFS_WRITE_SIZE = WINOS_VFS_WRITE_SIZE;
+
 /// @summary Define the size of the buffer allocated for each I/O request.
-static size_t    const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
+static size_t   const VFS_ALLOC_SIZE = VFS_IOBUF_SIZE / AIO_MAX_ACTIVE;
+
+/// @summary Define the file size limit for preferring buffered I/O. Large
+/// files can pollute the page cache and will reduce overall I/O throughput.
+#ifndef WINOS_VFS_DIRECT_IO_THRESHOLD
+#define WINOS_VFS_DIRECT_IO_THRESHOLD (16 * 1024 * 1024)
+#endif
+static int64_t  const VFS_DIRECT_IO_THRESHOLD = WINOS_VFS_DIRECT_IO_THRESHOLD;
 
 /// @summary The spin count used on critical sections protecting shared resources
 /// of srmw_freelist_t and srmw_fifo_t.
@@ -187,20 +206,32 @@ enum aio_command_e
     AIO_COMMAND_WRITE = 1, /// Data should be written to the file.
     AIO_COMMAND_FLUSH = 2, /// Any pending writes should be flushed to disk.
     AIO_COMMAND_CLOSE = 3, /// The file should be closed.
+    AIO_COMMAND_FINAL = 4, /// The file should be closed and renamed.
 };
 
-/// @summary Define the supported VFS access modes for a file.
-enum vfs_mode_e
-{
-    VFS_MODE_LOAD     = 0, /// The file is being loaded entirely and then closed.
-    VFS_MODE_EXPLICIT = 1, /// The file reads are controlled by the user.
-};
-
-/// @summary Defines the supported VFS file status flags.
-enum vfs_status_e
+/// @summary Defines the supported VFS stream-in status flags.
+enum vfs_stream_in_status_e
 {
     VFS_STATUS_NONE   = (0 << 0), /// No special status bits are set.
-    VFS_STATUS_CLOSE  = (1 << 0), /// The file is marked as having a close pending.
+    VFS_STATUS_PAUSE  = (1 << 0), /// The stream is currently paused.
+    VFS_STATUS_CLOSE  = (1 << 0), /// The stream is marked as having a close pending.
+};
+
+/// @summary Defines the supported VFS stream-in control operations.
+enum vfs_stream_in_operation_e
+{
+    STREAM_IN_PAUSE   = 0, /// Stream loading should be paused.
+    STREAM_IN_RESUME  = 1, /// Stream loading should be resumed from the current position.
+    STREAM_IN_REWIND  = 2, /// Restart stream loading from the beginning of the stream.
+    STREAM_IN_SEEK    = 3, /// Seek to a position within the stream and start loading.
+    STREAM_IN_STOP    = 4, /// Stop stream loading and close the stream.
+};
+
+/// @summary Defines the supported file open hints.
+enum vfs_file_hint_e
+{
+    FILE_HINT_NONE    = (0 << 0), /// No special hints are provided.
+    FILE_HINT_DIRECT  = (1 << 0), /// Prefer unbuffered I/O.
 };
 
 /// @summary Defines the data associated with a fixed-size lookaside queue.
@@ -334,77 +365,114 @@ struct aio_state_t
     #undef MA
 };
 
-/// @summary Defines the data associated with a file load request passed to the
-/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_lfreq_t
+/// @summary Defines the data associated with a stream in creation request passed
+/// to the VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_sics_t
 {
-    vfs_lfreq_t       *Next;         /// Pointer to the next node in the queue.
+    vfs_sics_t        *Next;         /// Pointer to the next node in the queue.
     HANDLE             Fildes;       /// The file descriptor of the opened file.
     int64_t            DataSize;     /// The logical size of the file, in bytes.
     int64_t            FileSize;     /// The physical size of the file, in bytes.
     int64_t            FileOffset;   /// The byte offset of the start of the file data.
-    intptr_t           AFID;         /// The application-defined ID for the file.
+    intptr_t           ASID;         /// The application-defined ID for the file.
     int32_t            Type;         /// The file type, one of file_type_e.
+    int32_t            Behavior;     /// The behavior at end-of-stream, one of stream_in_mode_e.
     uint32_t           Priority;     /// The file access priority (0 = highest).
     size_t             SectorSize;   /// The physical sector size of the disk.
 };
 
-/// @summary Defines the data associated with a file close request passed to the
-/// VFS driver. This structure is intended for storage in a srmw_fifo_t.
-struct vfs_cfreq_t
+/// @summary Defines the data associated with a stream-in control operation,
+/// which may include pause, resume, rewind or stop. This structure is intended
+/// for storage in an srmw_fifo_t.
+struct vfs_siop_t
 {
-    vfs_cfreq_t       *Next;         /// Pointer to the next node in the queue.
-    intptr_t           AFID;         /// The application-defined ID for the file.
+    vfs_siop_t        *Next;         /// Pointer to the next node in the queue.
+    intptr_t           ASID;         /// The application-defined ID for the stream.
+    int32_t            OpId;         /// The operation ID, one of vfs_stream_in_op_e.
+    int64_t            Argument;     /// Optional data associated with the command.
 };
 
-/// @summary Defines the data associated with a completed I/O (read or write) operation.
-struct vfs_res_t
+/// @summary Defines the data associated with a completed stream-in read operation.
+struct vfs_sird_t
 {
-    intptr_t           AFID;         /// The application-defined ID for the file.
-    void              *DataBuffer;   /// The source or target buffer.
-    int64_t            FileOffset;   /// The absolute byte offset of the start of the operation. (CONVERT BACK TO RELATIVE!)
+    intptr_t           ASID;         /// The application-defined ID for the stream.
+    void              *DataBuffer;   /// The buffer containing the data that was read.
+    int64_t            FileOffset;   /// The absolute byte offset of the start of the operation.
     uint32_t           DataAmount;   /// The amount of data transferred.
     int                OSError;      /// The error code returned by the operation, or 0.
 };
 
+/// @summary Defines the data associated with an end-of-stream notification.
+struct vfs_sies_t
+{
+    intptr_t           ASID;         /// The application-defined ID for the stream.
+    int32_t            Behavior;     /// The configured behavior of the stream.
+};
+
+/// @summary Defines the data associated with a stream-out write request passed
+/// to the VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_sowr_t
+{
+    vfs_sowr_t        *Next;         /// Pointer to the next node in the queue.
+    HANDLE             Fildes;       /// The file descriptor of the opened file.
+    int64_t            FileOffset;   /// The byte offset at which the write begins.
+    void              *DataBuffer;   /// The buffer containing the data to write.
+    uint32_t           DataSize;     /// The number of bytes to write (constant).
+    uint32_t           Priority;     /// The stream priority (0 = highest).
+};
+
+/// @summary Defines the data associated with a stream-out close request passed
+/// to the VFS driver. This structure is intended for storage in a srmw_fifo_t.
+struct vfs_socs_t
+{
+    vfs_socs_t        *Next;         /// Pointer to the next node in the queue.
+    HANDLE             Fildes;       /// The file descriptor of the opened file.
+    uint32_t           Priority;     /// The stream priority (0 = highest).
+    char              *FilePath;     /// The target path, allocated with strdup(), or NULL.
+    int64_t            FileSize;     /// The logical size of the file, in bytes.
+};
+
 #define QC  (AIO_MAX_ACTIVE * 2)
-typedef srmw_fifo_t<vfs_lfreq_t>     vfs_lfq_t;     /// Load file request queue.
-typedef srmw_fifo_t<vfs_cfreq_t>     vfs_cfq_t;     /// Close file request queue.
-typedef srsw_fifo_t<vfs_res_t, QC>   vfs_resultq_t; /// AIO result queue.
-typedef srsw_fifo_t<void*, QC>       vfs_returnq_t; /// I/O buffer return queue.
+#define MS  (MAX_STREAMS_IN)
+typedef srmw_fifo_t<vfs_sowr_t>      vfs_sowriteq_t;   /// A stream-out write queue.
+typedef srmw_fifo_t<vfs_socs_t>      vfs_socloseq_t;   /// A stream-out close queue.
+typedef srmw_fifo_t<vfs_siop_t>      vfs_sicommandq_t; /// A stream-in command queue.
+typedef srmw_fifo_t<vfs_sics_t>      vfs_sicreateq_t;  /// A stream-in create queue.
+typedef srsw_fifo_t<vfs_sird_t, QC>  vfs_siresultq_t;  /// A stream-in result queue.
+typedef srsw_fifo_t<void*     , QC>  vfs_sireturnq_t;  /// A stream-in return queue.
+typedef srsw_fifo_t<vfs_sies_t, MS>  vfs_siendq_t;     /// A stream-in end-of-stream queue.
+#undef  MS
 #undef  QC
 
-/// @summary Information that remains constant from the point that a file is opened for reading.
-struct vfs_fdinfo_t
+/// @summary Information that remains constant from the point that a file is opened for stream-in.
+struct vfs_siinfo_t
 {
     HANDLE             Fildes;       /// The file descriptor for the file.
     int64_t            FileSize;     /// The physical file size, in bytes.
     int64_t            DataSize;     /// The file size after any size-changing transforms.
     int64_t            FileOffset;   /// The absolute byte offset of the start of the file data.
     size_t             SectorSize;   /// The disk physical sector size, in bytes.
+    int32_t            EndBehavior;  /// The end-of-stream behavior, one of stream_in_mode_e.
 };
 
-/// @summary Status information associated with an active file. This information is
-/// required to properly process (for example) close operations, where there may be
-/// one or more in-progress AIO operations against the file; the close must be
-/// deferred until all in-progress AIO operations have completed.
-struct vfs_status_t
+/// @summary Status information associated with an active stream-in. This information
+/// is required to properly process (for example) close operations, where there may be
+/// one or more in-progress read operations against the file; in which case the close
+/// must be deferred until all in-progress read operations have completed.
+struct vfs_sistat_t
 {
     uint64_t           NPendingAIO;  /// The number of pending AIO operations on the file.
-    uint32_t           StatusFlags;  /// A combination of vfs_status_e.
+    uint32_t           StatusFlags;  /// A combination of vfs_stream_in_status_e.
 };
 
 /// @summary Defines the data associated with a priority queue of pending AIO operations.
-/// TODO: Determine if 32-bits for the insertion ID is enough. This would be enough for
-/// 128TB of data, which if you were streaming 32KB chunks continuously at 980MB/sec, is
-/// enough for ~39 hours before the counter wraps around.
 struct vfs_io_opq_t
 {
     #define MO         AIO_MAX_ACTIVE
     int32_t            Count;        /// The number of items in the queue.
-    uint32_t           InsertionId;  /// The counter for tagging each AIO request.
+    uint64_t           InsertionId;  /// The counter for tagging each AIO request.
     uint32_t           Priority[MO]; /// The priority value for each item.
-    uint32_t           InsertId[MO]; /// The inserion order value for each item.
+    uint64_t           InsertId[MO]; /// The inserion order value for each item.
     aio_req_t          Request [MO]; /// The populated AIO request for each item.
     #undef MO
 };
@@ -423,24 +491,26 @@ struct vfs_io_fpq_t
 /// @summary Defines the state data maintained by a VFS driver instance.
 struct vfs_state_t
 {
-    #define MF         MAX_OPEN_FILES
+    #define MS         MAX_STREAMS_IN
     #define NT         FILE_TYPE_COUNT
-    vfs_cfq_t          CloseQueue;   /// The queue for file close requests.
-    vfs_lfq_t          LoadQueue;    /// The queue for complete file load requests.
+    vfs_sowriteq_t     StOutWriteQ;  /// Stream-out write operation queue.
+    vfs_socloseq_t     StOutCloseQ;  /// Stream-out close operation queue.
+    vfs_sicommandq_t   StInCommandQ; /// Stream-in playback command queue.
+    vfs_sicreateq_t    StInCreateQ;  /// Stream-in create operation queue.
     iobuf_alloc_t      IoAllocator;  /// The I/O buffer allocator.
     size_t             ActiveCount;  /// The number of open files.
-    intptr_t           FileAFID[MF]; /// An application-defined ID for each active file.
-    int32_t            FileType[MF]; /// One of file_mode_e for each active file.
-    int32_t            FileMode[MF]; /// One of vfs_mode_e for each active file.
-    uint32_t           Priority[MF]; /// The access priority for each active file.
-    int64_t            RdOffset[MF]; /// The current read offset for each active file.
-    vfs_fdinfo_t       FileInfo[MF]; /// The constant data for each active file.
-    vfs_status_t       FileStat[MF]; /// Pending AIO status for each active file.
-    vfs_io_opq_t       IoOperations; /// The priority queue of pending I/O operations.
-    vfs_resultq_t      IoResult[NT]; /// The per-file type queue for I/O results.
-    vfs_returnq_t      IoReturn[NT]; /// The per-file type queue for I/O buffer returns.
+    intptr_t           StInAFID[MS]; /// An application-defined ID for each active file.
+    int32_t            StInType[MS]; /// One of file_mode_e for each active file.
+    uint32_t           Priority[MS]; /// The access priority for each active file.
+    int64_t            RdOffset[MS]; /// The current read offset for each active file.
+    vfs_siinfo_t       StInInfo[MS]; /// The constant data for each active stream-in.
+    vfs_sistat_t       StInStat[MS]; /// Pending AIO status for each active stream-in.
+    vfs_io_opq_t       IoOperations; /// The priority queue of all pending I/O operations.
+    vfs_siresultq_t    SiResult[NT]; /// The per-file type queue for stream-in I/O results.
+    vfs_sireturnq_t    SiReturn[NT]; /// The per-file type queue for stream-in I/O buffer returns.
+    vfs_siendq_t       SiEndOfS[NT]; /// The per-file type queue for stream-in end-of-stream events.
     #undef NT
-    #undef MF
+    #undef MS
 };
 
 /// @summary Statistics tracked by the platform I/O system.
@@ -452,6 +522,23 @@ struct io_stats_t
     uint64_t           NStallsIOBuf; /// Stalls due to exhausted I/O buffer space.
     uint64_t           NStallsFT[NT];/// Stalls due to slow file data processing.
     #undef NT
+};
+
+/// @summary Defines the data associated with a file opened for buffered, synchronous I/O.
+struct file_t
+{
+    HANDLE             Fildes;       /// The file descriptor for the file.
+};
+
+/// @summary Defines the state information associated with a writable file. This
+/// information is modified only by the thread that calls platform_create_file().
+struct stream_writer_t
+{
+    HANDLE             Fildes;       /// The file descriptor for the file.
+    uint8_t           *BaseAddress;  /// The base address of the current buffer.
+    size_t             DataOffset;   /// The write pointer offset from the start of the buffer.
+    int64_t            FileOffset;   /// The absolute offset of the write pointer within the file.
+    uint32_t           Priority;     /// The stream priority (0 = highest).
 };
 
 /*///////////////
@@ -468,13 +555,27 @@ static file_type_e   FILE_TYPE_LIST[] = {
     FILE_TYPE_JSON
 };
 
+/// @summary A list of printable names for each valid file type identifier.
+static char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
+    "DDS" , /* FILE_TYPE_DDS  */
+    "TGA" , /* FILE_TYPE_TGA  */
+    "WAV" , /* FILE_TYPE_WAV  */
+    "JSON"  /* FILE_TYPE_JSON */
+};
+
+static vfs_state_t VFS_STATE;
+static aio_state_t AIO_STATE;
+static io_stats_t  IO_STATS;
+
 // The following functions are not available under MinGW, so kernel32.dll is
 // loaded and these functions will be resolved manually.
 typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
 typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
 typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+typedef DWORD(WINAPI *GetFinalPathNameByHandleFn)(HANDLE, LPWSTR, DWORD, DWORD);
 
 static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
+static GetFinalPathNameByHandleFn   GetFinalPathNameByHandle_Func   = NULL;
 static SetProcessWorkingSetSizeExFn SetProcessWorkingSetSizeEx_Func = NULL;
 static SetFileInformationByHandleFn SetFileInformationByHandle_Func = NULL;
 
@@ -511,12 +612,15 @@ static void resolve_kernel_apis(void)
     if (kernel != NULL)
     {
         GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
+        GetFinalPathNameByHandle_Func   = (GetFinalPathNameByHandleFn)   GetProcAddress(kernel, "GetFinalPathNameByHandleW");
         SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
         SetFileInformationByHandle_Func = (SetFileInformationByHandleFn) GetProcAddress(kernel, "SetFileInformationByHandle");
     }
     // fallback if any of these APIs are not available.
     if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
     if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
+    // TODO: should fail if Vista+ APIs are not available. Or not be lazy and implement fallbacks.
+    // cbloomrants.blogspot.com/2012/12/12-21-12-file-handle-to-file-name-on.html
 }
 
 /// @summary Elevates the privileges for the process to include the privilege
@@ -1140,8 +1244,8 @@ static inline int io_opq_cmp_get(vfs_io_opq_t const *pq, int32_t a, int32_t b)
     // appear in the order they were inserted into the queue.
     uint32_t const p_a  = pq->Priority[a];
     uint32_t const p_b  = pq->Priority[b];
-    uint32_t const i_a  = pq->InsertId[a];
-    uint32_t const i_b  = pq->InsertId[b];
+    uint64_t const i_a  = pq->InsertId[a];
+    uint64_t const i_b  = pq->InsertId[b];
     if (p_a < p_b) return -1;
     if (p_a > p_b) return +1;
     if (i_a < i_b) return -1;
@@ -1234,7 +1338,7 @@ static bool io_opq_get(vfs_io_opq_t *pq, aio_req_t &request)
 
             // swap the parent with the largest child.
             uint32_t  temp_p     = pq->Priority[pos];
-            uint32_t  temp_i     = pq->InsertId[pos];
+            uint64_t  temp_i     = pq->InsertId[pos];
             aio_req_t temp_r     = pq->Request [pos];
             pq->Priority[pos]    = pq->Priority[m];
             pq->InsertId[pos]    = pq->InsertId[m];
@@ -1263,7 +1367,7 @@ static void io_fpq_clear(vfs_io_fpq_t *pq)
 /// @return true if the item was inserted in the queue, or false if the queue is full.
 static bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
 {
-    if (pq->Count < MAX_OPEN_FILES)
+    if (pq->Count < MAX_STREAMS_IN)
     {   // there's room in the queue for this operation.
         int32_t pos = pq->Count++;
         int32_t idx =(pos - 1) / 2;
@@ -1332,36 +1436,6 @@ static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
     else return false;
 }
 
-/// @summary Builds a list of record indices for all files with a given mode.
-/// @param list The output record index array of MAX_OPEN_FILES items.
-/// @param vfs The VFS driver state maintaining the input file list.
-/// @param mode One of vfs_mode_e indicating the filter mode.
-/// @return The number of files in the output list.
-static size_t map_files_by_mode(uint16_t *list, vfs_state_t const *vfs, int32_t mode)
-{
-    size_t         nfilter = 0;
-    uint16_t const nactive = uint16_t(vfs->ActiveCount);
-    for (uint16_t i = 0; i < nactive; ++i)
-    {
-        if (vfs->FileMode[i] == mode)
-            list[nfilter++]   = i;
-    }
-    return nfilter;
-}
-
-/// @summary Builds a file priority queue for a file index list.
-/// @param pq The priority queue to populate. Existing contents are overwritten.
-/// @param vfs The VFS driver state maintaining the active file information.
-/// @param list The list of input file record indices.
-/// @param n The number of elements in the file record index list.
-static void build_file_queue(vfs_io_fpq_t *pq, vfs_state_t const *vfs, uint16_t *list, size_t n)
-{
-    for (size_t i = 0; i < n; ++i)
-    {
-        io_fpq_put(pq, vfs->Priority[list[i]], list[i]);
-    }
-}
-
 /// @summary Retrieve the physical sector size for a block-access device.
 /// @param file The handle to an open file on the device.
 /// @return The size of a physical sector on the specified device.
@@ -1389,6 +1463,71 @@ static size_t physical_sector_size(HANDLE file)
         return DefaultPhysicalSectorSize;
     }
     else return desc.BytesPerPhysicalSector;
+}
+
+/// @summary Find the end of a volume and directory information portion of a path.
+/// @param path The path string to search.
+/// @param out_pathlen On return, indicates the number of bytes in the volume and
+/// directory information of the path string. If the input path has no volume or
+/// directory information, this value will be set to zero.
+/// @param out_strlen On return, indicates the number of bytes in the input path,
+/// not including the trailing zero byte.
+/// @return A pointer to one past the last volume or directory separator, if present;
+/// otherwise, the input pointer path.
+static char const* pathend(char const *path, size_t &out_pathlen, size_t &out_strlen)
+{
+    if (path == NULL)
+    {
+        out_pathlen = 0;
+        out_strlen  = 0;
+        return path;
+    }
+
+    char        ch   = 0;
+    char const *last = path;
+    char const *iter = path;
+    while ((ch = *iter++) != 0)
+    {
+        if (ch == ':' || ch == '\\' || ch == '/')
+            last = iter;
+    }
+    out_strlen  = size_t(iter - path - 1);
+    out_pathlen = size_t(last - path);
+    return last;
+}
+
+/// @summary Find the extension part of a filename or path string.
+/// @param path The path string to search; ideally just the filename portion.
+/// @param out_extlen On return, indicates the number of bytes of extension information.
+/// @return A pointer to the first character of the extension. Check the value of
+/// out_extlen to be sure that there is extension information.
+static char const* extpart(char const *path, size_t &out_extlen)
+{
+    if (path == NULL)
+    {
+        out_extlen = 0;
+        return path;
+    }
+
+    char        ch    = 0;
+    char const *last  = path;
+    char const *iter  = path;
+    while ((ch = *iter++) != 0)
+    {
+        if (ch == '.')
+            last = iter;
+    }
+    if (last != path)
+    {   // we found an extension separator somewhere in the input path.
+        // @note: this also filters out the case of ex. path = '.gitignore'.
+        out_extlen = size_t(iter - last - 1);
+    }
+    else
+    {
+        // no extension part is present in the input path.
+        out_extlen = 0;
+    }
+    return last;
 }
 
 /// @summary Synchronously opens a file and retrieves various information.
@@ -1651,14 +1790,94 @@ static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &erro
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
 static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 {   // close the file descriptors associated with the file.
-    if (req.Fildes != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(req.Fildes);
-    }
+    if (req.Fildes != INVALID_HANDLE_VALUE) CloseHandle(req.Fildes);
 
     // generate the completion result and push it to the queue.
     aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
     return srsw_fifo_put(&aio->CloseResults, res) ? 0 : -1;
+}
+
+/// @summary Synchronously processes a finalize request, which closes the temp
+/// file and safely moves it to the destination file path.
+/// @param aio The AIO driver state processing the AIO request.
+/// @param req The AIO request corresponding to the finalize operation.
+/// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
+static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
+{
+    int   nchartp = 0;    // number of characters in target path; MultiByteToWideChar().
+    DWORD ncharsp = 0;    // number of characters in source path; GetFinalPathNameByHandle().
+    size_t  ssize = 0;    // the disk physical sector size, in bytes.
+    int64_t lsize = 0;    // the logical file size, in bytes
+    int64_t psize = 0;    // the physical disk allocation size, in bytes.
+    char  *tpath  = (char*) req.DataBuffer;
+    WCHAR *source = NULL;
+    WCHAR *target = NULL;
+    FILE_END_OF_FILE_INFO eof;
+    FILE_ALLOCATION_INFO  sec;
+
+    // get the absolute path of the temporary file (the source file).
+    ncharsp = GetFinalPathNameByHandle_Func(req.Fildes, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    source  = (WCHAR*) malloc(ncharsp * sizeof(WCHAR));
+    if (ncharsp == 0 || source == NULL)
+    {   // couldn't allocate the temporary buffer for the source path.
+        goto error_cleanup;
+    }
+    GetFinalPathNameByHandle_Func(req.Fildes, source, ntchars, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+
+    // is the temporary file being deleted, or is it being moved?
+    if (tpath != NULL)
+    {   // the file is being moved, so convert the destination path.
+        nchartp = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, tpath, -1, NULL, 0);
+        target  = (WCHAR*) malloc(nchartp * sizeof(WCHAR));
+        if (nchartp == 0 || target == NULL)
+        {   // couldn't allocate the temporary buffer for the target path.
+            goto error_cleanup;
+        }
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchartp);
+    }
+    else
+    {   // handle the simple case of deleting the temporary file.
+        srsw_fifo_put(&aio->CloseResults, aio_result(0, 0, req));
+        CloseHandle(req.Fildes);
+        DeleteFile(source);
+        free(source);
+        return 0;
+    }
+
+    // the file needs to be moved into place. set the file size.
+    ssize = physical_sector_size(req.Fildes);
+    psize = align_up(req.FileOffset, ssize);
+    lsize = req.FileOffset;
+    eof.EndOfFile.QuadPart      = lsize;
+    sec.AllocationSize.QuadPart = psize;
+    SetFileInformationByHandle_Func(req.Fildes, FileAllocationInfo , &sec, sizeof(sec));
+    SetFileInformationByHandle_Func(req.Fildes, FileEndOfFileInfo  , &eof, sizeof(eof));
+    SetFileValidData(req.Fildes, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
+
+    // close the open file handle, and move the file into place.
+    // note that goto error_cleanup can't be used after this point,
+    // since we have already closed the file handle.
+    CloseHandle(req.Fildes);
+    if (!MoveFileEx(source, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {   // unable to move the file to the target location.
+        srsw_fifo_put(&aio->CloseResults, aio_result(GetLastError(), 0, req));
+        DeleteFile(source);
+        free(source);
+        free(target);
+        return -1;
+    }
+
+    // finally, we're done. complete the operation successfully.
+    free(source); free(target);
+    return srsw_fifo_put(&aio->CloseResults, aio_result(0, 0, req)) ? 0 : -1;
+
+error_cleanup:
+    srsw_fifo_put(&aio->CloseResults, aio_result(GetLastError(), 0, req));
+    if (req.Fildes != INVALID_HANDLE_VALUE) CloseHandle(req.Fildes);
+    if (source != NULL) DeleteFile(source);
+    if (source != NULL) free(source);
+    if (target != NULL) free(target);
+    return -1;
 }
 
 /// @summary Implements the main loop of the AIO driver using a polling mechanism.
@@ -1765,6 +1984,9 @@ static int aio_tick(aio_state_t *aio, DWORD timeout)
             case AIO_COMMAND_CLOSE:
                 result = aio_process_close(aio, req);
                 break;
+            case AIO_COMMAND_FINAL:
+                result = aio_process_finalize(aio, req);
+                break;
             default:
                 error  = ERROR_INVALID_PARAMETER;
                 break;
@@ -1825,20 +2047,20 @@ static void delete_aio_state(aio_state_t *aio)
 }
 
 /// @summary Searches the VFS driver state to determine the current index of an
-/// active file given the file's application-defined file ID.
+/// active stream-in given the stream application-defined ID.
 /// @param vfs The VFS driver state to search.
-/// @param afid The application-defined file ID to locate.
+/// @param asid The application-defined stream ID to locate.
 /// @param index On return, this value is set to the zero-based index of the
-/// current slot in the active file list associated with the input AFID.
-/// @return true if the AFID was located in the list.
-static inline bool vfs_find_by_afid(vfs_state_t const *vfs, intptr_t afid, size_t &index)
+/// current slot in the active stream list associated with the input ASID.
+/// @return true if the ASID was located in the list.
+static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
 {
-    intptr_t const  AFID      = afid;
-    intptr_t const *AFIDList  = vfs->FileAFID;
-    size_t   const  AFIDCount = vfs->ActiveCount;
-    for (size_t i = 0; i < AFIDCount; ++i)
+    intptr_t const  ASID      = asid;
+    intptr_t const *ASIDList  = vfs->StInASID;
+    size_t   const  ASIDCount = vfs->ActiveCount;
+    for (size_t i = 0; i < ASIDCount; ++i)
     {
-        if (AFIDList[i] == AFID)
+        if (ASIDList[i] == ASID)
         {
             index = i;
             return true;
@@ -1847,11 +2069,61 @@ static inline bool vfs_find_by_afid(vfs_state_t const *vfs, intptr_t afid, size_
     return false;
 }
 
+/// @summary Determines whether a path references a file on a remote drive.
+/// @param path The NULL-terminated UTF-8 path of the file.
+/// @return true if the file exists on a remote drive.
+static bool is_remote(char const *path)
+{
+    WCHAR  *hugebuf = NULL;
+    WCHAR  *pathbuf = NULL;
+    UINT    drvtype = DRIVE_UNKNOWN;
+    int     nchars  = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+
+    // convert the path from UTF-8 to UCS-2, which Windows requires.
+    if (nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        return false;
+    }
+    pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        if (pathbuf != NULL) free(pathbuf);
+        return false;
+    }
+
+    // we have no idea how long the volume information is.
+    // it can potentially be longer than the input path...
+    // AFAIK there is no way to get the length, so allocate
+    // a temporary 64KB buffer - the maximum length is 32767
+    // wide characters - just to get the stupid volume name.
+    hugebuf = (WCHAR*) malloc(32768 * sizeof(WCHAR));
+    if (hugebuf == NULL)
+    {   // cannot allocate our gargantuan temp buffer.
+        free(pathbuf);
+        return false;
+    }
+    // MSDN doesn't indicate whether GetVolumePathName() zero-terminates...
+    memset(hugebuf, 0, 32768 * sizeof(WCHAR));
+    // figure out what volume this file path refers to.
+    if (!GetVolumePathName(pathbuf, hugebuf, 32768))
+    {   // the file might not exist, etc.
+        free(hugebuf);
+        free(pathbuf);
+        return false;
+    }
+    // finally, we can actually determine the drive type.
+    drvtype = GetDriveType(hugebuf);
+    free(hugebuf);
+    free(pathbuf);
+    return (drvtype == DRIVE_REMOTE);
+}
+
 /// @summary Determine whether a path references a file within an archive, (and
 /// if so, which one) or whether it references a native file. Open the file if
 /// necessary, and return basic file information to the caller. This function
 /// should only be used for read-only files, files cannot be written in an archive.
 /// @param path The NULL-terminated UTF-8 path of the file to resolve.
+/// @param hints A combination of vfs_file_hint_e to control how the file is opened.
 /// @param iocp The I/O completion port from the AIO driver to associate with the
 /// file handle, or NULL if no I/O completion port is being used for I/O requests.
 /// @param fd On return, stores the file descriptor of the archive or native file.
@@ -1864,7 +2136,7 @@ static inline bool vfs_find_by_afid(vfs_state_t const *vfs, intptr_t afid, size_
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @return true if the file could be resolved.
-static bool vfs_resolve_file_read(char const *path, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+static bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
@@ -1873,7 +2145,13 @@ static bool vfs_resolve_file_read(char const *path, HANDLE iocp, HANDLE &fd, int
         DWORD access = GENERIC_READ;
         DWORD share  = FILE_SHARE_READ;
         DWORD create = OPEN_EXISTING;
-        DWORD flags  = FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
+        DWORD flags  = FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
+        if (((hints  & FILE_HINT_DIRECT) != 0) && is_remote(path) == false)
+        {   // ideally we would also check based on file size, but Windows
+            // doesn't provide any way to set FILE_FLAG_NO_BUFFERING after the fact.
+            // TODO: could stat the file beforehand...
+            flags   |= FILE_FLAG_NO_BUFFERING;
+        }
         if (open_file_raw(path, iocp, access, share, create, flags, fd, psize, sector_size))
         {   // native files always begin at the first byte.
             // logical and physical size are the same.
@@ -1889,97 +2167,34 @@ static bool vfs_resolve_file_read(char const *path, HANDLE iocp, HANDLE &fd, int
     }
 }
 
-/// @summary Resolve a path to a path on the native file system, open that file
-/// for writing, and return basic file information to the caller. This function
-/// should be used for files which can be read or written.
-/// @param path The NULL-terminated UTF-8 path of the file to resolve.
-/// @param iocp The I/O completion port from the AIO driver to associate with the
-/// file handle, or NULL if no I/O completion port is being used for I/O requests.
-/// @param fd On return, stores the file descriptor of the archive or native file.
-/// @param lsize On return, stores the logical size of the file, in bytes. If this
-/// value is set to something greater than zero when the function is called, the
-/// file is pre-allocated to be the specified size; otherwise, the file size is
-/// left unchanged (if the file exists), or is zero if the file was just created.
-/// @param psize On return, this is always set to the same value as lsize.
-/// @param offset On return, stores the byte offset of the first byte of the file.
-/// If this value is set to -1 when the function is called, the file pointer is
-/// positioned at the current end-of-file marker (so that data will be appended.)
-/// @param sector_size On return, stores the physical sector size of the disk.
-/// @return true if the file could be resolved.
-static bool vfs_resolve_file_write(char const *path, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
-{   // TODO: resolve path to a native path. only files opened on the native
-    // file system can be opened for writing.
-    bool native_path = true;
-    if  (native_path)
-    {
-        DWORD access = GENERIC_READ | GENERIC_WRITE;
-        DWORD share  = 0;          // do not share with anyone
-        DWORD create = OPEN_ALWAYS;// or CREATE_ALWAYS, to truncate?
-        DWORD flags  = FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH;
-        if (open_file_raw(path, iocp, access, share, create, flags, fd, psize, sector_size))
-        {
-            if (lsize > 0)
-            {   // pre-allocate space for the file. this is best-effort.
-                int64_t logical_size  = lsize;
-                int64_t physical_size = align_up(logical_size, sector_size);
-                FILE_END_OF_FILE_INFO eof; eof.EndOfFile.QuadPart      = logical_size;
-                FILE_ALLOCATION_INFO  sec; sec.AllocationSize.QuadPart = physical_size;
-                SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
-                SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
-                SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
-                lsize  = int64_t(logical_size);
-                psize  = int64_t(logical_size);
-            }
-            else
-            {   // no size was specified, so keep whatever the current size is.
-                lsize  = psize;
-            }
-            if (offset < 0)
-            {   // position the file pointer at the current end-of-file.
-                LARGE_INTEGER dist    = {0};
-                LARGE_INTEGER new_ptr = {0};
-                SetFilePointerEx(fd, dist, &new_ptr, FILE_END);
-                offset = new_ptr.QuadPart;
-            }
-            else offset = 0;
-            return true;
-        }
-    }
-}
-
-/// @summary Processes queued file open operations.
+/// @summary Processes queued commands for creating a new stream-in.
 /// @param vfs The VFS driver state.
-static void vfs_process_opens(vfs_state_t *vfs)
-{   // TODO: process pending explicit file open requests.
-}
-
-/// @summary Processes queued file load operations.
-/// @param vfs The VFS driver state.
-static void vfs_process_loads(vfs_state_t *vfs)
+static void vfs_process_sicreate(vfs_state_t *vfs)
 {
-    while (vfs->ActiveCount < MAX_OPEN_FILES)
+    while (vfs->ActiveCount < MAX_STREAMS_IN)
     {
-        vfs_lfreq_t   req;
-        if (srmw_fifo_get(&vfs->LoadQueue, req) == false)
-        {   // there are no pending loads, so we're done.
+        vfs_sics_t    req;
+        if (srmw_fifo_get(&vfs->StInCreateQ, req) == false)
+        {   // there are no pending create requests, so we're done.
             break;
         }
 
         // the file is already open; it was opened during platform_load_file().
         // all we need to do is update our internal active file list.
         size_t index = vfs->ActiveCount++;
-        vfs->FileAFID[index]             = req.AFID;
-        vfs->FileType[index]             = req.Type;
-        vfs->FileMode[index]             = VFS_MODE_LOAD;
+        vfs->StInASID[index]             = req.ASID;
+        vfs->StInType[index]             = req.Type;
         vfs->Priority[index]             = req.Priority;
         vfs->RdOffset[index]             = 0;
-        vfs->FileInfo[index].Fildes      = req.Fildes;
-        vfs->FileInfo[index].FileSize    = req.FileSize;
-        vfs->FileInfo[index].DataSize    = req.DataSize;
-        vfs->FileInfo[index].FileOffset  = req.FileOffset;
-        vfs->FileInfo[index].SectorSize  = req.SectorSize;
-        vfs->FileStat[index].NPendingAIO = 0;
-        vfs->FileStat[index].StatusFlags = VFS_STATUS_NONE;
+        vfs->StInInfo[index].Fildes      = req.Fildes;
+        vfs->StInInfo[index].Eventfd     = req.Eventfd;
+        vfs->StInInfo[index].FileSize    = req.FileSize;
+        vfs->StInInfo[index].DataSize    = req.DataSize;
+        vfs->StInInfo[index].FileOffset  = req.FileOffset;
+        vfs->StInInfo[index].SectorSize  = req.SectorSize;
+        vfs->StInInfo[index].EndBehavior = req.Behavior;
+        vfs->StInStat[index].NPendingAIO = 0;
+        vfs->StInStat[index].StatusFlags = VFS_STATUS_NONE;
     }
 }
 
@@ -1989,11 +2204,11 @@ static void vfs_process_loads(vfs_state_t *vfs)
 /// @return The zero-based index of the next record to check.
 static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 {
-    if (vfs->FileStat[i].NPendingAIO > 0)
+    if (vfs->StInStat[i].NPendingAIO > 0)
     {   // there are pending AIO operations against this file.
         // the file cannot be closed until all operations have completed.
         // the file close will be queued after the last operation completes.
-        vfs->FileStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+        vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
         return (i + 1);
     }
 
@@ -2002,32 +2217,31 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
     if (aio_req != NULL)
     {   // fill out the request. it will be processed at a later time.
         aio_req->Command    = AIO_COMMAND_CLOSE;
-        aio_req->Fildes     = vfs->FileInfo[i].Fildes;
+        aio_req->Fildes     = vfs->StInInfo[i].Fildes;
         aio_req->DataAmount = 0;
-        aio_req->BaseOffset = vfs->FileInfo[i].FileOffset;
+        aio_req->BaseOffset = vfs->StInInfo[i].FileOffset;
         aio_req->FileOffset = 0;
         aio_req->DataBuffer = NULL;
         aio_req->QTimeNanos = nanotime();
         aio_req->ATimeNanos = 0;
-        aio_req->AFID       = vfs->FileAFID[i];
-        aio_req->Type       = vfs->FileType[i];
+        aio_req->AFID       = vfs->StInASID[i];
+        aio_req->Type       = vfs->StInType[i];
         aio_req->Reserved   = 0;
 
         // delete the file from our internal state immediately.
         size_t const last   = vfs->ActiveCount - 1;
-        vfs->FileAFID[i]    = vfs->FileAFID[last];
-        vfs->FileType[i]    = vfs->FileType[last];
-        vfs->FileMode[i]    = vfs->FileMode[last];
+        vfs->StInASID[i]    = vfs->StInASID[last];
+        vfs->StInType[i]    = vfs->StInType[last];
         vfs->Priority[i]    = vfs->Priority[last];
         vfs->RdOffset[i]    = vfs->RdOffset[last];
-        vfs->FileInfo[i]    = vfs->FileInfo[last];
+        vfs->StInInfo[i]    = vfs->StInInfo[last];
         vfs->ActiveCount    = last;
         return i;
     }
     else
     {   // there's no more space in the pending I/O operation queue.
         // we'll try closing the file again when there's space.
-        vfs->FileStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+        vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
         return (i + 1);
     }
 }
@@ -2035,33 +2249,10 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
 static void vfs_process_closes(vfs_state_t *vfs)
-{   // process explicit close requests.
-    while (vfs->ActiveCount > 0)
-    {   // grab the next close command from the queue.
-        vfs_cfreq_t   req;
-        if (srmw_fifo_get(&vfs->CloseQueue, req) == false)
-        {   // there are no more pending closes, so we're done.
-            break;
-        }
-
-        // locate the corresponding file record and queue a close to VFS.
-        // it's important that the operation go through the VFS queue, so
-        // that we can be sure any pending I/O operations on the file have
-        // been submitted prior to the file being closed.
-        size_t index = 0;
-        if (vfs_find_by_afid(vfs, req.AFID, index))
-        {   // attempt to queue the close. note that the operation
-            // might not get queued immediately, because we could
-            // have run out of space in the pending operation queue,
-            // or there could be outstanding I/O operations.
-            vfs_queue_close(vfs, index);
-        }
-    }
-
-    // process deferred close requests.
+{
     for (size_t i = 0; i < vfs->ActiveCount; )
     {
-        if (vfs->FileStat[i].StatusFlags & VFS_STATUS_CLOSE)
+        if (vfs->StInStat[i].StatusFlags & VFS_STATUS_CLOSE)
         {   // there's a pending close operation against this file.
             // vfs_queue_close() returns the next index to check;
             // either i (if a close was queued), or i + 1.
@@ -2095,17 +2286,17 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
     size_t    index = 0;
     while (srsw_fifo_get(&aio->ReadResults, res))
     {   // convert the AIO result into something useful for the platform layer.
-        vfs_res_t iores;
-        iores.AFID       = res.AFID;
-        iores.DataBuffer = res.DataBuffer;
-        iores.FileOffset = res.FileOffset; // this is the relative offset
-        iores.DataAmount = res.DataAmount;
-        iores.OSError    = res.OSError;
-        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores))
+        vfs_sird_t read;
+        read.ASID       = res.AFID;
+        read.DataBuffer = res.DataBuffer;
+        read.FileOffset = res.FileOffset; // this is the relative offset
+        read.DataAmount = res.DataAmount;
+        read.OSError    = res.OSError;
+        if (srsw_fifo_put(&vfs->SiResult[res.Type], read))
         {   // a single read operation has completed.
-            if (vfs_find_by_afid(vfs, res.AFID, index))
+            if (vfs_find_by_asid(vfs, res.AFID, index))
             {   // decrement the number of pending I/O operations.
-                vfs->FileStat[index].NPendingAIO--;
+                vfs->StInStat[index].NPendingAIO--;
             }
         }
         else
@@ -2121,26 +2312,11 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
-    size_t    index = 0;
     while (srsw_fifo_get(&aio->WriteResults, res))
-    {   // convert the AIO result into something useful for the platform layer.
-        // TODO: writes need to be differentiated from reads, obviously.
-        vfs_res_t iores;
-        iores.AFID       = res.AFID;
-        iores.DataBuffer = res.DataBuffer;
-        iores.FileOffset = res.FileOffset; // this is the relative offset
-        iores.DataAmount = res.DataAmount;
-        iores.OSError    = res.OSError;
-        if (srsw_fifo_put(&vfs->IoResult[res.Type], iores))
-        {   // a single write operation has completed.
-            if (vfs_find_by_afid(vfs, res.AFID, index))
-            {   // decrement the number of pending I/O operations.
-                vfs->FileStat[index].NPendingAIO--;
-            }
-        }
-        else
-        {   // TODO: track this statistic somewhere.
-            // This should not be happening.
+    {   // no need to return anything to the platform layer.
+        if (res.DataBuffer != NULL)
+        {   // free the fixed-size write buffer.
+            VirtualFree(res.DataBuffer, VFS_WRITE_SIZE);
         }
     }
 }
@@ -2166,9 +2342,9 @@ static void vfs_process_buffer_returns(vfs_state_t *vfs)
 {
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
-        void          *buffer;
-        vfs_returnq_t *returnq   = &vfs->IoReturn[i];
-        iobuf_alloc_t &allocator =  vfs->IoAllocator;
+        void            *buffer;
+        vfs_sireturnq_t *returnq   = &vfs->SiReturn[i];
+        iobuf_alloc_t   &allocator =  vfs->IoAllocator;
         while (srsw_fifo_get(returnq, buffer))
         {
             iobuf_put(allocator, buffer);
@@ -2176,26 +2352,67 @@ static void vfs_process_buffer_returns(vfs_state_t *vfs)
     }
 }
 
-/// @summary Updates the status of all active file loads, and submits I/O operations.
+/// @summary Updates the status of all active input streams, and submits I/O operations.
 /// @param vfs The VFS driver state.
 /// @return true if the tick should continue submitting I/O operations, or false if
 /// either buffer space is full or the I/O operation queue is full.
-static bool vfs_update_loads(vfs_state_t *vfs)
+static bool vfs_update_stream_in(vfs_state_t *vfs)
 {
     iobuf_alloc_t &allocator = vfs->IoAllocator;
     size_t const read_amount = allocator.AllocSize;
-    size_t       file_count  = 0;
+    size_t const file_count  = vfs->ActiveCount;
     uint32_t     priority    = 0;
     uint16_t     index       = 0;
-    uint16_t     index_list[MAX_OPEN_FILES];
     vfs_io_fpq_t file_queue;
+    vfs_siop_t   op;
+
+    // process any pending stream-in control operations.
+    while (srmw_fifo_get(&vfs->StInCommandQ, op))
+    {
+        size_t i = 0;
+        if (vfs_find_by_asid(vfs, op.ASID, i))
+        {   // the stream is currently in the active list, so process the control.
+            switch (op.OpId)
+            {
+                case STREAM_IN_PAUSE:
+                    vfs->StInStat[i].StatusFlags |=  VFS_STATUS_PAUSE;
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_CLOSE);
+                    break;
+                case STREAM_IN_RESUME:
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    break;
+                case STREAM_IN_REWIND:
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->RdOffset[i] = 0;
+                    break;
+                case STREAM_IN_SEEK:
+                    if ((op.Argument & (vfs->StInInfo[i].SectorSize-1)) != 0)
+                    {   // align up to the nearest sector size multiple.
+                        // then, subtract the sector size to get the next lowest multiple.
+                        op.Argument  = align_up(op.Argument, vfs->StInInfo[i].SectorSize);
+                        op.Argument -= vfs->StInInfo[i].SectorSize;
+                    }
+                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->RdOffset[i] = op.Argument;
+                    break;
+                case STREAM_IN_STOP:
+                    vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+                    break;
+            }
+        }
+    }
 
     // build a priority queue of files, and then process them one at a time
     // starting with the highest-priority file. the goal here is to fill up
     // the queue of pending I/O operations and stay maximally busy.
     io_fpq_clear(&file_queue);
-    file_count = map_files_by_mode(index_list, vfs, VFS_MODE_LOAD);
-    build_file_queue(&file_queue, vfs, index_list, file_count);
+    for (size_t i = 0; i < file_count; ++i)
+    {
+        if (vfs->StInStat[i].StatusFlags == VFS_STATUS_NONE)
+        {   // only update streams that are active (not paused, not closed.)
+            io_fpq_put(&file_queue, vfs->Priority[i], uint16_t(i));
+        }
+    }
     while(io_fpq_get(&file_queue, index, priority))
     {   // we want to submit as many sequential reads against the file as
         // possible for maximum efficiency. these operations will be
@@ -2204,7 +2421,6 @@ static bool vfs_update_loads(vfs_state_t *vfs)
         // 1. we've reached the end of the file data. continue with the next file.
         // 2. we've run out of pending queue space. stop processing for the tick.
         // 3. we've run out of I/O buffer space. stop processing for the tick.
-        // TODO: investigate combining reads to reduce AIO op count?
         size_t nqueued = 0;
         while (iobuf_bytes_free(allocator) > 0)
         {   // allocate a new request in our internal operation queue.
@@ -2212,25 +2428,24 @@ static bool vfs_update_loads(vfs_state_t *vfs)
             if (req != NULL)
             {   // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
-                req->Fildes     = vfs->FileInfo[index].Fildes;
+                req->Fildes     = vfs->StInInfo[index].Fildes;
                 req->DataAmount = read_amount;
-                req->BaseOffset = vfs->FileInfo[index].FileOffset;
+                req->BaseOffset = vfs->StInInfo[index].FileOffset;
                 req->FileOffset = vfs->RdOffset[index];
                 req->DataBuffer = iobuf_get(allocator);
                 req->QTimeNanos = nanotime();
                 req->ATimeNanos = 0;
-                req->AFID       = vfs->FileAFID[index];
-                req->Type       = vfs->FileType[index];
+                req->AFID       = vfs->StInASID[index];
+                req->Type       = vfs->StInType[index];
                 req->Reserved   = 0;
                 nqueued++;
 
                 // update the byte offset to the next read.
                 int64_t newofs  = vfs->RdOffset[index] + read_amount;
                 vfs->RdOffset[index] = newofs;
-                if (newofs >= vfs->FileInfo[index].FileSize)
-                {   // reached or passed end-of-file; mark as pending close.
-                    // processing will continue on with the next file.
-                    vfs->FileStat[index].StatusFlags |= VFS_STATUS_CLOSE;
+                if (newofs >= vfs->StInInfo[index].FileSize)
+                {   // reached or passed end-of-file.
+                    // continue processing the next file.
                     break;
                 }
             }
@@ -2242,34 +2457,93 @@ static bool vfs_update_loads(vfs_state_t *vfs)
 
         // update the number of pending AIO operations against the file.
         // this value is decremented as operations are completed.
-        vfs->FileStat[index].NPendingAIO += nqueued;
+        vfs->StInStat[index].NPendingAIO += nqueued;
 
-        // if we ran out of I/O buffer space, there's no point in continuing.
-        if (nqueued == 0)
-        {   // TODO: track this statistic somewhere.
+        if (vfs->RdOffset[index] >= vfs->StInInfo[index].FileSize)
+        {   // the end-of-stream notification gives the listener a chance to
+            // take some appropriate action. we could handle it automatically,
+            // but for some usages we might do the wrong thing - for example,
+            // some data is at the end of the stream, but after reading it,
+            // the application wants to seek to some other offset and resume
+            // instead of closing - neither STREAM_IN_ONCE and STREAM_IN_LOOP fit.
+            // the stream remains paused until a STOP, SEEK or REWIND is received.
+            if ((vfs->StInStat[index].StatusFlags & VFS_STATUS_PAUSE) == 0)
+            {
+                vfs_sies_t eos = {
+                    vfs->StInASID[index],
+                    vfs->StInInfo[index].EndBehavior
+                };
+                srsw_fifo_put(&vfs->SiEndOfS[vfs->StInType[index]], eos);
+                vfs->StInStat[index].StatusFlags |= VFS_STATUS_PAUSE;
+            }
+        }
+        else if (nqueued == 0)
+        {   // we ran out of I/O buffer space; there's no point in continuing.
+            // TODO: track this statistic somewhere.
             return false;
         }
     }
     return true;
 }
 
-/// @summary Processes all queued explicit read operations.
-/// @param vfs The VFS driver state.
+/// @summary Processes as many pending stream-out operations as possible.
+/// @param vfs The VFS driver state to update.
 /// @return true if the tick should continue submitting I/O operations, or false if
-/// either buffer space is full or the I/O operation queue is full.
-static bool vfs_process_reads(vfs_state_t *vfs)
-{   // TODO: process any pending explicit read operations.
-    // TODO: be sure to increment the number of outstanding AIO operations!
-    return true;
-}
+/// the I/O operation queue is full.
+static bool vfs_update_stream_out(vfs_state_t *vfs)
+{
+    vfs_sowr_t write;
+    while (srmw_fifo_get(&vfs->StOutWriteQ, write))
+    {   // allocate a new request in our internal operation queue.
+        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
+        if (req != NULL)
+        {   // populate the (already queued) request.
+            req->Command    = AIO_COMMAND_WRITE;
+            req->Fildes     = write.Fildes;
+            req->DataAmount = write.DataSize;
+            req->BaseOffset = 0;
+            req->FileOffset = write.FileOffset;
+            req->DataBuffer = write.DataBuffer;
+            req->QTimeNanos = nanotime();
+            req->ATimeNanos = 0;
+            req->AFID       = write.Fildes;
+            req->Type       = 0;
+            req->Reserved   = 0;
+        }
+        else
+        {   // the internal operation queue is full.
+            // put the write back in the queue, and return.
+            srmw_fifo_put(&vfs->StOutWriteQ, write);
+            return false;
+        }
+    }
 
-/// @summary Processes all queued explicit write operations.
-/// @param vfs The VFS driver state.
-/// @return true if the tick should continue submitting I/O operations, or false if
-/// either buffer space is full or the I/O operation queue is full.
-static bool vfs_process_writes(vfs_state_t *vfs)
-{   // TODO: process any pending explicit write operations.
-    // TODO: be sure to increment the number of outstanding AIO operations!
+    vfs_socs_t close;
+    while (srmw_fifo_get(&vfs->StOutCloseQ, close))
+    {   // allocate a new request in our internal operation queue.
+        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
+        if (req != NULL)
+        {   // populate the (already queued) request.
+            req->Command    = AIO_COMMAND_FINAL;
+            req->Fildes     = close.Fildes;
+            req->Eventfd    = close.Eventfd;
+            req->DataAmount = 0;
+            req->BaseOffset = 0;
+            req->FileOffset = close.FileSize;
+            req->DataBuffer = NULL;
+            req->QTimeNanos = nanotime();
+            req->ATimeNanos = 0;
+            req->AFID       = close.Fildes;
+            req->Type       = 0;
+            req->Reserved   = 0;
+        }
+        else
+        {   // the internal operation queue is full.
+            // put the close back in the queue, and return.
+            srmw_fifo_put(&vfs->StOutCloseQ, close);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2293,9 +2567,8 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 
     // generate read and write I/O operations. this increments the number of
     // pending I/O operations across the set of active files.
-    vfs_update_loads(vfs);
-    vfs_process_reads(vfs);
-    vfs_process_writes(vfs);
+    vfs_update_stream_in(vfs);
+    vfs_update_stream_out(vfs);
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
@@ -2322,20 +2595,23 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 
     // open file requests should be processed after all close requests.
     // this increases the likelyhood that we'll have open file slots.
-    vfs_process_opens(vfs);
-    vfs_process_loads(vfs);
+    vfs_process_sicreate(vfs);
 }
 
 /// @summary Returns an I/O buffer to the pool. This function should be called
-/// for every read or write result that the platform layer dequeues.
+/// for every read result that the platform layer dequeues.
 /// @param vfs The VFS state that posted the I/O result.
 /// @param type One of file_type_e indicating the type of file being processed.
 /// @param buffer The buffer to return. This value may be NULL.
 static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
-{   // TODO: it might be better to check that the buffer does come from
-    // the address range of the I/O buffer allocator, to prevent accidental
-    // returns of application-managed buffers (for writes, etc.)
-    if (buffer != NULL) srsw_fifo_put(&vfs->IoReturn[type], buffer);
+{
+    void const *iobeg = (uint8_t const *)  vfs->IoAllocator.BaseAddress;
+    void const *ioend = (uint8_t const *)  vfs->IoAllocator.BaseAddress + vfs->IoAllocator.TotalSize;
+    if (buffer >= iobeg && buffer < ioend)
+    {   // only return the buffer if it's within the address range handed out
+        // by the I/O buffer allocator. this excludes user-allocated buffers.
+        srsw_fifo_put(&vfs->SiReturn[type], buffer);
+    }
 }
 
 /// @summary Initialize a VFS driver state object and allocate any I/O resources.
@@ -2344,12 +2620,15 @@ static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 static bool create_vfs_state(vfs_state_t *vfs)
 {   // TODO: some error handling would be nice.
     create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
-    create_srmw_fifo(&vfs->CloseQueue, MAX_OPEN_FILES);
-    create_srmw_fifo(&vfs->LoadQueue , MAX_OPEN_FILES);
+    create_srmw_fifo(&vfs->StOutWriteQ     , AIO_MAX_ACTIVE);
+    create_srmw_fifo(&vfs->StOutCloseQ     , MAX_STREAMS_IN);
+    create_srmw_fifo(&vfs->StInCommandQ    , MAX_STREAMS_IN);
+    create_srmw_fifo(&vfs->StInCreateQ     , MAX_STREAMS_IN);
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
-        flush_srsw_fifo(&vfs->IoResult[i]);
-        flush_srsw_fifo(&vfs->IoReturn[i]);
+        flush_srsw_fifo(&vfs->SiResult[i]);
+        flush_srsw_fifo(&vfs->SiReturn[i]);
+        flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
     io_opq_clear(&vfs->IoOperations);
     vfs->ActiveCount = 0;
@@ -2362,13 +2641,16 @@ static void delete_vfs_state(vfs_state_t *vfs)
 {
     vfs->ActiveCount = 0;
     io_opq_clear(&vfs->IoOperations);
-    delete_srmw_fifo(&vfs->LoadQueue);
-    delete_srmw_fifo(&vfs->CloseQueue);
+    delete_srmw_fifo(&vfs->StInCreateQ);
+    delete_srmw_fifo(&vfs->StInCommandQ);
+    delete_srmw_fifo(&vfs->StOutCloseQ);
+    delete_srmw_fifo(&vfs->StOutWriteQ);
     delete_iobuf_allocator(vfs->IoAllocator);
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
-        flush_srsw_fifo(&vfs->IoResult[i]);
-        flush_srsw_fifo(&vfs->IoReturn[i]);
+        flush_srsw_fifo(&vfs->SiResult[i]);
+        flush_srsw_fifo(&vfs->SiReturn[i]);
+        flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
 }
 
@@ -2438,45 +2720,494 @@ static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, 
 #endif
 }
 
-/// @summary Queues a file for loading. The file is read from beginning to end and
-/// data is returned to the application on the thread appropriate for the given type.
+/// @summary Formats and writes an I/O error description to stderr.
+/// @param app_id The application-defined identifier of the file being accessed when the error occurred.
+/// @param type The of the values of the file_type_e enumeration.
+/// @param error_code The system error code value.
+/// @param error_message An optional string description of the error.
+static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
+{
+    int errn = int(error_code);
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(errn));
+}
+
+/// @summary Opens a file for streaming data to the application. The file will be
+/// read from beginning to end and data returned to the application on the thread
+/// appropriate for the given type.
 /// @param path The NULL-terminated UTF-8 path of the file to load.
-/// @param id The application-defined identifier for the load request.
+/// @param id The application-defined identifier for the stream.
 /// @param type One of file_type_e indicating the type of file being loaded. This allows
 /// the platform to decide the thread on which data should be returned to the application.
-/// @param priority The file loading priority, with 0 indicating the highest possible priority.
-/// @param file_size On return, this location is updated with the logical size of the file.
-/// @return true if the file was successfully opened and the load was queued.
-static bool platform_load_file(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &file_size)
+/// @param mode One of stream_in_mode_e indicating the stream behavior at end-of-stream.
+/// @param start Specify true to start streaming in the file data immediately.
+/// @param stream_size On return, this location is updated with the logical size of the stream.
+/// @return true if the file was successfully opened.
+static bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
 {
+    int     hint   = FILE_HINT_NONE;
     HANDLE  fd     = INVALID_HANDLE_VALUE;
     HANDLE  iocp   = AIO_STATE.ASIOContext;
     size_t  ssize  = 0;
     int64_t lsize  = 0;
     int64_t psize  = 0;
     int64_t offset = 0;
-    if (vfs_resolve_file_read(path, iocp, fd, lsize, psize, offset, ssize))
-    {   // queue a file load request to be processed by the VFS driver.
-        vfs_lfreq_t req;
+    if (mode == STREAM_IN_ONCE)
+    {   // for files that will be streamed in only once, prefer unbuffered I/O.
+        // this avoids polluting the page cache with their data.
+        hint  = FILE_HINT_DIRECT;
+    }
+    if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize))
+    {   // queue a load file request to be processed by the VFS driver.
+        vfs_sics_t req;
         req.Next       = NULL;
         req.Fildes     = fd;
         req.DataSize   = lsize;  // size of the file after decompression
         req.FileSize   = psize;  // number of bytes to read from the file
         req.FileOffset = offset; // offset of first byte relative to fd 0, SEEK_SET
-        req.AFID       = id;
+        req.ASID       = id;
         req.Type       = type;
+        req.Behavior   = mode;
         req.Priority   = priority;
         req.SectorSize = ssize;
-        file_size      = lsize;  // return the logical size to the caller
-        srmw_fifo_put(&VFS_STATE.LoadQueue, req);
-        return true;
+        stream_size    = lsize;  // return the logical size to the caller
+        return srmw_fifo_put(&VFS_STATE.StInCreateQ, req);
     }
     else
     {   // unable to open the file, so fail immediately.
-        file_size = 0;
+        stream_size = 0;
         return false;
     }
 }
+
+/// @summary Queues a file for loading. The file is read from beginning to end and
+/// data is returned to the application on the thread appropriate for the given type.
+/// The file is closed automatically when all data has been read, or an error occurs.
+/// Equivalent to open_stream(path, id, type, priority, STREAM_IN_ONCE, true, stream_size).
+/// @param path The NULL-terminated UTF-8 path of the file to load.
+/// @param id The application-defined identifier for the load request.
+/// @param type One of file_type_e indicating the type of file being loaded. This allows
+/// the platform to decide the thread on which data should be returned to the application.
+/// @param priority The file loading priority, with 0 indicating the highest possible priority.
+/// @param stream_size On return, this location is updated with the logical size of the stream.
+/// @return true if the file was successfully opened and the load was queued.
+static bool platform_stream_in(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &stream_size)
+{   // just redirect to open stream, which will queue the appropriate requests.
+    return platform_open_stream(path, id, type, priority, STREAM_IN_ONCE, true, stream_size);
+}
+
+/// @summary Pauses a stream without closing the underlying file.
+/// @param id The application-defined identifier of the stream.
+/// @return true if the stream pause was queued.
+static bool platform_pause_stream(intptr_t id)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_PAUSE;
+    req.Argument = 0;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Resumes streaming a paused stream.
+/// @param id The application-defined identifier of the stream.
+/// @return true if the stream start was queued.
+static bool platform_resume_stream(intptr_t id)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_RESUME;
+    req.Argument = 0;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Starts streaming data from the beginning of the stream.
+/// @param id The application-defined identifier of the stream.
+/// @return true if the stream rewind was queued.
+static bool platform_rewind_stream(intptr_t id)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_REWIND;
+    req.Argument = 0;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Positions the read cursor for the stream near a given location and resumes playback of the stream.
+/// @param id The application-defined identifier of the stream.
+/// @param absolute_offset The byte offset of the new playback position from the
+/// start of the stream. The stream loading will resume from at or before this position.
+/// @return true if the stream seek was queued.
+static bool platform_seek_stream(intptr_t id, int64_t absolute_offset)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_SEEK;
+    req.Argument = absolute_offset;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Stops loading a stream and closes the underlying file.
+/// @param id The application-defined identifier of the stream.
+/// @return true if the stream close was queued.
+static bool platform_stop_stream(intptr_t id)
+{
+    vfs_siop_t   req;
+    req.Next     = NULL;
+    req.ASID     = id;
+    req.OpId     = STREAM_IN_STOP;
+    req.Argument = 0;
+    return srmw_fifo_put(&VFS_STATE.StInCommandQ, req);
+}
+
+/// @summary Implements the default end-of-stream behavior for basic stream types.
+/// @param id The application-defined identifier of the stream.
+/// @param type One of file_type_e indicating the type of data being streamed in.
+/// @param default_behavior One of stream_in_mode_e indicating the configured default behavior of the stream.
+/// @return true if the behavior was processed.
+static bool platform_default_eos(intptr_t id, int32_t type, int32_t default_behavior)
+{
+    switch (default_behavior)
+    {
+        case STREAM_IN_ONCE: return platform_stop_stream(id);
+        case STREAM_IN_LOOP: return platform_rewind_stream(id);
+        default: break;
+    }
+    return false;
+}
+
+/// @summary Opens a file for reading or writing. The file is opened in buffered
+/// mode, and all operations will block the calling thread. If the file exists,
+/// it is opened and any existing data is preserved. If the file does not exist,
+/// it is created and initialized to empty.
+/// @param path The path of the file to open.
+/// @param read_only Specify true to open the file in read-only mode.
+/// @param file_size On return this value indicates the current size of the file, in bytes.
+/// @param file On return, this value is set to the file record used for subsequent operations.
+/// @return true if the file was opened.
+static bool platform_open_file(char const *path, bool read_only, int64_t &file_size, file_t **file)
+{   // TODO: consider extending this to use vfs_resolve_file_read?
+    LARGE_INTEGER sz = {0};
+    file_t     *f = NULL;
+    DWORD  access = read_only ? GENERIC_READ    : GENERIC_READ | GENERIC_WRITE;
+    DWORD  share  = read_only ? FILE_SHARE_READ : 0;
+    DWORD  create = OPEN_ALWAYS;
+    DWORD  flags  = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+    HANDLE fd     = INVALID_HANDLE_VALUE;
+    WCHAR *pathbuf= NULL;
+    int    nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+
+    // convert the path from UTF-8 to UCS-2, which Windows requires.
+    if (nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+    pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+
+    // open the file with the requested access and flags.
+    if ((fd == CreateFile(path-conv, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
+    {   // the file could not be opened; check GetLastError().
+        goto error_cleanup;
+    }
+    if (!GetFileSizeEx(fd, &sz))
+    {   // the file size could not be retrieved; check GetLastError().
+        goto error_cleanup;
+    }
+
+    f =  (file_t*) malloc(sizeof(file_t));
+    if (f == NULL) goto error_cleanup;
+
+    file_size = sz.QuadPart;
+    f->Fildes = fd;
+    *file     = f;
+    return true;
+
+error_cleanup:
+    if (fd != INVALID_HANDLE_VALUE) CloseHandle(fd);
+    if (pathbuf != NULL) free(pathbuf);
+    file_size = 0;
+    *file = NULL;
+    return false;
+}
+
+/// @summary Synchronously reads data from a file.
+/// @param file The file state returned from open_file().
+/// @param offset The absolute byte offset at which to start reading data.
+/// @param buffer The buffer into which data will be written.
+/// @param size The maximum number of bytes to read.
+/// @param bytes_read On return, this value is set to the number of bytes actually
+/// read. This may be less than the number of bytes requested, or 0 at end-of-file.
+/// @return true if the read operation was successful.
+static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_t size, size_t &bytes_read)
+{
+    LARGE_INTEGER pos = {0};
+    pos.QuadPart  = offset;
+    if (!SetFilePointerEx(file->Fildes, pos, NULL, FILE_BEGIN))
+    {   // unable to seek to the specified offset. check GetLastError().
+        bytes_read = 0;
+        return false;
+    }
+    // safely read the requested number of bytes. for very large reads,
+    // size > UINT32_MAX, the result is undefined, so possibly split the
+    // read up into several sub-reads (though this case is unlikely...)
+    uint8_t *b  =(uint8_t*) buffer;
+    bytes_read  = 0;
+    while (size > 0)
+    {
+        DWORD nread  = 0;
+        DWORD toread = size <= 0xFFFFFFFFU ? size : 0xFFFFFFFFU;
+        DWORD err    = ERROR_SUCCESS;
+        if (ReadFile(file->Fildes, &b[bytes_read], toread, &nread, NULL))
+        {
+            if (nread > 0)
+            {   // the read has completed successfully and returned data.
+                bytes_read += nread;
+                size       -= nread;
+            }
+            else if (nread == 0)
+            {   // end-of-file was encountered (not sure if this is the path?)
+                break;
+            }
+        }
+        else if ((err = GetLastError()) == ERROR_HANDLE_EOF)
+        {   // end of file was encountered. not sure if this is async only?
+            break;
+        }
+        else
+        {   // an error occurred; check err.
+            return false;
+        }
+    }
+    return true;
+}
+
+/// @summary Synchronously writes data to a file.
+/// @param file The file state returned from open_file().
+/// @param offset The absolute byte offset at which to start writing data.
+/// @param buffer The data to be written to the file.
+/// @param size The number of bytes to write to the file.
+/// @param bytes_written On return, this value is set to the number of bytes
+/// actually written to the file.
+/// @return true if the write operation was successful.
+static bool platform_write_file(file_t *file, int64_t offset, void const *buffer, size_t size, size_t &bytes_written)
+{
+    LARGE_INTEGER pos = {0};
+    pos.QuadPart  = offset;
+    if (!SetFilePointerEx(file->Fildes, pos, NULL, FILE_BEGIN))
+    {   // unable to seek to the specified offset. check GetLastError().
+        bytes_written = 0;
+        return false;
+    }
+    uint8_t const *b  = (uint8_t const*) buffer;
+    bytes_written     = 0;
+    while (size > 0)
+    {
+        DWORD nwrite  = 0;
+        DWORD towrite = size <= 0xFFFFFFFFU ? size : 0xFFFFFFFFU;
+        if (WriteFile(file->Fildes, &b[bytes_written], towrite, &nwrite, NULL))
+        {
+            bytes_written += nwrite;
+            size          -= nwrite;
+        }
+        else
+        {   // an error occurred; check GetLastError().
+            return false;
+        }
+    }
+    return true;
+}
+
+/// @summary Flushes any buffered writes to the file, and updates file metadata.
+/// @param file The file state returned from open_file().
+/// @return true if the flush operation was successful.
+static bool platform_flush_file(file_t *file)
+{
+    return (FlushFileBuffers(file->Fildes) == TRUE);
+}
+
+/// @summary Closes a file.
+/// @param file The file state returned from open_file().
+/// @return true if the file is closed.
+static bool platform_close_file(file_t **file)
+{   // TODO: consider extending this to support archive files?
+    file_t *f = *file;
+    *file  = NULL;
+    if (f != NULL)
+    {
+        if (f->Fildes != -1) CloseHandle(f->Fildes);
+        free(f);
+    }
+}
+
+/// @summary Saves a file to disk. If the file exists, it is overwritten. This
+/// operation is performed entirely synchronously and will block the calling
+/// thread until the file is written. The file is guaranteed to have been either
+/// written successfully, or not at all.
+/// @param path The path of the file to write.
+/// @param data The contents of the file.
+/// @param size The number of bytes to read from data and write to the file.
+/// @return true if the operation was successful.
+static bool platform_write_out(char const *path, void const *data, int64_t size)
+{
+    size_t pathlen   = 0;
+    size_t dirlen    = 0;
+    WCHAR *temp_path = NULL;
+    WCHAR  random[9];
+    int    nchars    = 0;
+
+    // we need to create this file in the same directory as the output path.
+    // this avoids problems with MoveFileEx() having to copy across volumes.
+    // so, generate a unique filename within that same directory.
+    // don't use GetTempPath() and GetTempFileName() because those are ass.
+    pathend(path, dirlen, pathlen);
+    nchars      = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen > 0 ? dirlen : -1, NULL, 0);
+    if (nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        return false;
+    }
+    temp_path  = (WCHAR*) malloc((nchars + 19) * sizeof(WCHAR)); // + '\' + 'writeout-XXXXXXXX'
+    memset(temp_path, 0, (nchars + 19) * sizeof(WCHAR));
+    if (dirlen > 0)
+    {   // the output path has volume and/or directory information specified.
+        // convert UTF-8 => UCS-2 to the temporary path buffer; append separator.
+        MultiBytetoWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen, temp_path, nchars + 19);
+        wcscat(temp_path, L"\\");
+    }
+    wcscat(temp_path, L"writeout-");
+    vswprintf(random, 9, L"%p", GetTickCount());
+    random[8] = 0;
+    wcscat(temp_path, random);
+}
+/*    int    nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+
+    // convert the path from UTF-8 to UCS-2, which Windows requires.
+    if (nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+    pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
+    uint8_t const *buffer        = (uint8_t const*) data;          // the input buffer
+    size_t  const  page_size     = (size_t) sysconf(_SC_PAGESIZE); // the system page size, in bytes
+    int     const  prot          = PROT_READ   | PROT_WRITE;       // we want to be able to read and write
+    int     const  flags         = MAP_PRIVATE | MAP_ANONYMOUS;    // mapping is private and may begin anywhere
+    struct  stat   st            = {0};                            // for retrieving the physical sector size
+    int64_t        fsize         =  0;                             // the file size, rounded up to the nearest sector
+    uint8_t       *sector_buffer = NULL;                           // a one-page buffer for padding, aligned
+    size_t         sector_count  =  0;                             // the number of whole sectors in 'data'
+    size_t         sector_bytes  =  0;                             // the nearest sector-size multiple <= 'size'
+    size_t         sector_over   =  0;                             // how much over a sector boundary 'size' is
+    size_t         pathlen       =  0;                             // the total length of 'path', in bytes
+    size_t         dirlen        =  0;                             // the length of the path part of 'path', in bytes
+    size_t         ssize         =  0;                             // the physical disk sector size, in bytes
+    char          *temp_path     = NULL;                           // buffer for the path of the temporary file
+    int            fd            = -1;                             // file descriptor of the temporary file
+
+    // we need to create this file in the same directory as the output path.
+    // this avoids problems with rename() not being able to work across partitions.
+    // so, generate a unique filename within that same directory.
+    pathend(path, dirlen, pathlen);
+    temp_path  = (char*) malloc(dirlen + 17); // + '/' + 'writeout-XXXXXX'
+    memset(temp_path, 0, dirlen + 17);
+    if (dirlen > 0)
+    {   // the output path has volume and/or directory information specified.
+        // copy it to the temporary path buffer, and append a path separator.
+        memcpy(temp_path, path, dirlen);
+        strcat(temp_path, "/");
+    }
+    // now append the template filename to the temp_path buffer.
+    strcat(temp_path, "writeout-XXXXXX");
+
+    // allocate enough storage for a single block/sector. to support
+    // direct I/O, the buffer must be allocated on an address that is
+    // an even multiple of the disk sector size. allocating a single
+    // page from the VMM will satisfy this requirement, and as an
+    // added bonus, the page contents is zeroed, so we don't have to.
+    if ((sector_buffer = (uint8_t*) mmap(NULL, page_size, prot, flags, -1, 0)) == NULL)
+    {   // unable to allocate the single-sector buffer. check errno.
+        goto error_cleanup;
+    }
+
+    // use mkstemp to generate a temporary filename and open the file.
+    if ((fd = mkstemp(temp_path)) == -1)
+    {   // the file could not be opened at all. check errno.
+        goto error_cleanup;
+    }
+
+    // mkstemp doesn't allow specification of additional flags, so add O_DIRECT.
+    // if this fails, it's not a fatal; we'll still be able to write the file.
+    fcntl(fd, F_SETFL, O_DIRECT);
+
+    // retrieve the physical block size for the disk containing the file.
+    if (fstat(fd, &st) < 0)
+    {   // unable to retrieve file stats; fail.
+        goto error_cleanup;
+    }
+
+    // copy the data extending into the tail sector into our temporary buffer.
+    sector_count  = size_t(size / st.st_blksize);
+    sector_bytes  = size_t(st.st_blksize * sector_count);
+    sector_over   = size_t(size - sector_bytes);
+    if (sector_over > 0)
+    {   // buffer the overlap amount into our temporary buffer.
+        memcpy(sector_buffer, &buffer[sector_bytes], sector_over);
+    }
+
+    // align the file size up to an even multiple of the physical sector size.
+    // pre-allocate space for the file, without changing the file size.
+    ssize = st.st_blksize;
+    fsize = align_up(size, ssize);
+    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, off_t(fsize)) != 0)
+    {   // unable to pre-allocate space for the file. check errno.
+        goto error_cleanup;
+    }
+
+    // finally, we can write the data to the file.
+    if (sector_bytes > 0)
+    {   // write the bulk of the data, if the data is > 1 sector.
+        write(fd, buffer, sector_bytes);
+    }
+    if (sector_over  > 0)
+    {   // write the remainder of the data.
+        write(fd, sector_buffer, st.st_blksize);
+    }
+
+    // close the file, and then truncate it to the correct size.
+    if (close(fd) == -1 || truncate(temp_path, size) == -1)
+    {   // unable to set the correct file size. check errno.
+        fd = -1; goto error_cleanup;
+    }
+
+    // all of that was successful, to move the temp file to the destination path.
+    if (rename(temp_path, path) == -1)
+    {   // the temp file could not be renamed. check errno.
+        fd = -1; goto error_cleanup;
+    }
+
+    // all done; clean up temporary memory.
+    munmap(sector_buffer, page_size);
+    free(temp_path);
+    return true;
+
+error_cleanup:
+    if (sector_buffer != NULL) munmap(sector_buffer, page_size);
+    if (fd != -1) close(fd);
+    if (temp_path != NULL)
+    {   // be sure to delete the temporary file.
+        unlink(temp_path);
+        free(temp_path);
+    }
+    return false;
+}*/
 
 /// @summary Saves a file to disk. If the file exists, it is overwritten. This
 /// operation is performed entirely synchronously and will block the calling

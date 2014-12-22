@@ -498,6 +498,16 @@ static inline size_t align_up(size_t size, size_t pow2)
     return (size == 0) ? pow2 : ((size + (pow2-1)) & ~(pow2-1));
 }
 
+/// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
+/// @param size The size value to round up.
+/// @param pow2 The power-of-two alignment.
+/// @return The input size, rounded up to the nearest even multiple of pow2.
+static inline int64_t align_up(int64_t size, size_t pow2)
+{
+    assert((pow2 & (pow2-1)) == 0);
+    return (size == 0) ? int64_t(pow2) : ((size + int64_t(pow2-1)) & ~int64_t(pow2-1));
+}
+
 /// @summary Clamps a value to a given maximum.
 /// @param size The size value to clamp.
 /// @param limit The upper-bound to clamp to.
@@ -1567,11 +1577,9 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 /// @param req The AIO request corresponding to the finalize operation.
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
 static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
-{   // TODO: we assume that the flush portion of this operation was
-    // taken care of by the VFS layer when it processed the request.
+{
     struct stat st;                        // results of lstat; st_size gives the path length.
     ssize_t nsrc =  0;                     // the number of bytes read by readlink().
-    off_t    eof =  0;                     // the current end-of-file position.
     char *target = (char*) req.DataBuffer; // either NULL, or allocated by strdup().
     char *source =  NULL;                  // allocated with malloc().
     char fdpath[32];                       // the path /proc/self/fd/########.
@@ -1612,11 +1620,9 @@ static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
 
     // we're saving the file, so save off the current EOF position.
     // we'll use this to set the 'real' size of the file.
-    // TODO: we can pass in the file size explicitly...better?
-    eof = lseek(req.Fildes, 0, SEEK_END);
     if (req.Eventfd != -1) close(req.Eventfd);
     if (req.Fildes != -1) close(req.Fildes);
-    if (truncate(source, eof) == -1)
+    if (truncate(source, req.FileOffset) == -1)
     {   // can't just goto error_cleanup; we've already closed the fd's.
         srsw_fifo_put(&aio->CloseResults, aio_result(errno, 0, req));
         free(source);  free(target);
@@ -1953,6 +1959,7 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
     {   // fill out the request. it will be processed at a later time.
         aio_req->Command    = AIO_COMMAND_CLOSE;
         aio_req->Fildes     = vfs->StInInfo[i].Fildes;
+        aio_req->Eventfd    = vfs->StInInfo[i].Eventfd;
         aio_req->DataAmount = 0;
         aio_req->BaseOffset = vfs->StInInfo[i].FileOffset;
         aio_req->FileOffset = 0;
@@ -2041,7 +2048,7 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
     }
 }
 
-/// @summary Processes all completed file read notifications from AIO.
+/// @summary Processes all completed file write notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
@@ -2053,6 +2060,19 @@ static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
         {   // free the fixed-size write buffer.
             munmap(res.DataBuffer, VFS_WRITE_SIZE);
         }
+    }
+}
+
+/// @summary Processes all completed file flush notifications from AIO.
+/// @param vfs The VFS driver state.
+/// @param aio The AIO driver state.
+static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
+{
+    aio_res_t res;
+    // there's nothing that the VFS driver needs to do here for the application.
+    while (srsw_fifo_get(&aio->FlushResults, res))
+    {
+        /* empty */
     }
 }
 
@@ -2247,15 +2267,15 @@ static bool vfs_update_stream_out(vfs_state_t *vfs)
         if (req != NULL)
         {   // populate the (already queued) request.
             req->Command    = AIO_COMMAND_FINAL;
-            req->Fildes     = write.Fildes;
-            req->Eventfd    = write.Eventfd;
+            req->Fildes     = close.Fildes;
+            req->Eventfd    = close.Eventfd;
             req->DataAmount = 0;
             req->BaseOffset = 0;
-            req->FileOffset = 0;
+            req->FileOffset = close.FileSize;
             req->DataBuffer = NULL;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
-            req->AFID       = write.Fildes;
+            req->AFID       = close.Fildes;
             req->Type       = 0;
             req->Reserved   = 0;
         }
@@ -2305,9 +2325,10 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
     // dispatch any completed I/O operations to the per-type queues for
     // processing by the platform layer and dispatching to the application.
     // this decrements the number of pending I/O operations across the file set.
-    vfs_process_completed_reads (vfs, aio);
-    vfs_process_completed_writes(vfs, aio);
-    vfs_process_completed_closes(vfs, aio);
+    vfs_process_completed_reads  (vfs, aio);
+    vfs_process_completed_writes (vfs, aio);
+    vfs_process_completed_flushes(vfs, aio);
+    vfs_process_completed_closes (vfs, aio);
 
     // close file requests should be processed after all read and write requests.
     // this ensures that all I/O has been submitted before closing the file.
@@ -2373,6 +2394,21 @@ static void delete_vfs_state(vfs_state_t *vfs)
         flush_srsw_fifo(&vfs->SiReturn[i]);
         flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
+}
+
+/// @summary Checks a file type value to make sure it is known.
+/// @param file_type One of the values of the file_type_e enumeration.
+/// @return true if the file type is known.
+static bool check_file_type(int32_t file_type)
+{
+    size_t  const  ntypes   = sizeof(FILE_TYPE_LIST) / sizeof(FILE_TYPE_LIST[0]);
+    int32_t const *typelist = (int32_t const*) FILE_TYPE_LIST;
+    for (size_t i = 0; i  < ntypes; ++i)
+    {
+        if (typelist[i] == file_type)
+            return true;
+    }
+    return false;
 }
 
 /// @summary No-op callback function invoked when the platform I/O system has
@@ -2450,7 +2486,7 @@ static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error
 /// @return true if the file was successfully opened.
 static bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
 {
-    bool    hint   = true;
+    int     hint   = FILE_HINT_NONE;
     int     fd     = -1;
     int     efd    = -1;
     size_t  ssize  =  0;
@@ -2460,7 +2496,7 @@ static bool platform_open_stream(char const *path, intptr_t id, int32_t type, ui
     if (mode == STREAM_IN_ONCE)
     {   // for files that will be streamed in only once, prefer unbuffered I/O.
         // this avoids polluting the page cache with their data.
-        hint  = false;
+        hint  = FILE_HINT_DIRECT;
     }
     if (vfs_resolve_file_read(path, hint, fd, efd, lsize, psize, offset, ssize))
     {   // queue a load file request to be processed by the VFS driver.
@@ -2650,7 +2686,7 @@ static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_
         ssize_t nread  =  read(file->Fildes, &b[bytes_read], size);
         if (nread > 0)
         {   // the read has completed successfully and returned data.
-            bytes_read =+ nread;
+            bytes_read += nread;
             size       -= nread;
         }
         else if (nread == 0)
