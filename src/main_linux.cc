@@ -3249,6 +3249,10 @@ cleanup:
     return result;
 }
 
+/// @summary Entry point of the application.
+/// @param argc The number of command-line arguments.
+/// @param argv An array of NULL-terminated strings specifying command-line arguments.
+/// @return Either EXIT_SUCCESS or EXIT_FAILURE.
 int main(int argc, char **argv)
 {
     platform_layer_t platform_layer;

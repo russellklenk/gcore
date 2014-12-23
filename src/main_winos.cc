@@ -428,7 +428,7 @@ struct vfs_socs_t
     vfs_socs_t        *Next;         /// Pointer to the next node in the queue.
     HANDLE             Fildes;       /// The file descriptor of the opened file.
     uint32_t           Priority;     /// The stream priority (0 = highest).
-    char              *FilePath;     /// The target path, allocated with strdup(), or NULL.
+    WCHAR             *FilePath;     /// The target path, allocated with malloc(), or NULL.
     int64_t            FileSize;     /// The logical size of the file, in bytes.
 };
 
@@ -1528,6 +1528,72 @@ static char const* extpart(char const *path, size_t &out_extlen)
         out_extlen = 0;
     }
     return last;
+}
+
+/// @summary Generates a unique filename for use as a temp file in a given directory.
+/// @param path The NULL-terminated UTF-8 string specifying the target path.
+/// @param prefix The NULL-terminated UCS-2 string specifying the filename prefix.
+/// @return A string <volume and directory info from path>\<prefix>-########\0.
+/// The returned string should be freed using the standard C library free() function.
+static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
+{
+    int    nbytes =-1;    // the number of bytes of volume and directory info
+    int    nchars = 0;
+    size_t pathlen= 0;    // the number of bytes in path, not including zero-byte
+    size_t dirlen = 0;    // the number of bytes of volume and directory info
+    size_t pfxlen = 0;    // the number of chars in prefix
+    WCHAR *temp   = NULL; // the temporary file path we will return
+    WCHAR  random[9];     // zero-terminated string of 8 random hex digits
+
+    // ensure that a prefix is specified.
+    if (prefix == NULL)
+    {   // use the prefix 'tempfile'.
+        prefix  = L"tempfile";
+    }
+
+    // the temp file should be created in the same directory as the output path.
+    // this avoids problems with file moves across volumes or partitions, which
+    // will either fail, or are implemented as a non-atomic file copy. the path
+    // we return will contain the full volume and directory information from the
+    // input path, and append a filename of the form prefix-######## to it.
+    pathend(path, dirlen, pathlen);       // get the path portion of the input string.
+    pfxlen = wcslen(prefix);              // get the length of the prefix string.
+    nbytes = dirlen > 0 ? dirlen  : -1;   // get the number of bytes of volume and directory info.
+    nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, nbytes, NULL, 0);
+    if (dirlen > 0 && nchars == 0)
+    {   // the path cannot be converted from UTF-8 to UCS-2.
+        return NULL;
+    }
+    // allocate storage for the path string, converted to UCS-2.
+    // the output path has the form:
+    // <volume and directory info from path>\<prefix>-########\0
+    nchars =  nchars + 1 + pfxlen + 10;            // + '\\' + prefix + '-' + '########\0'
+    temp   = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (temp == NULL) return NULL;
+    memset(temp, 0, nchars * sizeof(WCHAR));
+    if (dirlen > 0)
+    {   // the output path has volume and directory information specified.
+        // convert this data from UTF-8 to UCS-2 and append a directory separator.
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen, temp, nchars);
+        wcscat(temp, L"\\");
+    }
+    wcscat(temp, prefix);
+    wcscar(temp, L"-");
+
+    // generate a 32-bit 'random' value and convert it to an eight-digit hex value.
+    // start with the current tick count, and then mix the bits using the 4-byte
+    // integer hash, full avalanche method from burtleburtle.net/bob/hash/integer.html.
+    uint32_t bits = GetTickCount();
+    bits  = (bits + 0x7ed55d16) + (bits << 12);
+    bits  = (bits ^ 0xc761c23c) ^ (bits >> 19);
+    bits  = (bits + 0x165667b1) + (bits <<  5);
+    bits  = (bits + 0xd3a2646c) ^ (bits <<  9);
+    bits  = (bits + 0xfd7046c5) + (bits <<  3);
+    bits  = (bits ^ 0xb55a4f09) ^ (bits >> 16);
+    swprintf(random, 9, "%08x", bits);
+    random[8]  = 0;
+    wcscat(temp, random);
+    return temp;
 }
 
 /// @summary Synchronously opens a file and retrieves various information.
@@ -3055,320 +3121,476 @@ static bool platform_close_file(file_t **file)
 /// @return true if the operation was successful.
 static bool platform_write_out(char const *path, void const *data, int64_t size)
 {
-    size_t pathlen   = 0;
-    size_t dirlen    = 0;
-    WCHAR *temp_path = NULL;
-    WCHAR  random[9];
-    int    nchars    = 0;
+    FILE_END_OF_FILE_INFO eof;
+    FILE_ALLOCATION_INFO  sec;
+    uint8_t const     *buffer = (uint8_t const*)data;
+    SYSTEM_INFO sysinfo       = {0};
+    HANDLE      fd            = INVALID_HANDLE_VALUE;
+    DWORD       mem_flags     = MEM_RESERVE  | MEM_COMMIT;
+    DWORD       mem_protect   = PAGE_READWRITE;
+    DWORD       access        = GENERIC_READ | GENERIC_WRITE;
+    DWORD       share         = FILE_SHARE_READ;
+    DWORD       create        = CREATE_ALWAYS;
+    DWORD       flags         = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING;
+    WCHAR      *temp_path     = make_temp_path(path, L"writeout");
+    WCHAR      *file_path     = NULL;
+    DWORD       page_size     = 0;
+    int64_t     file_size     = 0;
+    uint8_t    *sector_buffer = NULL;
+    size_t      sector_count  = 0;
+    int64_t     sector_bytes  = 0;
+    size_t      sector_over   = 0;
+    size_t      sector_size   = 0;
+    int         nchars        = 0;
 
-    // we need to create this file in the same directory as the output path.
-    // this avoids problems with MoveFileEx() having to copy across volumes.
-    // so, generate a unique filename within that same directory.
-    // don't use GetTempPath() and GetTempFileName() because those are ass.
-    pathend(path, dirlen, pathlen);
-    nchars      = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen > 0 ? dirlen : -1, NULL, 0);
+    // convert the destination path from UTF-8 to UCS-2.
+    nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
     if (nchars == 0)
-    {   // the path cannot be converted from UTF-8 to UCS-2.
-        return false;
-    }
-    temp_path  = (WCHAR*) malloc((nchars + 19) * sizeof(WCHAR)); // + '\' + 'writeout-XXXXXXXX'
-    memset(temp_path, 0, (nchars + 19) * sizeof(WCHAR));
-    if (dirlen > 0)
-    {   // the output path has volume and/or directory information specified.
-        // convert UTF-8 => UCS-2 to the temporary path buffer; append separator.
-        MultiBytetoWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen, temp_path, nchars + 19);
-        wcscat(temp_path, L"\\");
-    }
-    wcscat(temp_path, L"writeout-");
-    vswprintf(random, 9, L"%p", GetTickCount());
-    random[8] = 0;
-    wcscat(temp_path, random);
-}
-/*    int    nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-
-    // convert the path from UTF-8 to UCS-2, which Windows requires.
-    if (nchars == 0)
-    {   // the path cannot be converted from UTF-8 to UCS-2.
+    {   // unable to convert UTF-8 to UCS-2; check GetLastError().
         goto error_cleanup;
     }
-    pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
-    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
-    {   // the path cannot be converted from UTF-8 to UCS-2.
+    file_path = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+    if (file_path == NULL)
+    {   // unable to allocate the UCS-2 path buffer.
         goto error_cleanup;
     }
-    uint8_t const *buffer        = (uint8_t const*) data;          // the input buffer
-    size_t  const  page_size     = (size_t) sysconf(_SC_PAGESIZE); // the system page size, in bytes
-    int     const  prot          = PROT_READ   | PROT_WRITE;       // we want to be able to read and write
-    int     const  flags         = MAP_PRIVATE | MAP_ANONYMOUS;    // mapping is private and may begin anywhere
-    struct  stat   st            = {0};                            // for retrieving the physical sector size
-    int64_t        fsize         =  0;                             // the file size, rounded up to the nearest sector
-    uint8_t       *sector_buffer = NULL;                           // a one-page buffer for padding, aligned
-    size_t         sector_count  =  0;                             // the number of whole sectors in 'data'
-    size_t         sector_bytes  =  0;                             // the nearest sector-size multiple <= 'size'
-    size_t         sector_over   =  0;                             // how much over a sector boundary 'size' is
-    size_t         pathlen       =  0;                             // the total length of 'path', in bytes
-    size_t         dirlen        =  0;                             // the length of the path part of 'path', in bytes
-    size_t         ssize         =  0;                             // the physical disk sector size, in bytes
-    char          *temp_path     = NULL;                           // buffer for the path of the temporary file
-    int            fd            = -1;                             // file descriptor of the temporary file
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, file_path, nchars);
 
-    // we need to create this file in the same directory as the output path.
-    // this avoids problems with rename() not being able to work across partitions.
-    // so, generate a unique filename within that same directory.
-    pathend(path, dirlen, pathlen);
-    temp_path  = (char*) malloc(dirlen + 17); // + '/' + 'writeout-XXXXXX'
-    memset(temp_path, 0, dirlen + 17);
-    if (dirlen > 0)
-    {   // the output path has volume and/or directory information specified.
-        // copy it to the temporary path buffer, and append a path separator.
-        memcpy(temp_path, path, dirlen);
-        strcat(temp_path, "/");
-    }
-    // now append the template filename to the temp_path buffer.
-    strcat(temp_path, "writeout-XXXXXX");
-
-    // allocate enough storage for a single block/sector. to support
-    // direct I/O, the buffer must be allocated on an address that is
-    // an even multiple of the disk sector size. allocating a single
-    // page from the VMM will satisfy this requirement, and as an
-    // added bonus, the page contents is zeroed, so we don't have to.
-    if ((sector_buffer = (uint8_t*) mmap(NULL, page_size, prot, flags, -1, 0)) == NULL)
-    {   // unable to allocate the single-sector buffer. check errno.
+    // get the system page size, and allocate a single-page buffer. to support
+    // unbuffered I/O, the buffer must be allocated on a sector-size boundary
+    // and must also be a multiple of the physical disk sector size. allocating
+    // a virtual memory page using VirtualAlloc will satisfy these constraints.
+    GetNativeSystemInfo_Func(&sysinfo);
+    page_size     = sysinfo.dwPageSize;
+    sector_buffer = (uint8_t*) VirtualAlloc(NULL, page_size, mem_flags, mem_protect);
+    if (sector_buffer == NULL)
+    {   // unable to allocate the overage buffer; check GetLastError().
         goto error_cleanup;
     }
 
-    // use mkstemp to generate a temporary filename and open the file.
-    if ((fd = mkstemp(temp_path)) == -1)
-    {   // the file could not be opened at all. check errno.
+    // create the temporary file, and get the physical disk sector size.
+    // pre-allocate storage for the file contents, which should improve performance.
+    if ((fd = CreateFile(temp_path, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
+    {   // unable to create the new file; check GetLastError().
         goto error_cleanup;
     }
+    sector_size = physical_sector_size(fd);
+    file_size   = align_up(size, sector_size);
+    eof.EndOfFile.QuadPart      = size;
+    sec.AllocationSize.QuadPart = file_size;
+    SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
+    SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
+    SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
 
-    // mkstemp doesn't allow specification of additional flags, so add O_DIRECT.
-    // if this fails, it's not a fatal; we'll still be able to write the file.
-    fcntl(fd, F_SETFL, O_DIRECT);
-
-    // retrieve the physical block size for the disk containing the file.
-    if (fstat(fd, &st) < 0)
-    {   // unable to retrieve file stats; fail.
-        goto error_cleanup;
-    }
-
-    // copy the data extending into the tail sector into our temporary buffer.
-    sector_count  = size_t(size / st.st_blksize);
-    sector_bytes  = size_t(st.st_blksize * sector_count);
-    sector_over   = size_t(size - sector_bytes);
+    // copy the data extending into the tail sector into the overage buffer.
+    sector_count = size_t (size / sector_size);
+    sector_bytes = int64_t(sector_size) * sector_count;
+    sector_over  = size_t (size - sector_bytes);
     if (sector_over > 0)
-    {   // buffer the overlap amount into our temporary buffer.
+    {   // buffer the overlap amount. note that the page will have been zeroed.
         memcpy(sector_buffer, &buffer[sector_bytes], sector_over);
     }
 
-    // align the file size up to an even multiple of the physical sector size.
-    // pre-allocate space for the file, without changing the file size.
-    ssize = st.st_blksize;
-    fsize = align_up(size, ssize);
-    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, off_t(fsize)) != 0)
-    {   // unable to pre-allocate space for the file. check errno.
+    // write the data to the file.
+    if (sector_bytes > 0)
+    {   // write the bulk of the data, if the data is > 1 sector.
+        int64_t amount = 0;
+        DWORD   nwrite = 0;
+        while  (amount < sector_bytes)
+        {
+            DWORD n = (sector_bytes - amount) < 0xFFFFFFFFU ? (sector_bytes - amount) : 0xFFFFFFFFU;
+            WriteFile(fd, &buffer[amount], n, &nwrite, NULL);
+            amount += nwrite;
+        }
+    }
+    if (sector_over > 0)
+    {   // write the remaining sector-sized chunk of data.
+        DWORD n = (DWORD) sector_size;
+        DWORD w = (DWORD) 0;
+        WriteFile(fd, sector_buffer, n, &w, NULL);
+    }
+
+    // close the file, and move it to the destination path.
+    CloseHandle(fd); fd = INVALID_HANDLE_VALUE;
+    if (!MoveFileEx(temp_path, file_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {   // the file could not be moved into place; check GetLastError().
         goto error_cleanup;
     }
 
-    // finally, we can write the data to the file.
-    if (sector_bytes > 0)
-    {   // write the bulk of the data, if the data is > 1 sector.
-        write(fd, buffer, sector_bytes);
-    }
-    if (sector_over  > 0)
-    {   // write the remainder of the data.
-        write(fd, sector_buffer, st.st_blksize);
-    }
-
-    // close the file, and then truncate it to the correct size.
-    if (close(fd) == -1 || truncate(temp_path, size) == -1)
-    {   // unable to set the correct file size. check errno.
-        fd = -1; goto error_cleanup;
-    }
-
-    // all of that was successful, to move the temp file to the destination path.
-    if (rename(temp_path, path) == -1)
-    {   // the temp file could not be renamed. check errno.
-        fd = -1; goto error_cleanup;
-    }
-
-    // all done; clean up temporary memory.
-    munmap(sector_buffer, page_size);
+    // clean up our temporary buffers; we're done.
+    VirtualFree(sector_buffer, 0, MEM_RELEASE);
+    free(file_path);
     free(temp_path);
     return true;
 
 error_cleanup:
-    if (sector_buffer != NULL) munmap(sector_buffer, page_size);
-    if (fd != -1) close(fd);
-    if (temp_path != NULL)
-    {   // be sure to delete the temporary file.
-        unlink(temp_path);
-        free(temp_path);
-    }
+    if (fd != INVALID_HANDLE_VALUE) CloseHandle(fd);
+    if (sector_buffer != NULL) VirtualFree(sector_buffer, 0, MEM_RELEASE);
+    if (file_path != NULL) free(file_path);
+    if (temp_path != NULL) DeleteFile(temp_path);
+    if (temp_path != NULL) free(temp_path);
     return false;
-}*/
-
-/// @summary Saves a file to disk. If the file exists, it is overwritten. This
-/// operation is performed entirely synchronously and will block the calling
-/// thread until the file is written. The file is guaranteed to have been either
-/// written successfully, or not at all.
-/// @param path The path of the file to write.
-/// @param data The contents of the file.
-/// @param size The number of bytes to read from data and write to the file.
-/// @return true if the operation was successful.
-static bool platform_save_file(char const *path, void const *data, int64_t size)
-{
-    // generate a temporary filename (see platform_create_file),
-    // vfs_resolve_file_write that path (preallocate the file),
-    // write the data and close the file,
-    // rename() to the input path
-}
-
-/// @summary Opens a file for read-write access. The application is responsible
-/// for submitting read and write operations. If the file exists, it is opened
-/// without truncation. If the file does not exist, it is created.
-/// @param path The path of the file to open.
-/// @param id The application-defined identifier of the file.
-/// @param type One of file_type_e indicating the type of file being opened. This allows
-/// the platform to decide the thread on which data should be returned to the application.
-/// @param priority The file operation priority, with 0 indicating the highest possible priority.
-/// @param read_only Specify true to open a file as read-only.
-/// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
-/// operations more efficient. If an estimate is unknown, specify zero.
-/// @param file_size On return, this value is updated with the current size of the file, in bytes.
-/// @return true if the file was opened successfully.
-static bool platform_open_file(char const *path, intptr_t id, int32_t type, uint32_t priority, bool read_only, int64_t reserve_size, int64_t &file_size)
-{
-    // if read_only is true, use vfs_resolve_file_read(), and support archive files.
-    // if read_only is false, use vfs_resolve_file_write(), and support native files only.
-}
-
-/// @summary Closes a file explicitly opened for reading or writing.
-/// @param id The application-defined identifier associated with the file.
-/// @return true if the close request was successfuly queued.
-static bool platform_close_file(intptr_t id)
-{
-    vfs_cfreq_t req;
-    req.Next = NULL;
-    req.AFID = id;
-    return srmw_fifo_put(&VFS_STATE.CloseQueue, req);
-}
-
-/// @summary Queues a read operation against an open file. The file should have
-/// previously been opened using platform_open_file(), platform_append_file(),
-/// or platform_create_file(). Reads starting at arbitrary locations are supported,
-/// however, the read may return more or less data than requested.
-/// @param id The application-defined identifier of the file.
-/// @param offset The absolute byte offset within the file at which to being reading data.
-/// @param size The number of bytes to read. The read may return more or less data than requested.
-/// @return true if the read operation was successfully submitted.
-static bool platform_read_file(intptr_t id, int64_t offset, uint32_t size)
-{
-    // again, offsets must be sector-aligned. in this case, we can calculate
-    // the nearest sector offset <= offset, offset_aligned, and then calculate
-    // the size as align_to(size + (offset_aligned - offset), sector_size).
-    // when the read completes, we would then have to do some calculations to
-    // determine the starting offset of the data in the buffer, and return that
-    // to the caller; we would *also* have to make sure that the base buffer
-    // pointer is passed through so it can be returned, but all of this complexity
-    // occurs in the platform layer.
-}
-
-/// @summary Queues a write operation against an open file. The file should have
-/// previously been opened using platform_open_file(), platform_append_file() or
-/// platform_create_file(). Writes starting at arbitrary locations are not supported;
-/// all writes occur at the end of the file. It is possible that not all data is
-/// immediately flushed to disk; if this behavior is required, use the function
-/// platform_flush_file() to flush any buffered data to disk.
-/// @param id The application-defined identifier of the file.
-/// @param data The data to write. Do not modify the contents of this buffer
-/// until the write completion notification is received.
-/// @param size The number of bytes to write.
-static bool platform_write_file(intptr_t id, void const *data, uint32_t size)
-{
-    // note that we may not be able to support a user-specified offset here,
-    // because offset must be sector-aligned. so we probably should support
-    // only sequential writes to files, and we have to do it in sector-size
-    // multiples, so that means we have to perform some internal buffering.
-    // in order to support arbitrary offsets, we would have to perform a read
-    // followed by the write, which is unacceptable. basically in this case,
-    // we will submit writes up to the sector size multiple <= size, and then
-    // we have to buffer any remaining data. when the file is closed, if there
-    // is any buffered data, we zero-pad up to the nearest sector size multiple,
-    // then ftruncate() to set EOF, and then do the close. this means that for
-    // each open file, we must maintain a one-sector write buffer, which for
-    // the current 128 file limit amounts to up to 512KB of overhead.
-    // if a write request is received and data is currently buffered, and the
-    // write would cross the sector boundary, copy from the user data buffer
-    // to the internal sector buffer, write the sector buffer, and then continue
-    // as usual. we could support offsets by failing if they don't fall on a
-    // sector boundary, but that seems kind of horrible, and unlikely to succeed.
-    // seeking also cannot be supported, because we'd then have to deal with the
-    // same issue as supporting arbitrary offsets (we'd have to read and write
-    // any buffered data, and then seek.)
-    //
-    // writes will be blocking unless the file has been preallocated using
-    // posix_fadvise(), so platform_open_file() and platform_create_file()
-    // should accept an optional file size parameter to perform this
-    // preallocation.
-}
-
-/// @summary Flushes any pending writes to disk.
-/// @param id The application-defined identifier of the file to flush.
-/// @return true if the flush operation was successfully queued.
-static bool platform_flush_file(intptr_t id)
-{
-    // this should be pretty straightforward.
 }
 
 /// @summary Opens a new temporary file for writing. The file is initially empty.
-/// Data may be written to or read from the file using platform_[read/write]_file().
-/// When finished, call platform_finalize_file() to close the file and move it to
-/// its final destination or delete the file.
-/// @param id The application-defined identifier of the file.
-/// @param type One of file_type_e indicating the type of file being created. This allows
-/// the platform to decide the thread on which data should be returned to the application.
+/// Data may be written to the file using append_stream(). When finished, call
+/// close_stream() to close the file and move it to its final destination.
+/// @param where The directory path where the file will be created, or NULL to use the CWD.
 /// @param priority The file operation priority, with 0 indicating the highest possible priority.
 /// @param reserve_size The size, in bytes, to preallocate for the file. This makes write
-/// operations more efficient. If an estimate is unknown, specify zero.
-/// @return true if the file is opened and ready for I/O operations.
-static bool platform_create_file(intptr_t id, int32_t type, uint32_t priority, int64_t reserve_size)
+/// operations more efficient. Specify zero if unknown.
+/// @param writer On return, this value will point to the file writer state.
+/// @return true if the file is opened and ready for write operations.
+static bool platform_create_stream(char const *where, uint32_t priority, int64_t reserve_size, stream_writer_t **writer)
 {
-    // generate a filename using mkostemp(), which also opens the file.
-    //
-    // On MacOS, use mktemp() with a template of /tmp/temp.XXXXXX, and then open with O_EXCL.
-    //
-    // On Windows, use GetTempPath() and GetTempFileName().
+    FILE_END_OF_FILE_INFO eof;
+    FILE_ALLOCATION_INFO  sec;
+    stream_writer_t *sw = NULL;                 // the file writer we return
+    HANDLE  fd          = INVALID_HANDLE_VALUE; // file descriptor of the temporary file
+    WCHAR  *temp_path   = NULL;                 // buffer for the path of the temporary file
+    int64_t file_size   =  0;                   // the file size, rounded up to the nearest sector
+    size_t  sector_size =  0;                   // the physical disk sector size, in bytes
+    void   *buffer      = NULL;                 // the write buffer for the stream
+    DWORD   mem_flags   = MEM_RESERVE | MEM_COMMIT;
+    DWORD   mem_protect = PAGE_READWRITE;
+    DWORD   access      = GENERIC_READ | GENERIC_WRITE;
+    DWORD   share       = FILE_SHARE_READ;
+    DWORD   create      = CREATE_ALWAYS;
+    DWORD   flags       = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING;
+
+    // allocate storage for the file writer up front.
+    sw = (stream_writer_t*) malloc(sizeof(stream_writer_t));
+    if (sw == NULL) goto error_cleanup;
+
+    // we need to create this file in the same directory as the output path.
+    // this avoids problems with rename() not being able to work across partitions.
+    // so, generate a unique filename within that same directory.
+    temp_path = make_temp_path(where, L"tempfile");
+    if (temp_path == NULL) goto error_cleanup;
+
+    // create the temporary file, and get the physical disk sector size.
+    if ((fd = CreateFile(temp_path, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
+    {   // unable to create the new file; check GetLastError().
+        goto error_cleanup;
+    }
+    if (reserve_size > 0)
+    {   // pre-allocate storage for the file contents, which should improve performance.
+        // this is best-effort, so it's not a fatal error if it fails.
+        sector_size = physical_sector_size(fd);
+        file_size   = align_up(reserve_size, sector_size);
+        sec.AllocationSize.QuadPart = file_size;
+        eof.EndOfFile.QuadPart      = reserve_size;
+        SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
+        SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
+        SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
+    }
+
+    // now use VirtualAlloc to allocate a buffer for combining small writes.
+    // use VirtualAlloc because it is guaranteed to return addresses with the
+    // correct alignment, and ranges rounded up to the correct size for use
+    // with unbuffered I/O.
+    if ((buffer = VirtualAlloc(NULL, VFS_WRITE_SIZE, mem_flags, mem_protect)) == NULL)
+    {   // the allocation failed; check GetLastError().
+        goto error_cleanup;
+    }
+
+    // populate the file writer; we're done.
+    sw->Fildes      = fd;
+    sw->BaseAddress = (uint8_t*) buffer;
+    sw->DataOffset  = 0;
+    sw->FileOffset  = 0;
+    sw->Priority    = priority;
+    *writer = sw;
+    return true;
+
+error_cleanup:
+    if (fd != INVALID_HANDLE_VALUE) CloseHandle(fd);
+    if (temp_path != NULL) DeleteFile(temp_path);
+    if (temp_path != NULL) free(temp_path);
+    if (sw != NULL) free(sw);
+    *writer = NULL;
+    return false;
 }
 
-/// @summary Closes a file previously opened using platform_create_file(), and
-/// atomically renames that file to move it to the specified path. This function
-/// blocks the calling thread until all operations have completed.
-/// @param id The application-defined identifier of the file passed to the create file call.
-/// @param path The target path and filename of the file, or NULL to delete the file.
-/// @return true if the rename or delete was performed successfully.
-static bool platform_finalize_file(intptr_t id, char const *path)
+/// @summary Queues a write operation against an open file. The file should have
+/// previously been opened using create_stream(). The data is always appended to
+/// the end of the file; writes to arbitrary locations are not supported.
+/// @param writer The file writer state returned from the create file call.
+/// @param data The data to write. Do not modify the contents of this buffer
+/// until the write completion notification is received.
+/// @param size The number of bytes to write.
+/// @param bytes_written On return, this value is updated with the number of bytes written.
+/// @return true if the write operation was successful.
+static bool platform_append_stream(stream_writer_t *writer, void const *data, uint32_t size, size_t &bytes_written)
 {
-    // rename() or unlink(). we have the problem that we have only a fd, so on Linux:
-    // 1. get the required buffer size using lstat('/proc/self/fd/###') .st_size field.
-    // 2. use ssize_t readlink('/proc/self/fd/###', buffer, bufsz) to read the absolute path.
-    // 3. close the temporary file.
-    // 4. call either rename() or unlink() on the path.
-    //
-    // On MacOS, use fcntl(fd, F_GETPATH, dst[MAXPATHLEN?]) to get the path, and
-    // then use either rename() or unlink().
-    //
-    // On Windows, use GetFileInformationByHandleEx with FileNameInfo, and then
-    // use either MoveFileEx() or DeleteFile().
+    DWORD mem_flags   = MEM_RESERVE | MEM_COMMIT;
+    DWORD mem_protect = PAGE_READWRITE;
+
+    bytes_written = 0;
+    while (size   > 0)
+    {
+        uint8_t const  *srcbuf = (uint8_t const*) data + bytes_written;
+        void  *newbuf = writer->BaseAddress;                         /* assume no new buffer is needed  */
+        size_t nwrite = writer->DataOffset + size > VFS_WRITE_SIZE ? /* does size exceed buffer space?  */
+                        VFS_WRITE_SIZE - writer->DataOffset        : /* yes, so fill the current buffer */
+                        size;                                        /* no, so write the remaining data */
+
+        if (writer->DataOffset + nwrite == VFS_WRITE_SIZE)
+        {   // allocate a new buffer for the next write operation(s).
+            // we do this first because if it fails, we want to fail
+            // but still have a 'live' buffer.
+            if ((newbuf = VirtualAlloc(NULL, VFS_WRITE_SIZE, mem_flags, mem_protect)) == NULL)
+            {   // this is a serious error - check GetLastError().
+                return false;
+            }
+
+            // fill up the active buffer, and queue a write to the VFS.
+            // if queueing the write fails, we won't update DataOffset,
+            // and the caller can attempt to resume the write later.
+            memcpy(&writer->BaseAddress[writer->DataOffset], srcbuf, nwrite);
+
+            vfs_sowr_t write;
+            write.Next       = NULL;
+            write.Fildes     = writer->Fildes;
+            write.FileOffset = writer->FileOffset;
+            write.DataBuffer = writer->BaseAddress;
+            write.DataSize   = VFS_WRITE_SIZE;
+            write.Priority   = writer->Priority;
+            if (srmw_fifo_put(&VFS_STATE.StOutWriteQ, write))
+            {
+                size -= nwrite;
+                bytes_written += nwrite;
+                writer->BaseAddress = (uint8_t*) newbuf;
+                writer->FileOffset += VFS_WRITE_SIZE;
+                writer->DataOffset  = 0;
+            }
+            else return false;
+        }
+        else
+        {   // this write only partially fills up the buffer.
+            size -= nwrite;
+            bytes_written += nwrite;
+            memcpy(&writer->BaseAddress[writer->DataOffset], srcbuf, nwrite);
+            writer->DataOffset += nwrite;
+        }
+    }
+}
+
+/// @summary Closes a file previously opened using create_stream(), and atomically
+/// renames that file to move it to the specified path.
+/// @param writer The stream writer state returned from the create stream call.
+/// @param path The target path and filename of the file, or NULL to delete the file.
+/// @return true if the finalize operation was successfully queued.
+static bool platform_close_stream(stream_writer_t **writer, char const *path)
+{
+    stream_writer_t  *sw = *writer;
+    void           *addr =  sw->BaseAddress;
+    size_t            nb =  sw->DataOffset;
+    int64_t           fs =  sw->FileOffset + sw->DataOffset;
+    uint32_t    priority =  sw->Priority;
+    HANDLE            fd =  sw->Fildes;
+    WCHAR     *file_path =  NULL;
+    int           nchars =  0;
+
+    if (path != NULL)
+    {   // convert the destination path from UTF-8 to UCS-2.
+        nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+        if (nchars == 0)
+        {   // unable to convert UTF-8 to UCS-2; check GetLastError().
+            return false;
+        }
+        file_path = (WCHAR*) malloc(nchars * sizeof(WCHAR));
+        if (file_path == NULL)
+        {   // unable to allocate the UCS-2 path buffer.
+            return false;
+        }
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, file_path, nchars);
+    }
+
+    if (nb > 0)
+    {   // queue a write with the remaining data.
+        vfs_sowr_t       write;
+        write.Next       = NULL;
+        write.Fildes     = sw->Fildes;
+        write.FileOffset = sw->FileOffset;
+        write.DataBuffer = sw->BaseAddress;
+        write.DataSize   = VFS_WRITE_SIZE;
+        write.Priority   = sw->Priority;
+        if (srmw_fifo_put(&VFS_STATE.StOutWriteQ, write))
+        {   // the write was submitted; update the offset in case the close fails.
+            sw->FileOffset += VFS_WRITE_SIZE;
+            sw->DataOffset  = 0;
+        }
+        else
+        {   // unable to queue the final write; don't proceed with the close.
+            return false;
+        }
+    }
+    else if (addr != NULL)
+    {   // there's an empty buffer hanging around; free it now.
+        VirtualFree(addr, 0, MEM_RELEASE);
+    }
+
+    // submit the stream close request to the VFS.
+    vfs_socs_t     close;
+    close.Next     = NULL;
+    close.Fildes   = fd;
+    close.Priority = priority;
+    close.FilePath = file_path;
+    close.FileSize = fs;
+    if (srmw_fifo_put(&VFS_STATE.StOutCloseQ, close))
+    {   // the close was successfully submitted.
+        *writer = NULL;
+        free(sw);
+        return true;
+    }
+    else
+    {   // free the file path to avoid leaking memory.
+        if (close.FilePath != NULL) free(close.FilePath);
+        return false;
+    }
 }
 
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
-static aio_state_t AIO_STATE;
-static vfs_state_t VFS_STATE;
-static io_stats_t  IO_STATS;
+static int test_stream_in(int argc, char **argv, platform_layer_t *p)
+{
+    int64_t ss = 0;
+    int result = EXIT_SUCCESS;
+    bool  done = false;
+
+    init_io_stats(&IO_STATS);
+    create_aio_state(&AIO_STATE);
+    create_vfs_state(&VFS_STATE);
+
+    if (argc < 2)
+    {
+        fprintf(stderr, "ERROR: Missing required argument infile.\n");
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // start a stream-in.
+    if (p->open_stream(argv[1], 1234, 0, 0, STREAM_IN_LOOP, true, ss))
+    {
+        fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", argv[1], ss);
+        result = EXIT_SUCCESS;
+    }
+    else
+    {
+        fprintf(stderr, "ERROR: Unable to load file \'%s\'.\n", argv[1]);
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // run everything on the same thread, which isn't required.
+    // we could run VFS on one thread, AIO on another, or both on the same.
+    while (!done)
+    {   // update the VFS and AIO drivers. this generates AIO operations,
+        // updates stream-in status, and pushes data to the application.
+        vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+        aio_poll(&AIO_STATE);
+
+        if (VFS_STATE.ActiveCount == 0)
+        {   // we could have closed due to an error in this test case.
+            // normally, you wouldn't have this check.
+            done = true;
+        }
+
+        // process data received from the I/O system. normally, different
+        // threads would handle one or more file types, depending on what
+        // needs to be done with the data and who needs access to it.
+        for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
+        {
+            int32_t    type = int32_t(i); // the file_type_e.
+            vfs_sird_t read;
+            while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
+            {
+                if (read.OSError == 0)
+                {   // echo the data to stdout.
+                    // normally, you'd push the result to a callback.
+                    fwrite(read.DataBuffer, 1, read.DataAmount, stdout);
+                    // after the application has had a chance to process
+                    // the data, return the buffer so it can be used again.
+                    vfs_return_buffer(&VFS_STATE, type, read.DataBuffer);
+                }
+                else
+                {   // an error occurred, so display it and then exit.
+                    platform_print_ioerror(read.ASID, type, read.OSError, strerror(read.OSError));
+                    p->stop_stream(read.ASID);
+                    result = EXIT_FAILURE;
+                }
+            }
+
+            vfs_sies_t eos;
+            while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
+            {
+                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", eos.ASID);
+                p->rewind_stream(eos.ASID);
+            }
+        }
+    }
+
+cleanup:
+    delete_vfs_state(&VFS_STATE);
+    delete_aio_state(&AIO_STATE);
+    return result;
+}
+
+static int test_fileio_in(int argc, char **argv, platform_layer_t *p)
+{
+    size_t  nr = 0;
+    int64_t fo = 0;
+    int64_t ss = 0;
+    int result = EXIT_SUCCESS;
+    bool  done = false;
+    file_t *fp = NULL;
+    void  *buf = malloc(VFS_ALLOC_SIZE);
+
+    if (argc < 2)
+    {
+        fprintf(stderr, "ERROR: Missing required argument infile.\n");
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // open the file.
+    if (p->open_file(argv[1], true, ss, &fp))
+    {
+        fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", argv[1], ss);
+        result = EXIT_SUCCESS;
+    }
+    else
+    {
+        fprintf(stderr, "ERROR: Unable to load file \'%s\'.\n", argv[1]);
+        fprintf(stdout, "USAGE: a.out infile\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // read as much data as possible, write to stdout.
+    while (p->read_file(fp, fo, buf, VFS_ALLOC_SIZE, nr))
+    {
+        if (nr == 0)
+        {
+            fo  = 0;
+            continue;
+        }
+        else
+        {
+            fwrite(buf, 1, nr, stdout);
+            fo += nr;
+        }
+    }
+
+cleanup:
+    if (fp != NULL) p->close_file(&fp);
+    return result;
+}
 
 /// @summary Entry point of the application.
 /// @param argc The number of command-line arguments.
@@ -3379,17 +3601,23 @@ int main(int argc, char **argv)
     platform_layer_t platform_layer;
     int exit_code = EXIT_SUCCESS;
 
-    // set up the platform layer callbacks:
-    platform_layer.print_ioerror = platform_print_ioerror;
-    platform_layer.load_file     = platform_load_file;
-    platform_layer.save_file     = platform_save_file;
+    // set up the platform layer function pointers:
+    platform_layer.stream_in     = platform_stream_in;
+    platform_layer.open_stream   = platform_open_stream;
+    platform_layer.pause_stream  = platform_pause_stream;
+    platform_layer.resume_stream = platform_resume_stream;
+    platform_layer.rewind_stream = platform_rewind_stream;
+    platform_layer.seek_stream   = platform_seek_stream;
+    platform_layer.stop_stream   = platform_stop_stream;
     platform_layer.open_file     = platform_open_file;
-    platform_layer.close_file    = platform_close_file;
     platform_layer.read_file     = platform_read_file;
     platform_layer.write_file    = platform_write_file;
     platform_layer.flush_file    = platform_flush_file;
-    platform_layer.create_file   = platform_create_file;
-    platform_layer.finalize_file = platform_finalize_file;
+    platform_layer.close_file    = platform_close_file;
+    platform_layer.write_out     = platform_write_out;
+    platform_layer.create_stream = platform_create_stream;
+    platform_layer.append_stream = platform_append_stream;
+    platform_layer.close_stream  = platform_close_stream;
 
     // initialize the high-resolution timer on the system.
     inittime();
