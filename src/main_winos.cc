@@ -137,6 +137,7 @@ typedef struct _FILE_NAME_INFO {
 #include <string.h>
 #include <intrin.h>
 #include <windows.h>
+#include <inttypes.h>
 
 #include "bridge.h"
 
@@ -481,11 +482,11 @@ struct vfs_io_opq_t
 /// is used to determine which files get a chance to submit I/O operations.
 struct vfs_io_fpq_t
 {
-    #define MF         MAX_OPEN_FILES
+    #define MS         MAX_STREAMS_IN
     int32_t            Count;        /// The number of items in the queue.
-    uint32_t           Priority[MF]; /// The priority value for each file.
-    uint16_t           RecIndex[MF]; /// The index of the file record.
-    #undef MF
+    uint32_t           Priority[MS]; /// The priority value for each file.
+    uint16_t           RecIndex[MS]; /// The index of the file record.
+    #undef MS
 };
 
 /// @summary Defines the state data maintained by a VFS driver instance.
@@ -499,7 +500,7 @@ struct vfs_state_t
     vfs_sicreateq_t    StInCreateQ;  /// Stream-in create operation queue.
     iobuf_alloc_t      IoAllocator;  /// The I/O buffer allocator.
     size_t             ActiveCount;  /// The number of open files.
-    intptr_t           StInAFID[MS]; /// An application-defined ID for each active file.
+    intptr_t           StInASID[MS]; /// An application-defined ID for each active file.
     int32_t            StInType[MS]; /// One of file_mode_e for each active file.
     uint32_t           Priority[MS]; /// The access priority for each active file.
     int64_t            RdOffset[MS]; /// The current read offset for each active file.
@@ -1556,9 +1557,9 @@ static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     // will either fail, or are implemented as a non-atomic file copy. the path
     // we return will contain the full volume and directory information from the
     // input path, and append a filename of the form prefix-######## to it.
-    pathend(path, dirlen, pathlen);       // get the path portion of the input string.
-    pfxlen = wcslen(prefix);              // get the length of the prefix string.
-    nbytes = dirlen > 0 ? dirlen  : -1;   // get the number of bytes of volume and directory info.
+    pathend(path, dirlen, pathlen);          // get the path portion of the input string.
+    pfxlen = wcslen(prefix);                 // get the length of the prefix string.
+    nbytes = dirlen > 0 ? int(dirlen)  : -1; // get the number of bytes of volume and directory info.
     nchars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, nbytes, NULL, 0);
     if (dirlen > 0 && nchars == 0)
     {   // the path cannot be converted from UTF-8 to UCS-2.
@@ -1567,18 +1568,18 @@ static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     // allocate storage for the path string, converted to UCS-2.
     // the output path has the form:
     // <volume and directory info from path>\<prefix>-########\0
-    nchars =  nchars + 1 + pfxlen + 10;            // + '\\' + prefix + '-' + '########\0'
+    nchars =  int(nchars + 1 + pfxlen + 10);
     temp   = (WCHAR*) malloc(nchars * sizeof(WCHAR));
     if (temp == NULL) return NULL;
     memset(temp, 0, nchars * sizeof(WCHAR));
     if (dirlen > 0)
     {   // the output path has volume and directory information specified.
         // convert this data from UTF-8 to UCS-2 and append a directory separator.
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, dirlen, temp, nchars);
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, int(dirlen), temp, nchars);
         wcscat(temp, L"\\");
     }
     wcscat(temp, prefix);
-    wcscar(temp, L"-");
+    wcscat(temp, L"-");
 
     // generate a 32-bit 'random' value and convert it to an eight-digit hex value.
     // start with the current tick count, and then mix the bits using the 4-byte
@@ -1590,7 +1591,7 @@ static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     bits  = (bits + 0xd3a2646c) ^ (bits <<  9);
     bits  = (bits + 0xfd7046c5) + (bits <<  3);
     bits  = (bits ^ 0xb55a4f09) ^ (bits >> 16);
-    swprintf(random, 9, "%08x", bits);
+    swprintf(random, 9, L"%08x" ,  bits);
     random[8]  = 0;
     wcscat(temp, random);
     return temp;
@@ -1870,14 +1871,12 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
 static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
 {
-    int   nchartp = 0;    // number of characters in target path; MultiByteToWideChar().
     DWORD ncharsp = 0;    // number of characters in source path; GetFinalPathNameByHandle().
     size_t  ssize = 0;    // the disk physical sector size, in bytes.
     int64_t lsize = 0;    // the logical file size, in bytes
     int64_t psize = 0;    // the physical disk allocation size, in bytes.
-    char  *tpath  = (char*) req.DataBuffer;
+    WCHAR *target = (WCHAR*) req.DataBuffer;
     WCHAR *source = NULL;
-    WCHAR *target = NULL;
     FILE_END_OF_FILE_INFO eof;
     FILE_ALLOCATION_INFO  sec;
 
@@ -1888,20 +1887,10 @@ static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
     {   // couldn't allocate the temporary buffer for the source path.
         goto error_cleanup;
     }
-    GetFinalPathNameByHandle_Func(req.Fildes, source, ntchars, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    GetFinalPathNameByHandle_Func(req.Fildes, source, ncharsp, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
 
     // is the temporary file being deleted, or is it being moved?
-    if (tpath != NULL)
-    {   // the file is being moved, so convert the destination path.
-        nchartp = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, tpath, -1, NULL, 0);
-        target  = (WCHAR*) malloc(nchartp * sizeof(WCHAR));
-        if (nchartp == 0 || target == NULL)
-        {   // couldn't allocate the temporary buffer for the target path.
-            goto error_cleanup;
-        }
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchartp);
-    }
-    else
+    if (target == NULL)
     {   // handle the simple case of deleting the temporary file.
         srsw_fifo_put(&aio->CloseResults, aio_result(0, 0, req));
         CloseHandle(req.Fildes);
@@ -2231,6 +2220,7 @@ static bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HAND
             return false;
         }
     }
+    return false;
 }
 
 /// @summary Processes queued commands for creating a new stream-in.
@@ -2253,7 +2243,6 @@ static void vfs_process_sicreate(vfs_state_t *vfs)
         vfs->Priority[index]             = req.Priority;
         vfs->RdOffset[index]             = 0;
         vfs->StInInfo[index].Fildes      = req.Fildes;
-        vfs->StInInfo[index].Eventfd     = req.Eventfd;
         vfs->StInInfo[index].FileSize    = req.FileSize;
         vfs->StInInfo[index].DataSize    = req.DataSize;
         vfs->StInInfo[index].FileOffset  = req.FileOffset;
@@ -2382,7 +2371,7 @@ static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
     {   // no need to return anything to the platform layer.
         if (res.DataBuffer != NULL)
         {   // free the fixed-size write buffer.
-            VirtualFree(res.DataBuffer, VFS_WRITE_SIZE);
+            VirtualFree(res.DataBuffer, 0, MEM_RELEASE);
         }
     }
 }
@@ -2495,7 +2484,7 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
             {   // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
                 req->Fildes     = vfs->StInInfo[index].Fildes;
-                req->DataAmount = read_amount;
+                req->DataAmount = uint32_t(read_amount);
                 req->BaseOffset = vfs->StInInfo[index].FileOffset;
                 req->FileOffset = vfs->RdOffset[index];
                 req->DataBuffer = iobuf_get(allocator);
@@ -2572,7 +2561,7 @@ static bool vfs_update_stream_out(vfs_state_t *vfs)
             req->DataBuffer = write.DataBuffer;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
-            req->AFID       = write.Fildes;
+            req->AFID       = 0;
             req->Type       = 0;
             req->Reserved   = 0;
         }
@@ -2592,14 +2581,13 @@ static bool vfs_update_stream_out(vfs_state_t *vfs)
         {   // populate the (already queued) request.
             req->Command    = AIO_COMMAND_FINAL;
             req->Fildes     = close.Fildes;
-            req->Eventfd    = close.Eventfd;
             req->DataAmount = 0;
             req->BaseOffset = 0;
             req->FileOffset = close.FileSize;
             req->DataBuffer = NULL;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
-            req->AFID       = close.Fildes;
+            req->AFID       = 0;
             req->Type       = 0;
             req->Reserved   = 0;
         }
@@ -2776,7 +2764,18 @@ static void null_write_func(intptr_t app_id, int32_t type, void const *data, int
 static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
 #ifdef DEBUG
-    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(error_code));
+    LPSTR  buffer = NULL;
+    size_t size   = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | 
+        FORMAT_MESSAGE_FROM_SYSTEM     | 
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, 
+        error_code, 
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+        (LPSTR)&buffer, 
+        0, NULL);
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, buffer);
+    if (buffer != NULL) LocalFree(buffer);
 #else
     // in release mode, all parameters are unused. suppress compiler warnings.
     (void) sizeof(app_id);
@@ -2793,8 +2792,18 @@ static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, 
 /// @param error_message An optional string description of the error.
 static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
-    int errn = int(error_code);
-    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(errn));
+    LPSTR  buffer = NULL;
+    size_t size   = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | 
+        FORMAT_MESSAGE_FROM_SYSTEM     | 
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, 
+        error_code, 
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+        (LPSTR)&buffer, 
+        0, NULL);
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, buffer);
+    if (buffer != NULL) LocalFree(buffer);
 }
 
 /// @summary Opens a file for streaming data to the application. The file will be
@@ -2977,7 +2986,7 @@ static bool platform_open_file(char const *path, bool read_only, int64_t &file_s
     }
 
     // open the file with the requested access and flags.
-    if ((fd == CreateFile(path-conv, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
+    if ((fd = CreateFile(pathbuf, access, share, NULL, create, flags, NULL)) == INVALID_HANDLE_VALUE)
     {   // the file could not be opened; check GetLastError().
         goto error_cleanup;
     }
@@ -3027,7 +3036,7 @@ static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_
     while (size > 0)
     {
         DWORD nread  = 0;
-        DWORD toread = size <= 0xFFFFFFFFU ? size : 0xFFFFFFFFU;
+        DWORD toread = size <= 0xFFFFFFFFU ? DWORD(size) : 0xFFFFFFFFU;
         DWORD err    = ERROR_SUCCESS;
         if (ReadFile(file->Fildes, &b[bytes_read], toread, &nread, NULL))
         {
@@ -3075,7 +3084,7 @@ static bool platform_write_file(file_t *file, int64_t offset, void const *buffer
     while (size > 0)
     {
         DWORD nwrite  = 0;
-        DWORD towrite = size <= 0xFFFFFFFFU ? size : 0xFFFFFFFFU;
+        DWORD towrite = size <= 0xFFFFFFFFU ? DWORD(size) : 0xFFFFFFFFU;
         if (WriteFile(file->Fildes, &b[bytes_written], towrite, &nwrite, NULL))
         {
             bytes_written += nwrite;
@@ -3106,9 +3115,10 @@ static bool platform_close_file(file_t **file)
     *file  = NULL;
     if (f != NULL)
     {
-        if (f->Fildes != -1) CloseHandle(f->Fildes);
+        if (f->Fildes != INVALID_HANDLE_VALUE) CloseHandle(f->Fildes);
         free(f);
     }
+    return true;
 }
 
 /// @summary Saves a file to disk. If the file exists, it is overwritten. This
@@ -3198,7 +3208,7 @@ static bool platform_write_out(char const *path, void const *data, int64_t size)
         DWORD   nwrite = 0;
         while  (amount < sector_bytes)
         {
-            DWORD n = (sector_bytes - amount) < 0xFFFFFFFFU ? (sector_bytes - amount) : 0xFFFFFFFFU;
+            DWORD n = (sector_bytes - amount) < 0xFFFFFFFFU ? DWORD(sector_bytes - amount) : 0xFFFFFFFFU;
             WriteFile(fd, &buffer[amount], n, &nwrite, NULL);
             amount += nwrite;
         }
@@ -3358,7 +3368,7 @@ static bool platform_append_stream(stream_writer_t *writer, void const *data, ui
             write.Priority   = writer->Priority;
             if (srmw_fifo_put(&VFS_STATE.StOutWriteQ, write))
             {
-                size -= nwrite;
+                size -= uint32_t(nwrite);
                 bytes_written += nwrite;
                 writer->BaseAddress = (uint8_t*) newbuf;
                 writer->FileOffset += VFS_WRITE_SIZE;
@@ -3368,12 +3378,13 @@ static bool platform_append_stream(stream_writer_t *writer, void const *data, ui
         }
         else
         {   // this write only partially fills up the buffer.
-            size -= nwrite;
+            size -= uint32_t(nwrite);
             bytes_written += nwrite;
             memcpy(&writer->BaseAddress[writer->DataOffset], srcbuf, nwrite);
             writer->DataOffset += nwrite;
         }
     }
+    return true;
 }
 
 /// @summary Closes a file previously opened using create_stream(), and atomically
@@ -3509,7 +3520,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             vfs_sird_t read;
             while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
             {
-                if (read.OSError == 0)
+                if (SUCCEEDED(read.OSError))
                 {   // echo the data to stdout.
                     // normally, you'd push the result to a callback.
                     fwrite(read.DataBuffer, 1, read.DataAmount, stdout);
@@ -3528,8 +3539,8 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             vfs_sies_t eos;
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
-                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", eos.ASID);
-                p->rewind_stream(eos.ASID);
+                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
+                p->stop_stream(eos.ASID);
             }
         }
     }
@@ -3546,7 +3557,6 @@ static int test_fileio_in(int argc, char **argv, platform_layer_t *p)
     int64_t fo = 0;
     int64_t ss = 0;
     int result = EXIT_SUCCESS;
-    bool  done = false;
     file_t *fp = NULL;
     void  *buf = malloc(VFS_ALLOC_SIZE);
 
@@ -3628,6 +3638,8 @@ int main(int argc, char **argv)
     elevate_process_privileges();
 
     // TODO: dynamically load the application code.
+    //exit_code = test_stream_in(argc, argv, &platform_layer);
+    platform_write_out("C:\\Users\\rklenk\\abc.txt", "Hello, write out!", strlen("Hello, write out!"));
 
     exit(exit_code);
 }
