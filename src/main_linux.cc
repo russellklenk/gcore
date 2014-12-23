@@ -1906,6 +1906,7 @@ static bool vfs_resolve_file_read(char const *path, int hints, int &fd, int &efd
             return false;
         }
     }
+    return false;
 }
 
 /// @summary Processes queued commands for creating a new stream-in.
@@ -2170,7 +2171,7 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
                 req->Command    = AIO_COMMAND_READ;
                 req->Fildes     = vfs->StInInfo[index].Fildes;
                 req->Eventfd    = vfs->StInInfo[index].Eventfd;
-                req->DataAmount = read_amount;
+                req->DataAmount = uint32_t(read_amount);
                 req->BaseOffset = vfs->StInInfo[index].FileOffset;
                 req->FileOffset = vfs->RdOffset[index];
                 req->DataBuffer = iobuf_get(allocator);
@@ -2452,7 +2453,7 @@ static void null_write_func(intptr_t app_id, int32_t type, void const *data, int
 static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
 #ifdef DEBUG
-    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(error_code));
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(error_code));
 #else
     // in release mode, all parameters are unused. suppress compiler warnings.
     (void) sizeof(app_id);
@@ -2470,7 +2471,7 @@ static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, 
 static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
     int errn = int(error_code);
-    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(errn));
+    fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, strerror(errn));
 }
 
 /// @summary Opens a file for streaming data to the application. The file will be
@@ -2686,8 +2687,8 @@ static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_
         ssize_t nread  =  read(file->Fildes, &b[bytes_read], size);
         if (nread > 0)
         {   // the read has completed successfully and returned data.
-            bytes_read += nread;
-            size       -= nread;
+            bytes_read += size_t(nread);
+            size       -= size_t(nread);
         }
         else if (nread == 0)
         {   // end-of-file was encountered.
@@ -2723,8 +2724,8 @@ static bool platform_write_file(file_t *file, int64_t offset, void const *buffer
         ssize_t nwrite = write(file->Fildes, &b[bytes_written], size);
         if (nwrite > 0)
         {   // the write has completed successfully.
-            bytes_written += nwrite;
-            size          -= nwrite;
+            bytes_written += size_t(nwrite);
+            size          -= size_t(nwrite);
         }
         else
         {   // an error occurred; check errno.
@@ -2754,6 +2755,7 @@ static bool platform_close_file(file_t **file)
         if (f->Fildes != -1) close(f->Fildes);
         free(f);
     }
+    return true;
 }
 
 /// @summary Saves a file to disk. If the file exists, it is overwritten. This
@@ -3025,7 +3027,7 @@ static bool platform_append_stream(stream_writer_t *writer, void const *data, ui
             write.Priority   = writer->Priority;
             if (srmw_fifo_put(&VFS_STATE.StOutWriteQ, write))
             {
-                size -= nwrite;
+                size -= uint32_t(nwrite);
                 bytes_written += nwrite;
                 writer->BaseAddress = (uint8_t*) newbuf;
                 writer->FileOffset += VFS_WRITE_SIZE;
@@ -3035,12 +3037,13 @@ static bool platform_append_stream(stream_writer_t *writer, void const *data, ui
         }
         else
         {   // this write only partially fills up the buffer.
-            size -= nwrite;
+            size -= uint32_t(nwrite);
             bytes_written += nwrite;
             memcpy(&writer->BaseAddress[writer->DataOffset], srcbuf, nwrite);
             writer->DataOffset += nwrite;
         }
     }
+    return true;
 }
 
 /// @summary Closes a file previously opened using create_stream(), and atomically
@@ -3185,7 +3188,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             vfs_sies_t eos;
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
-                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", eos.ASID);
+                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
                 p->rewind_stream(eos.ASID);
             }
         }
