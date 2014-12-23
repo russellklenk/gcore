@@ -10,6 +10,21 @@
 #define COMPILER_MFENCE_READ_WRITE _ReadWriteBarrier()
 #define never_inline               __declspec(noinline)
 
+/*////////////////
+//   Includes   //
+////////////////*/
+#include <stdio.h>
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <intrin.h>
+#include <windows.h>
+#include <inttypes.h>
+
+#include "bridge.h"
+
 #ifdef __GNUC__
 #ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
     #define QUOTA_LIMITS_HARDWS_MIN_ENABLE     0x00000001
@@ -125,21 +140,6 @@ typedef struct _FILE_NAME_INFO {
 } FILE_NAME_INFO, *PFILE_NAME_INFO;
 #endif /* __GNUC__ <= 4.9 - MinGW */
 #endif /* __GNUC__ comple - MinGW */
-
-/*////////////////
-//   Includes   //
-////////////////*/
-#include <stdio.h>
-#include <assert.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <intrin.h>
-#include <windows.h>
-#include <inttypes.h>
-
-#include "bridge.h"
 
 /*/////////////////
 //   Constants   //
@@ -573,12 +573,14 @@ static io_stats_t  IO_STATS;
 typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
 typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
 typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+typedef BOOL (WINAPI *GetQueuedCompletionStatusExFn)(HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL);
 typedef DWORD(WINAPI *GetFinalPathNameByHandleFn)(HANDLE, LPWSTR, DWORD, DWORD);
 
-static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
-static GetFinalPathNameByHandleFn   GetFinalPathNameByHandle_Func   = NULL;
-static SetProcessWorkingSetSizeExFn SetProcessWorkingSetSizeEx_Func = NULL;
-static SetFileInformationByHandleFn SetFileInformationByHandle_Func = NULL;
+static GetNativeSystemInfoFn         GetNativeSystemInfo_Func         = NULL;
+static GetFinalPathNameByHandleFn    GetFinalPathNameByHandle_Func    = NULL;
+static SetProcessWorkingSetSizeExFn  SetProcessWorkingSetSizeEx_Func  = NULL;
+static SetFileInformationByHandleFn  SetFileInformationByHandle_Func  = NULL;
+static GetQueuedCompletionStatusExFn GetQueuedCompletionStatusEx_Func = NULL;
 
 /*///////////////////////
 //   Local Functions   //
@@ -612,16 +614,19 @@ static void resolve_kernel_apis(void)
     HMODULE kernel = GetModuleHandleA("kernel32.dll");
     if (kernel != NULL)
     {
-        GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
-        GetFinalPathNameByHandle_Func   = (GetFinalPathNameByHandleFn)   GetProcAddress(kernel, "GetFinalPathNameByHandleW");
-        SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
-        SetFileInformationByHandle_Func = (SetFileInformationByHandleFn) GetProcAddress(kernel, "SetFileInformationByHandle");
+        GetNativeSystemInfo_Func         = (GetNativeSystemInfoFn)          GetProcAddress(kernel, "GetNativeSystemInfo");
+        GetFinalPathNameByHandle_Func    = (GetFinalPathNameByHandleFn)     GetProcAddress(kernel, "GetFinalPathNameByHandleW");
+        SetProcessWorkingSetSizeEx_Func  = (SetProcessWorkingSetSizeExFn)   GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        SetFileInformationByHandle_Func  = (SetFileInformationByHandleFn)   GetProcAddress(kernel, "SetFileInformationByHandle");
+        GetQueuedCompletionStatusEx_Func = (GetQueuedCompletionStatusExFn)  GetProcAddress(kernel, "GetQueuedCompletionStatusEx");
     }
     // fallback if any of these APIs are not available.
     if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
     if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
     // TODO: should fail if Vista+ APIs are not available. Or not be lazy and implement fallbacks.
+    // for GetFinalPathNameByHandle, see:
     // cbloomrants.blogspot.com/2012/12/12-21-12-file-handle-to-file-name-on.html
+    // GetQueuedCompletionStatusEx is Vista+ only also.
 }
 
 /// @summary Elevates the privileges for the process to include the privilege
@@ -1942,7 +1947,7 @@ static int aio_tick(aio_state_t *aio, DWORD timeout)
 {   // poll kernel AIO for any completed events, and process them first.
     OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];  // STACK: 8-16KB depending on OS.
     ULONG nevents = 0;
-    BOOL  iocpres = GetQueuedCompletionStatusEx(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
+    BOOL  iocpres = GetQueuedCompletionStatusEx_Func(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
     if (iocpres && nevents > 0)
     {   // kernel AIO reported one or more events are ready.
         for (ULONG i = 0; i < nevents; ++i)
