@@ -1878,7 +1878,6 @@ static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
     WCHAR *target = (WCHAR*) req.DataBuffer;
     WCHAR *source = NULL;
     FILE_END_OF_FILE_INFO eof;
-    FILE_ALLOCATION_INFO  sec;
 
     // get the absolute path of the temporary file (the source file).
     ncharsp = GetFinalPathNameByHandle_Func(req.Fildes, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
@@ -1900,13 +1899,11 @@ static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
     }
 
     // the file needs to be moved into place. set the file size.
+    lsize = req.FileOffset;
+    eof.EndOfFile.QuadPart = lsize;
     ssize = physical_sector_size(req.Fildes);
     psize = align_up(req.FileOffset, ssize);
-    lsize = req.FileOffset;
-    eof.EndOfFile.QuadPart      = lsize;
-    sec.AllocationSize.QuadPart = psize;
-    SetFileInformationByHandle_Func(req.Fildes, FileAllocationInfo , &sec, sizeof(sec));
-    SetFileInformationByHandle_Func(req.Fildes, FileEndOfFileInfo  , &eof, sizeof(eof));
+    SetFileInformationByHandle_Func(req.Fildes, FileEndOfFileInfo, &eof, sizeof(eof));
     SetFileValidData(req.Fildes, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
 
     // close the open file handle, and move the file into place.
@@ -3186,11 +3183,8 @@ static bool platform_write_out(char const *path, void const *data, int64_t size)
     }
     sector_size = physical_sector_size(fd);
     file_size   = align_up(size, sector_size);
-    eof.EndOfFile.QuadPart      = size;
     sec.AllocationSize.QuadPart = file_size;
     SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
-    SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
-    SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
 
     // copy the data extending into the tail sector into the overage buffer.
     sector_count = size_t (size / sector_size);
@@ -3219,6 +3213,11 @@ static bool platform_write_out(char const *path, void const *data, int64_t size)
         DWORD w = (DWORD) 0;
         WriteFile(fd, sector_buffer, n, &w, NULL);
     }
+
+    // set the correct end-of-file marker.
+    eof.EndOfFile.QuadPart      = size;
+    SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
+    SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
 
     // close the file, and move it to the destination path.
     CloseHandle(fd); fd = INVALID_HANDLE_VALUE;
@@ -3289,10 +3288,7 @@ static bool platform_create_stream(char const *where, uint32_t priority, int64_t
         sector_size = physical_sector_size(fd);
         file_size   = align_up(reserve_size, sector_size);
         sec.AllocationSize.QuadPart = file_size;
-        eof.EndOfFile.QuadPart      = reserve_size;
         SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
-        SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
-        SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
     }
 
     // now use VirtualAlloc to allocate a buffer for combining small writes.
