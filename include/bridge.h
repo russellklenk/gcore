@@ -13,6 +13,37 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*////////////////////
+//   Preprocessor   //
+////////////////////*/
+/// @summary Tag used to mark a function as available for use outside of the
+/// current translation unit (the default visibility).
+#ifndef export_function
+#define export_function
+#endif
+
+/// @summary Tag used to mark a function as available for public use, but not
+/// exported outside of the translation unit.
+#ifndef public_function
+#define public_function   static
+#endif
+
+/// @summary Tag used to mark a function internal to the translation unit.
+#ifndef internal_function
+#define internal_function static
+#endif
+
+/// @summary Tag used to mark a variable as local to a function, and persistent
+/// across invocations of that function.
+#ifndef local_persist
+#define local_persist     static
+#endif
+
+/// @summary Tag used to mark a variable as global to the translation unit.
+#ifndef global_variable
+#define global_variable   static
+#endif
+
 /*/////////////////
 //   Constants   //
 /////////////////*/
