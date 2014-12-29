@@ -289,24 +289,6 @@ struct aio_state_t
     #undef MA
 };
 
-/// @summary Signature for a function used to push data to a decoder stream.
-/// @param s The decoder stream to which the data is being pushed.
-/// @param buffer The data buffer containing the encoded data.
-/// @param size The number of bytes of encoded data.
-/// @return true if the decoder accepted the buffer.
-/// TODO: Should assert (s->Cursor == s->BufferEnd)
-typedef bool (*decode_push_fn)(stream_decoder_t *s, void *buffer, size_t size);
-
-/// @summary Data associated with a VFS file decoder stream. The decoder stream
-/// is used to perform any decryption, decompression, etc. to the raw file data
-/// so that the parsing layer can process it. The decoder input is the raw data
-/// returned by the AIO driver.
-struct vfs_sidecode_t
-{
-    stream_decoder_t  *DecodeState;  /// The persistent decoder state.
-    decode_push_fn     push_buffer;  /// Function to push data to the decoder.
-};
-
 /// @summary Defines the data associated with a stream in creation request passed
 /// to the VFS driver. This structure is intended for storage in a srmw_fifo_t.
 struct vfs_sics_t
@@ -322,8 +304,7 @@ struct vfs_sics_t
     int32_t            Behavior;     /// The behavior at end-of-stream, one of stream_in_mode_e.
     uint32_t           Priority;     /// The file access priority (0 = highest).
     size_t             SectorSize;   /// The physical sector size of the disk.
-    stream_decoder_t  *DecodeState;  /// The initialized stream decoder state.
-    decode_push_fn     decode_push;  /// The function to push data to the decoder.
+    stream_decoder_t  *Decoder;      /// The initialized stream decoder state.
 };
 
 /// @summary Defines the data associated with a stream-in control operation,
@@ -345,8 +326,7 @@ struct vfs_sird_t
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation.
     uint32_t           DataAmount;   /// The amount of data transferred.
     int                OSError;      /// The error code returned by the operation, or 0.
-    stream_decoder_t  *DecodeState;  /// The stream decoder state.
-    decode_push_fn     decode_push;  /// The function to call to push data to the decoder.
+    stream_decoder_t  *Decoder;      /// The stream decoder state.
 };
 
 /// @summary Defines the data associated with an end-of-stream notification.
@@ -462,7 +442,7 @@ struct vfs_state_t
     vfs_siendq_t       SiEndOfS[NT]; /// The per-file type queue for stream-in end-of-stream events.
     size_t             SiDecCount;   /// The number of stream-in with active decode state.
     intptr_t           SiDecASID[MD];/// The stream ID for each active-decode stream-in.
-    vfs_sidecode_t     SiDecInfo[MD];/// The decode state for each active-decode stream-in.
+    stream_decoder_t  *SiDecInfo[MD];/// The decode state for each active-decode stream-in.
     #undef NT       // per-file type
     #undef MS       // per-active stream
     #undef MD       // per-active decode
@@ -1939,8 +1919,10 @@ internal_function bool is_remote(int fd)
 /// For native files, the logical  and physical file size are the same.
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
+/// @param decoder On return, points to the initialized decoder instance used to decode
+/// the data. The specific decoder type depends on the source file type.
 /// @return true if the file could be resolved.
-internal_function bool vfs_resolve_file_read(char const *path, int hints, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+internal_function bool vfs_resolve_file_read(char const *path, int hints, int &fd, int &efd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size, stream_decoder_t *&decoder)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
@@ -1956,13 +1938,15 @@ internal_function bool vfs_resolve_file_read(char const *path, int hints, int &f
                 // never use O_DIRECT for files mounted with NFS or CIFS; these don't read correctly.
                 fcntl(fd, F_SETFL, O_RDONLY | O_LARGEFILE | O_DIRECT);
             }
-            lsize  = psize;
-            offset = 0;
+            decoder = new stream_decoder_t();
+            lsize   = psize;
+            offset  = 0;
             return true;
         }
         else
         {   // unable to open the file, so fail immediately.
             fd = efd = -1; lsize = psize = offset = sector_size = 0;
+            decoder = NULL;
             return false;
         }
     }
@@ -1981,22 +1965,27 @@ internal_function void vfs_process_sicreate(vfs_state_t *vfs)
             break;
         }
 
-        // the file is already open; it was opened during platform_load_file().
+        // the file is already open; it was opened during platform_open_stream().
         // all we need to do is update our internal active file list.
-        size_t index = vfs->ActiveCount++;
-        vfs->StInASID[index]             = req.ASID;
-        vfs->StInType[index]             = req.Type;
-        vfs->Priority[index]             = req.Priority;
-        vfs->RdOffset[index]             = 0;
-        vfs->StInInfo[index].Fildes      = req.Fildes;
-        vfs->StInInfo[index].Eventfd     = req.Eventfd;
-        vfs->StInInfo[index].FileSize    = req.FileSize;
-        vfs->StInInfo[index].DataSize    = req.DataSize;
-        vfs->StInInfo[index].FileOffset  = req.FileOffset;
-        vfs->StInInfo[index].SectorSize  = req.SectorSize;
-        vfs->StInInfo[index].EndBehavior = req.Behavior;
-        vfs->StInStat[index].NPendingAIO = 0;
-        vfs->StInStat[index].StatusFlags = VFS_STATUS_NONE;
+        size_t indexa = vfs->ActiveCount++;
+        vfs->StInASID[indexa]             = req.ASID;
+        vfs->StInType[indexa]             = req.Type;
+        vfs->Priority[indexa]             = req.Priority;
+        vfs->RdOffset[indexa]             = 0;
+        vfs->StInInfo[indexa].Fildes      = req.Fildes;
+        vfs->StInInfo[indexa].Eventfd     = req.Eventfd;
+        vfs->StInInfo[indexa].FileSize    = req.FileSize;
+        vfs->StInInfo[indexa].DataSize    = req.DataSize;
+        vfs->StInInfo[indexa].FileOffset  = req.FileOffset;
+        vfs->StInInfo[indexa].SectorSize  = req.SectorSize;
+        vfs->StInInfo[indexa].EndBehavior = req.Behavior;
+        vfs->StInStat[indexa].NPendingAIO = 0;
+        vfs->StInStat[indexa].StatusFlags = VFS_STATUS_NONE;
+
+        // save the stream decoder state, used when processing read data.
+        size_t indexd = vfs->SiDecCount++;
+        vfs->SiDecASID[indexd] = req.ASID;
+        vfs->SiDecInfo[indexd] = req.Decoder;
     }
 }
 
@@ -2032,11 +2021,16 @@ internal_function size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
         aio_req->Reserved   = 0;
 
         // delete the decoder state for the file immediately.
+        // it is possible that we will get completed reads for the
+        // stream after the close command is received, but if the
+        // caller has closed the stream, it is assumed that any
+        // outstanding data is not wanted and will be discarded.
         size_t      indexd  = 0;
         size_t const lastd  = vfs->SiDecCount - 1;
         if (vfs_decoder_by_asid(vfs, vfs->StInASID[i], indexd))
         {   // free resources associated with the decoder state.
-            free(vfs->SiDecInfo[indexd].DecodeState);
+            delete vfs->SiDecInfo[indexd];
+            vfs->SiDecInfo[indexd] = NULL;
             // swap the last decoder info into slot 'index'.
             vfs->SiDecASID[indexd] = vfs->SiDecASID[lastd];
             vfs->SiDecInfo[indexd] = vfs->SiDecInfo[lastd];
@@ -2099,10 +2093,13 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
     aio_res_t res;
     size_t    index = 0;
     while (srsw_fifo_get(&aio->ReadResults, res))
-    {
-        // locate the stream decoder state so we can pass it on to the platform layer.
+    {   // locate the stream decoder state so we can pass it on to the platform layer.
         if (vfs_decoder_by_asid(vfs, res.AFID, index) == false)
         {   // the stream has been stopped; don't report the data.
+            if (vfs_find_by_asid(vfs, res.AFID, index))
+            {   // decrement the number of pending I/O operations.
+                vfs->StInStat[index].NPendingAIO--;
+            }
             continue;
         }
 
@@ -2113,8 +2110,7 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
         read.FileOffset  = res.FileOffset; // this is the relative offset
         read.DataAmount  = res.DataAmount;
         read.OSError     = res.OSError;
-        read.DecodeState = vfs->SiDecInfo[index].DecodeState;
-        read.decode_push = vfs->SiDecInfo[index].push_buffer;
+        read.Decoder     = vfs->SiDecInfo[index];
         if (srsw_fifo_put(&vfs->SiResult[res.Type], read))
         {   // a single read operation has completed.
             if (vfs_find_by_asid(vfs, res.AFID, index))
@@ -2208,7 +2204,7 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
                     break;
                 case STREAM_IN_SEEK:
                     if ((op.Argument & (vfs->StInInfo[i].SectorSize-1)) != 0)
-                    {   // align up to the nearest sector size multiple.
+                    {   // round up to the nearest sector size multiple.
                         // then, subtract the sector size to get the next lowest multiple.
                         op.Argument  = align_up(op.Argument, vfs->StInInfo[i].SectorSize);
                         op.Argument -= vfs->StInInfo[i].SectorSize;
@@ -2478,11 +2474,10 @@ internal_function void delete_vfs_state(vfs_state_t *vfs)
     }
     for (size_t i = 0; i < vfs->SiDecCount; ++i)
     {
-        if (vfs->SiDecInfo[i].DecodeState != NULL)
+        if (vfs->SiDecInfo[i] != NULL)
         {
-            free(vfs->SiDecInfo[i].DecodeState);
-            vfs->SiDecInfo[i].DecodeState  = NULL;
-            vfs->SiDecInfo[i].push_buffer  = NULL;
+            delete vfs->SiDecInfo[i];
+            vfs->SiDecInfo[i] = NULL;
         }
     }
     vfs->SiDecCount = 0;
@@ -2585,12 +2580,13 @@ internal_function bool platform_open_stream(char const *path, intptr_t id, int32
     int64_t lsize  =  0;
     int64_t psize  =  0;
     int64_t offset =  0;
+    stream_decoder_t *decoder = NULL;
     if (mode == STREAM_IN_ONCE)
     {   // for files that will be streamed in only once, prefer unbuffered I/O.
         // this avoids polluting the page cache with their data.
         hint  = FILE_HINT_DIRECT;
     }
-    if (vfs_resolve_file_read(path, hint, fd, efd, lsize, psize, offset, ssize))
+    if (vfs_resolve_file_read(path, hint, fd, efd, lsize, psize, offset, ssize, decoder))
     {   // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
@@ -2604,6 +2600,7 @@ internal_function bool platform_open_stream(char const *path, intptr_t id, int32
         req.Behavior   = mode;
         req.Priority   = priority;
         req.SectorSize = ssize;
+        req.Decoder    = decoder;
         stream_size    = lsize;  // return the logical size to the caller
         return srmw_fifo_put(&VFS_STATE.StInCreateQ, req);
     }
@@ -2723,7 +2720,7 @@ internal_function bool platform_default_eos(intptr_t id, int32_t type, int32_t d
 /// @param file On return, this value is set to the file record used for subsequent operations.
 /// @return true if the file was opened.
 internal_function bool platform_open_file(char const *path, bool read_only, int64_t &file_size, file_t **file)
-{   // TODO: consider extending this to use vfs_resolve_file_read?
+{
     struct stat st;
     file_t *f = NULL;
     int flags = read_only ? (O_RDONLY | O_LARGEFILE) : (O_RDWR | O_LARGEFILE);
@@ -3263,7 +3260,18 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
                 if (read.OSError == 0)
                 {   // echo the data to stdout.
                     // normally, you'd push the result to a callback.
-                    fwrite(read.DataBuffer, 1, read.DataAmount, stdout);
+                    // note that all of the reading of the data is performed
+                    // through the stream decoder, which transparently performs
+                    // any decompression and/or decryption that might be necessary.
+                    read.Decoder->push(read.DataBuffer, read.DataAmount);
+                    do
+                    {
+                        size_t amount = read.Decoder->amount();
+                        void  *buffer = read.Decoder->Cursor;
+                        fwrite(buffer , 1, amount, stdout);
+                        read.Decoder->Cursor += amount;
+                    }
+                    while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process
                     // the data, return the buffer so it can be used again.
                     vfs_return_buffer(&VFS_STATE, type, read.DataBuffer);
@@ -3280,7 +3288,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
                 fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                p->rewind_stream(eos.ASID);
+                p->stop_stream(eos.ASID);//p->rewind_stream(eos.ASID);
             }
         }
     }

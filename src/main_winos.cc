@@ -24,6 +24,8 @@
 #include <inttypes.h>
 
 #include "bridge.h"
+#include "decode.cc"
+#include "datain.cc"
 
 #ifdef __GNUC__
 #ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
@@ -154,7 +156,15 @@ static uint64_t  const SEC_TO_NANOSEC = 1000000000ULL;
 static size_t    const IO_SYSTEM_RATE = 60;
 
 /// @summary Define the maximum number of concurrent stream-in files.
-static size_t    const MAX_STREAMS_IN = 16;
+#ifndef WINOS_MAX_STREAMS_IN
+#define WINOS_MAX_STREAMS_IN    16
+#endif
+static size_t    const MAX_STREAMS_IN = WINOS_MAX_STREAMS_IN;
+
+/// @summary Define the maximum number of concurrently active decoder streams.
+/// This needs to be larger than the maximum number of active stream-in files,
+/// as decode will lag behind I/O slightly in most cases.
+static size_t   const MAX_DECODER_IN = MAX_STREAMS_IN * 2;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
@@ -380,6 +390,7 @@ struct vfs_sics_t
     int32_t            Behavior;     /// The behavior at end-of-stream, one of stream_in_mode_e.
     uint32_t           Priority;     /// The file access priority (0 = highest).
     size_t             SectorSize;   /// The physical sector size of the disk.
+    stream_decoder_t  *Decoder;      /// The initialized stream decoder state.
 };
 
 /// @summary Defines the data associated with a stream-in control operation,
@@ -401,6 +412,7 @@ struct vfs_sird_t
     int64_t            FileOffset;   /// The absolute byte offset of the start of the operation.
     uint32_t           DataAmount;   /// The amount of data transferred.
     int                OSError;      /// The error code returned by the operation, or 0.
+    stream_decoder_t  *Decoder;      /// The stream decoder state.
 };
 
 /// @summary Defines the data associated with an end-of-stream notification.
@@ -492,6 +504,7 @@ struct vfs_io_fpq_t
 /// @summary Defines the state data maintained by a VFS driver instance.
 struct vfs_state_t
 {
+    #define MD         MAX_DECODER_IN
     #define MS         MAX_STREAMS_IN
     #define NT         FILE_TYPE_COUNT
     vfs_sowriteq_t     StOutWriteQ;  /// Stream-out write operation queue.
@@ -510,8 +523,12 @@ struct vfs_state_t
     vfs_siresultq_t    SiResult[NT]; /// The per-file type queue for stream-in I/O results.
     vfs_sireturnq_t    SiReturn[NT]; /// The per-file type queue for stream-in I/O buffer returns.
     vfs_siendq_t       SiEndOfS[NT]; /// The per-file type queue for stream-in end-of-stream events.
-    #undef NT
-    #undef MS
+    size_t             SiDecCount;   /// The number of stream-in with active decode state.
+    intptr_t           SiDecASID[MD];/// The stream ID for each active-decode stream-in.
+    stream_decoder_t  *SiDecInfo[MD];/// The decode state for each active-decode stream-in.
+    #undef NT       // per-file type
+    #undef MS       // per-active stream
+    #undef MD       // per-active decode
 };
 
 /// @summary Statistics tracked by the platform I/O system.
@@ -546,10 +563,10 @@ struct stream_writer_t
 //   Globals   //
 ///////////////*/
 /// @summary The frequency of the high-resolution timer on the system.
-static LARGE_INTEGER CLOCK_FREQUENCY  = {0};
+global_variable LARGE_INTEGER CLOCK_FREQUENCY  = {0};
 
 /// @summary A list of all of the file type identifiers we consider to be valid.
-static file_type_e   FILE_TYPE_LIST[] = {
+global_variable file_type_e   FILE_TYPE_LIST[] = {
     FILE_TYPE_DDS,
     FILE_TYPE_TGA,
     FILE_TYPE_WAV,
@@ -557,16 +574,16 @@ static file_type_e   FILE_TYPE_LIST[] = {
 };
 
 /// @summary A list of printable names for each valid file type identifier.
-static char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
+global_variable char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
     "DDS" , /* FILE_TYPE_DDS  */
     "TGA" , /* FILE_TYPE_TGA  */
     "WAV" , /* FILE_TYPE_WAV  */
     "JSON"  /* FILE_TYPE_JSON */
 };
 
-static vfs_state_t VFS_STATE;
-static aio_state_t AIO_STATE;
-static io_stats_t  IO_STATS;
+global_variable vfs_state_t VFS_STATE;
+global_variable aio_state_t AIO_STATE;
+global_variable io_stats_t  IO_STATS;
 
 // The following functions are not available under MinGW, so kernel32.dll is
 // loaded and these functions will be resolved manually.
@@ -576,18 +593,18 @@ typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, FILE_INFO_BY_HANDLE_
 typedef BOOL (WINAPI *GetQueuedCompletionStatusExFn)(HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL);
 typedef DWORD(WINAPI *GetFinalPathNameByHandleFn)(HANDLE, LPWSTR, DWORD, DWORD);
 
-static GetNativeSystemInfoFn         GetNativeSystemInfo_Func         = NULL;
-static GetFinalPathNameByHandleFn    GetFinalPathNameByHandle_Func    = NULL;
-static SetProcessWorkingSetSizeExFn  SetProcessWorkingSetSizeEx_Func  = NULL;
-static SetFileInformationByHandleFn  SetFileInformationByHandle_Func  = NULL;
-static GetQueuedCompletionStatusExFn GetQueuedCompletionStatusEx_Func = NULL;
+global_variable GetNativeSystemInfoFn         GetNativeSystemInfo_Func         = NULL;
+global_variable GetFinalPathNameByHandleFn    GetFinalPathNameByHandle_Func    = NULL;
+global_variable SetProcessWorkingSetSizeExFn  SetProcessWorkingSetSizeEx_Func  = NULL;
+global_variable SetFileInformationByHandleFn  SetFileInformationByHandle_Func  = NULL;
+global_variable GetQueuedCompletionStatusExFn GetQueuedCompletionStatusEx_Func = NULL;
 
 /*///////////////////////
 //   Local Functions   //
 ///////////////////////*/
 /// @summary Redirect a call to GetNativeSystemInfo to GetSystemInfo.
 /// @param sys_info The SYSTEM_INFO structure to populate.
-static void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
+internal_function void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
 {
     GetSystemInfo(sys_info);
 }
@@ -599,14 +616,14 @@ static void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
 /// @param maximum The maximum working set size, in bytes.
 /// @param flags Ignored. See MSDN for SetProcessWorkingSetSizeEx.
 /// @return See MSDN for SetProcessWorkingSetSize.
-static BOOL WINAPI SetProcessWorkingSetSizeEx_Fallback(HANDLE process, SIZE_T minimum, SIZE_T maximum, DWORD /*flags*/)
+internal_function BOOL WINAPI SetProcessWorkingSetSizeEx_Fallback(HANDLE process, SIZE_T minimum, SIZE_T maximum, DWORD /*flags*/)
 {
     return SetProcessWorkingSetSize(process, minimum, maximum);
 }
 
 /// @summary Loads function entry points that may not be available at compile
 /// time with some build environments.
-static void resolve_kernel_apis(void)
+internal_function void resolve_kernel_apis(void)
 {   // it's a safe assumption that kernel32.dll is mapped into our process
     // address space already, and will remain mapped for the duration of execution.
     // note that some of these APIs are Vista/WS2008+ only, so make sure that we
@@ -633,7 +650,7 @@ static void resolve_kernel_apis(void)
 /// SE_MANAGE_VOLUME_NAME, so that SetFileValidData() can be used to initialize
 /// a file without having to zero-fill the underlying sectors. This is optional,
 /// and we don't want it failing to prevent the application from launching.
-static void elevate_process_privileges(void)
+internal_function void elevate_process_privileges(void)
 {
     TOKEN_PRIVILEGES tp;
     HANDLE        token;
@@ -664,7 +681,7 @@ static void elevate_process_privileges(void)
 /// @param size The size value to round up.
 /// @param pow2 The power-of-two alignment.
 /// @return The input size, rounded up to the nearest even multiple of pow2.
-static inline size_t align_up(size_t size, size_t pow2)
+internal_function inline size_t align_up(size_t size, size_t pow2)
 {
     assert((pow2 & (pow2-1)) == 0);
     return (size == 0) ? pow2 : ((size + (pow2-1)) & ~(pow2-1));
@@ -674,7 +691,7 @@ static inline size_t align_up(size_t size, size_t pow2)
 /// @param size The size value to round up.
 /// @param pow2 The power-of-two alignment.
 /// @return The input size, rounded up to the nearest even multiple of pow2.
-static inline int64_t align_up(int64_t size, size_t pow2)
+internal_function inline int64_t align_up(int64_t size, size_t pow2)
 {
     assert((pow2 & (pow2-1)) == 0);
     return (size == 0) ? int64_t(pow2) : ((size + int64_t(pow2-1)) & ~int64_t(pow2-1));
@@ -684,20 +701,20 @@ static inline int64_t align_up(int64_t size, size_t pow2)
 /// @param size The size value to clamp.
 /// @param limit The upper-bound to clamp to.
 /// @return The smaller of size and limit.
-static inline size_t clamp_to(size_t size, size_t limit)
+internal_function inline size_t clamp_to(size_t size, size_t limit)
 {
     return (size > limit) ? limit : size;
 }
 
 /// @summary Initializes the high-resolution timer.
-static inline void inittime(void)
+internal_function inline void inittime(void)
 {
     QueryPerformanceFrequency(&CLOCK_FREQUENCY);
 }
 
 /// @summary Reads the current tick count for use as a timestamp.
 /// @return The current timestamp value, in nanoseconds.
-static inline uint64_t nanotime(void)
+internal_function inline uint64_t nanotime(void)
 {
     LARGE_INTEGER tsc = {0};
     LARGE_INTEGER tsf = CLOCK_FREQUENCY;
@@ -709,7 +726,7 @@ static inline uint64_t nanotime(void)
 /// Ensure that this function is not inlined by the compiler.
 /// @param address The address to write to. This address must be 32-bit aligned.
 /// @param value The value to write to address.
-static never_inline void atomic_write_uint32_aligned(uintptr_t address, uint32_t value)
+internal_function never_inline void atomic_write_uint32_aligned(uintptr_t address, uint32_t value)
 {
     assert((address & 0x03) == 0);                  // assert address is 32-bit aligned
     uint32_t *p  = (uint32_t*) address;
@@ -720,7 +737,7 @@ static never_inline void atomic_write_uint32_aligned(uintptr_t address, uint32_t
 /// Ensure that this function is not inlined by the compiler.
 /// @param address The address to write to. This address must be aligned to the pointer size.
 /// @param value The value to write to address.
-static never_inline void atomic_write_pointer_aligned(uintptr_t address, uintptr_t value)
+internal_function never_inline void atomic_write_pointer_aligned(uintptr_t address, uintptr_t value)
 {
     assert((address & (sizeof(uintptr_t)-1)) == 0); // assert address is pointer-size aligned
     uintptr_t *p = (uintptr_t*) address;
@@ -731,7 +748,7 @@ static never_inline void atomic_write_pointer_aligned(uintptr_t address, uintptr
 /// Ensure that this function is not inlined by the compiler.
 /// @param address The address to write to. This address must be 32-bit aligned.
 /// @return The value read from the specified address.
-static never_inline uint32_t atomic_read_uint32_aligned(uintptr_t address)
+internal_function never_inline uint32_t atomic_read_uint32_aligned(uintptr_t address)
 {
     assert((address & 0x03) == 0);
     volatile uint32_t *p = (uint32_t*) address;
@@ -741,7 +758,7 @@ static never_inline uint32_t atomic_read_uint32_aligned(uintptr_t address)
 /// @summary Clears or initializes a SRSW fixed lookaside queue to empty.
 /// @param srswq The queue to initialize.
 /// @param capacity The queue capacity. This must be a power-of-two.
-static inline void srsw_flq_clear(srsw_flq_t &srswq, uint32_t capacity)
+internal_function inline void srsw_flq_clear(srsw_flq_t &srswq, uint32_t capacity)
 {
     assert((capacity & (capacity-1)) == 0); // capacity is a power-of-two.
     srswq.PushedCount = 0;
@@ -752,7 +769,7 @@ static inline void srsw_flq_clear(srsw_flq_t &srswq, uint32_t capacity)
 /// @summary Retrieves the number of items currently available in a SRSW fixed
 /// lookaside queue. Do not pop more than the number of items returned by this call.
 /// @param srswq The queue to query.
-static inline uint32_t srsw_flq_count(srsw_flq_t &srswq)
+internal_function inline uint32_t srsw_flq_count(srsw_flq_t &srswq)
 {
     uintptr_t pushed_cnt_addr = (uintptr_t) &srswq.PushedCount;
     uintptr_t popped_cnt_addr = (uintptr_t) &srswq.PoppedCount;
@@ -765,7 +782,7 @@ static inline uint32_t srsw_flq_count(srsw_flq_t &srswq)
 /// before pushing an item into the queue.
 /// @param srswq The queue to query.
 /// @return true if the queue is full.
-static inline bool srsw_flq_full(srsw_flq_t &srswq)
+internal_function inline bool srsw_flq_full(srsw_flq_t &srswq)
 {
     return (srsw_flq_count(srswq) == srswq.Capacity);
 }
@@ -774,14 +791,14 @@ static inline bool srsw_flq_full(srsw_flq_t &srswq)
 /// before popping an item from the queue.
 /// @param srswq The queue to query.
 /// @return true if the queue is empty.
-static inline bool srsw_flq_empty(srsw_flq_t &srswq)
+internal_function inline bool srsw_flq_empty(srsw_flq_t &srswq)
 {
     return (srsw_flq_count(srswq) == 0);
 }
 
 /// @summary Gets the index the next push operation will write to. This must be
 /// called only by the producer prior to calling srsw_flq_push().
-static inline uint32_t srsw_flq_next_push(srsw_flq_t &srswq)
+internal_function inline uint32_t srsw_flq_next_push(srsw_flq_t &srswq)
 {
     uintptr_t pushed_cnt_addr = (uintptr_t) &srswq.PushedCount;
     uint32_t  pushed_cnt      = atomic_read_uint32_aligned(pushed_cnt_addr);
@@ -791,7 +808,7 @@ static inline uint32_t srsw_flq_next_push(srsw_flq_t &srswq)
 /// @summary Implements a push operation in a SRSW fixed lookaside queue. This
 /// must be called only from the producer.
 /// @param srswq The queue to update.
-static inline void srsw_flq_push(srsw_flq_t &srswq)
+internal_function inline void srsw_flq_push(srsw_flq_t &srswq)
 {
     uintptr_t pushed_cnt_addr = (uintptr_t) &srswq.PushedCount;
     uint32_t  pushed_cnt      = atomic_read_uint32_aligned(pushed_cnt_addr) + 1;
@@ -800,7 +817,7 @@ static inline void srsw_flq_push(srsw_flq_t &srswq)
 
 /// @summary Gets the index the next pop operation will read from. This must be
 /// called only by the consumer prior to popping an item from the queue.
-static inline uint32_t srsw_flq_next_pop(srsw_flq_t &srswq)
+internal_function inline uint32_t srsw_flq_next_pop(srsw_flq_t &srswq)
 {
     uintptr_t popped_cnt_addr = (uintptr_t) &srswq.PoppedCount;
     uint32_t  popped_cnt      = atomic_read_uint32_aligned(popped_cnt_addr);
@@ -810,7 +827,7 @@ static inline uint32_t srsw_flq_next_pop(srsw_flq_t &srswq)
 /// @summary Implements a pop operation in a SRSW fixed lookaside queue. This must
 /// be called only from the consumer against a non-empty queue.
 /// @param srswq The queue to update.
-static inline void srsw_flq_pop(srsw_flq_t &srswq)
+internal_function inline void srsw_flq_pop(srsw_flq_t &srswq)
 {
     uintptr_t popped_cnt_addr = (uintptr_t) &srswq.PoppedCount;
     uint32_t  popped_cnt      = atomic_read_uint32_aligned(popped_cnt_addr) + 1;
@@ -822,7 +839,7 @@ static inline void srsw_flq_pop(srsw_flq_t &srswq)
 /// one should be accessing the queue at the time.
 /// @param fifo The queue to flush.
 template <typename T, uint32_t N>
-static inline void flush_srsw_fifo(srsw_fifo_t<T, N> *fifo)
+internal_function inline void flush_srsw_fifo(srsw_fifo_t<T, N> *fifo)
 {
     srsw_flq_clear(fifo->Queue, N);
 }
@@ -831,7 +848,7 @@ static inline void flush_srsw_fifo(srsw_fifo_t<T, N> *fifo)
 /// @param fifo The queue to query.
 /// @return The number of items in the queue at the instant of the call.
 template <typename T, uint32_t N>
-static inline size_t srsw_fifo_count(srsw_fifo_t<T, N> *fifo)
+internal_function inline size_t srsw_fifo_count(srsw_fifo_t<T, N> *fifo)
 {
     return srsw_flq_count(fifo->Queue);
 }
@@ -840,7 +857,7 @@ static inline size_t srsw_fifo_count(srsw_fifo_t<T, N> *fifo)
 /// @param fifo The queue to query.
 /// @return true if the queue contains zero items at the instant of the call.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_is_empty(srsw_fifo_t<T, N> *fifo)
+internal_function inline bool srsw_fifo_is_empty(srsw_fifo_t<T, N> *fifo)
 {
     return srsw_flq_empty(fifo->Queue);
 }
@@ -849,7 +866,7 @@ static inline bool srsw_fifo_is_empty(srsw_fifo_t<T, N> *fifo)
 /// @param fifo The queue to query.
 /// @return true if the queue is full at the instant of the call.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> *fifo)
+internal_function inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> *fifo)
 {
     return srsw_flq_full(fifo->Queue);
 }
@@ -859,7 +876,7 @@ static inline bool srsw_fifo_is_full(srsw_fifo_t<T, N> *fifo)
 /// @param item The item to enqueue. This must be a POD type.
 /// @return true if the item was enqueued, or false if the queue is at capacity.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_put(srsw_fifo_t<T, N> *fifo, T const &item)
+internal_function inline bool srsw_fifo_put(srsw_fifo_t<T, N> *fifo, T const &item)
 {
     uint32_t count = srsw_flq_count(fifo->Queue) + 1;
     if (count <= N)
@@ -878,7 +895,7 @@ static inline bool srsw_fifo_put(srsw_fifo_t<T, N> *fifo, T const &item)
 /// @param item On return, the dequeued item is copied here.
 /// @return true if an item was dequeued, or false if the queue is empty.
 template <typename T, uint32_t N>
-static inline bool srsw_fifo_get(srsw_fifo_t<T, N> *fifo, T &item)
+internal_function inline bool srsw_fifo_get(srsw_fifo_t<T, N> *fifo, T &item)
 {
     uint32_t count = srsw_flq_count(fifo->Queue);
     if (count > 0)
@@ -897,7 +914,7 @@ static inline bool srsw_fifo_get(srsw_fifo_t<T, N> *fifo, T &item)
 /// @param capacity The number of nodes to allocate and place on the free list.
 /// @return true if the list is initialized successfully.
 template <typename T>
-static bool create_srmw_freelist(srmw_freelist_t<T> &list, size_t capacity)
+internal_function bool create_srmw_freelist(srmw_freelist_t<T> &list, size_t capacity)
 {
     InitializeCriticalSectionAndSpinCount(&list.Lock, SPIN_COUNT_Q);
     list.Head        = &list.XXXX;
@@ -923,7 +940,7 @@ static bool create_srmw_freelist(srmw_freelist_t<T> &list, size_t capacity)
 /// @summary Frees storage and resources associated with a free list.
 /// @param list The free list to delete.
 template <typename T>
-static void delete_srmw_freelist(srmw_freelist_t<T> &list)
+internal_function void delete_srmw_freelist(srmw_freelist_t<T> &list)
 {
     if (list.Head != NULL)
     {
@@ -944,7 +961,7 @@ static void delete_srmw_freelist(srmw_freelist_t<T> &list)
 /// @param list The free list to allocate from.
 /// @return The allocated, uninitialized node or NULL.
 template <typename T>
-static inline T* srmw_freelist_get(srmw_freelist_t<T> &list)
+internal_function inline T* srmw_freelist_get(srmw_freelist_t<T> &list)
 {
     T *node = NULL;
 
@@ -968,7 +985,7 @@ static inline T* srmw_freelist_get(srmw_freelist_t<T> &list)
 /// @param list The free list to update.
 /// @param node The node to return to the free list.
 template <typename T>
-static inline void srmw_freelist_put(srmw_freelist_t<T> &list, T *node)
+internal_function inline void srmw_freelist_put(srmw_freelist_t<T> &list, T *node)
 {
     // push the node at the front of the free list.
     EnterCriticalSection(&list.Lock);
@@ -982,7 +999,7 @@ static inline void srmw_freelist_put(srmw_freelist_t<T> &list, T *node)
 /// @param capacity The initial capacity of the FIFO.
 /// @return true if the FIFO is initialized.
 template <typename T>
-static bool create_srmw_fifo(srmw_fifo_t<T> *fifo, size_t capacity)
+internal_function bool create_srmw_fifo(srmw_fifo_t<T> *fifo, size_t capacity)
 {
     InitializeCriticalSectionAndSpinCount(&fifo->HeadLock, 0);
     InitializeCriticalSectionAndSpinCount(&fifo->TailLock, 0);
@@ -997,7 +1014,7 @@ static bool create_srmw_fifo(srmw_fifo_t<T> *fifo, size_t capacity)
 /// @summary Frees resources associated with a SRMW FIFO.
 /// @param fifo The FIFO to delete.
 template <typename T>
-static void delete_srmw_fifo(srmw_fifo_t<T> *fifo)
+internal_function void delete_srmw_fifo(srmw_fifo_t<T> *fifo)
 {   // move all items from the queue to the free list.
     while (fifo->Head != NULL)
     {
@@ -1019,7 +1036,7 @@ static void delete_srmw_fifo(srmw_fifo_t<T> *fifo)
 /// @param item On return, the contents of the next item are copied here.
 /// @return true if an item was retrieved.
 template <typename T>
-static bool srmw_fifo_get(srmw_fifo_t<T> *fifo, T &item)
+internal_function bool srmw_fifo_get(srmw_fifo_t<T> *fifo, T &item)
 {
     T  *old_head = NULL;
     T  *new_head = NULL;
@@ -1049,7 +1066,7 @@ static bool srmw_fifo_get(srmw_fifo_t<T> *fifo, T &item)
 /// @param item The item to enqueue.
 /// @return true if the item was appended to the queue.
 template <typename T>
-static bool srmw_fifo_put(srmw_fifo_t<T> *fifo, T const &item)
+internal_function bool srmw_fifo_put(srmw_fifo_t<T> *fifo, T const &item)
 {
     T  *node   = srmw_freelist_get(fifo->FreeList);
     if (node  == NULL) return false;
@@ -1075,7 +1092,7 @@ static bool srmw_fifo_put(srmw_fifo_t<T> *fifo, T const &item)
 /// up to the nearest even multiple of the largest disk sector size.
 /// @return true if the allocator was initialized. Check alloc.TotalSize and
 /// alloc.AllocSize to determine the values selected by the system.
-static bool create_iobuf_allocator(iobuf_alloc_t &alloc, size_t total_size, size_t alloc_size)
+internal_function bool create_iobuf_allocator(iobuf_alloc_t &alloc, size_t total_size, size_t alloc_size)
 {
     SYSTEM_INFO sysinfo = {0};
     GetNativeSystemInfo_Func(&sysinfo);
@@ -1146,7 +1163,7 @@ static bool create_iobuf_allocator(iobuf_alloc_t &alloc, size_t total_size, size
 /// @summary Delete an I/O buffer allocator. All memory is freed, regardless
 /// of whether any I/O buffers are in use by the application.
 /// @param alloc The I/O buffer allocator to delete.
-static void delete_iobuf_allocator(iobuf_alloc_t &alloc)
+internal_function void delete_iobuf_allocator(iobuf_alloc_t &alloc)
 {
     if (alloc.FreeList != NULL)
     {
@@ -1165,7 +1182,7 @@ static void delete_iobuf_allocator(iobuf_alloc_t &alloc)
 /// @summary Returns all I/O buffers to the free list of the allocator, regardless
 /// of whether any I/O buffers are in use by the application.
 /// @param alloc The I/O buffer allocator to flush.
-static void flush_iobuf_allocator(iobuf_alloc_t &alloc)
+internal_function void flush_iobuf_allocator(iobuf_alloc_t &alloc)
 {
     size_t const nallocs = alloc.TotalSize / alloc.AllocSize;
     size_t const allocsz = alloc.AllocSize;
@@ -1182,7 +1199,7 @@ static void flush_iobuf_allocator(iobuf_alloc_t &alloc)
 /// @summary Retrieves an I/O buffer from the pool.
 /// @param alloc The I/O buffer allocator to query.
 /// @return A pointer to the I/O buffer, or NULL if no buffers are available.
-static inline void* iobuf_get(iobuf_alloc_t &alloc)
+internal_function inline void* iobuf_get(iobuf_alloc_t &alloc)
 {
     if (alloc.FreeCount > 0)
     {   // return the next buffer from the free list,
@@ -1195,7 +1212,7 @@ static inline void* iobuf_get(iobuf_alloc_t &alloc)
 /// @summary Returns an I/O buffer to the pool.
 /// @param alloc The I/O buffer allocator that owns the buffer.
 /// @param iobuf The address of the buffer returned by iobuf_get().
-static inline void iobuf_put(iobuf_alloc_t &alloc, void *iobuf)
+internal_function inline void iobuf_put(iobuf_alloc_t &alloc, void *iobuf)
 {
     assert(iobuf != NULL);
     alloc.FreeList[alloc.FreeCount++] = iobuf;
@@ -1204,7 +1221,7 @@ static inline void iobuf_put(iobuf_alloc_t &alloc, void *iobuf)
 /// @summary Calaculate the number of bytes currently unused.
 /// @param alloc The I/O buffer allocator to query.
 /// @return The number of bytes currently available for use by the application.
-static inline size_t iobuf_bytes_free(iobuf_alloc_t const &alloc)
+internal_function inline size_t iobuf_bytes_free(iobuf_alloc_t const &alloc)
 {
     return (alloc.AllocSize * alloc.FreeCount);
 }
@@ -1212,7 +1229,7 @@ static inline size_t iobuf_bytes_free(iobuf_alloc_t const &alloc)
 /// @summary Calaculate the number of bytes currently allocated.
 /// @param alloc The I/O buffer allocator to query.
 /// @return The number of bytes currently in-use by the application.
-static inline size_t iobuf_bytes_used(iobuf_alloc_t const &alloc)
+internal_function inline size_t iobuf_bytes_used(iobuf_alloc_t const &alloc)
 {
     return  alloc.TotalSize - (alloc.AllocSize * alloc.FreeCount);
 }
@@ -1220,7 +1237,7 @@ static inline size_t iobuf_bytes_used(iobuf_alloc_t const &alloc)
 /// @summary Calculate the number of buffers currently allocated.
 /// @param alloc The I/O buffer allocator to query.
 /// @return The number of buffers currently in-use by the application.
-static inline size_t iobuf_buffers_used(iobuf_alloc_t const &alloc)
+internal_function inline size_t iobuf_buffers_used(iobuf_alloc_t const &alloc)
 {
     size_t const nallocs = alloc.TotalSize / alloc.AllocSize;
     size_t const nunused = alloc.FreeCount;
@@ -1232,7 +1249,7 @@ static inline size_t iobuf_buffers_used(iobuf_alloc_t const &alloc)
 /// @param priority The priority of the item being inserted.
 /// @param idx The zero-based index of the item in the queue to compare against.
 /// @return -1 if item a should appear before item b, +1 if item a should appear after item b.
-static inline int io_opq_cmp_put(vfs_io_opq_t const *pq, uint32_t priority, int32_t idx)
+internal_function inline int io_opq_cmp_put(vfs_io_opq_t const *pq, uint32_t priority, int32_t idx)
 {   // when inserting, the new item is always ordered after the existing item
     // if the priority values of the two items are the same.
     uint32_t const p_a  = priority;
@@ -1245,7 +1262,7 @@ static inline int io_opq_cmp_put(vfs_io_opq_t const *pq, uint32_t priority, int3
 /// @param a The zero-based index of the first element.
 /// @param b The zero-based index of the second element.
 /// @return -1 if item a should appear before item b, +1 if item a should appear after item b.
-static inline int io_opq_cmp_get(vfs_io_opq_t const *pq, int32_t a, int32_t b)
+internal_function inline int io_opq_cmp_get(vfs_io_opq_t const *pq, int32_t a, int32_t b)
 {   // first order by priority. if priority is equal, the operations should
     // appear in the order they were inserted into the queue.
     uint32_t const p_a  = pq->Priority[a];
@@ -1260,7 +1277,7 @@ static inline int io_opq_cmp_get(vfs_io_opq_t const *pq, int32_t a, int32_t b)
 
 /// @summary Resets a I/O operation priority queue to empty.
 /// @param pq The priority queue to clear.
-static void io_opq_clear(vfs_io_opq_t *pq)
+internal_function void io_opq_clear(vfs_io_opq_t *pq)
 {
     pq->Count = 0;
 }
@@ -1269,7 +1286,7 @@ static void io_opq_clear(vfs_io_opq_t *pq)
 /// @param pq The I/O operation priority queue to update.
 /// @param priority The priority value associated with the item being inserted.
 /// @return The AIO request to populate, or NULL if the queue is full.
-static aio_req_t* io_opq_put(vfs_io_opq_t *pq, uint32_t priority)
+internal_function aio_req_t* io_opq_put(vfs_io_opq_t *pq, uint32_t priority)
 {   // note that the InsertionId counter is enough to represent the transfer
     // of 128TB of data (at 32KB/request) which is enough for ~39 hours of
     // constant streaming at a rate of 980MB/s before the counter wraps around.
@@ -1296,7 +1313,7 @@ static aio_req_t* io_opq_put(vfs_io_opq_t *pq, uint32_t priority)
 /// @param pq The I/O operation priority queue to update.
 /// @param request On return, the AIO request is copied to this location.
 /// @return true if an operation was retrieved for false if the queue is empty.
-static inline bool io_opq_top(vfs_io_opq_t *pq, aio_req_t &request)
+internal_function inline bool io_opq_top(vfs_io_opq_t *pq, aio_req_t &request)
 {
     if (pq->Count > 0)
     {   // the highest-priority operation is located at index 0.
@@ -1310,7 +1327,7 @@ static inline bool io_opq_top(vfs_io_opq_t *pq, aio_req_t &request)
 /// @param pq The I/O operation priority queue to update.
 /// @param request On return, the AIO request is copied to this location.
 /// @return true if an operation was retrieved, or false if the queue is empty.
-static bool io_opq_get(vfs_io_opq_t *pq, aio_req_t &request)
+internal_function bool io_opq_get(vfs_io_opq_t *pq, aio_req_t &request)
 {
     if (pq->Count > 0)
     {   // the highest-priority operation is located at index 0.
@@ -1361,7 +1378,7 @@ static bool io_opq_get(vfs_io_opq_t *pq, aio_req_t &request)
 
 /// @summary Resets a file priority queue to empty.
 /// @param pq The priority queue to clear.
-static void io_fpq_clear(vfs_io_fpq_t *pq)
+internal_function void io_fpq_clear(vfs_io_fpq_t *pq)
 {
     pq->Count = 0;
 }
@@ -1371,7 +1388,7 @@ static void io_fpq_clear(vfs_io_fpq_t *pq)
 /// @param priority The priority value associated with the item being inserted.
 /// @param index The zero-based index of the file record being inserted.
 /// @return true if the item was inserted in the queue, or false if the queue is full.
-static bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
+internal_function bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
 {
     if (pq->Count < MAX_STREAMS_IN)
     {   // there's room in the queue for this operation.
@@ -1396,7 +1413,7 @@ static bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
 /// @param index On return, this location is updated with the file record index.
 /// @param priority On return, this location is updated with the file priority.
 /// @return true if a file was retrieved, or false if the queue is empty.
-static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
+internal_function bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
 {
     if (pq->Count > 0)
     {   // the highest-priority operation is located at index 0.
@@ -1445,7 +1462,7 @@ static bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
 /// @summary Retrieve the physical sector size for a block-access device.
 /// @param file The handle to an open file on the device.
 /// @return The size of a physical sector on the specified device.
-static size_t physical_sector_size(HANDLE file)
+internal_function size_t physical_sector_size(HANDLE file)
 {   // http://msdn.microsoft.com/en-us/library/ff800831(v=vs.85).aspx
     // for structure STORAGE_ACCESS_ALIGNMENT
     // Vista and Server 2008+ only - XP not supported.
@@ -1480,7 +1497,7 @@ static size_t physical_sector_size(HANDLE file)
 /// not including the trailing zero byte.
 /// @return A pointer to one past the last volume or directory separator, if present;
 /// otherwise, the input pointer path.
-static char const* pathend(char const *path, size_t &out_pathlen, size_t &out_strlen)
+internal_function char const* pathend(char const *path, size_t &out_pathlen, size_t &out_strlen)
 {
     if (path == NULL)
     {
@@ -1507,7 +1524,7 @@ static char const* pathend(char const *path, size_t &out_pathlen, size_t &out_st
 /// @param out_extlen On return, indicates the number of bytes of extension information.
 /// @return A pointer to the first character of the extension. Check the value of
 /// out_extlen to be sure that there is extension information.
-static char const* extpart(char const *path, size_t &out_extlen)
+internal_function char const* extpart(char const *path, size_t &out_extlen)
 {
     if (path == NULL)
     {
@@ -1541,7 +1558,7 @@ static char const* extpart(char const *path, size_t &out_extlen)
 /// @param prefix The NULL-terminated UCS-2 string specifying the filename prefix.
 /// @return A string <volume and directory info from path>\<prefix>-########\0.
 /// The returned string should be freed using the standard C library free() function.
-static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
+internal_function WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
 {
     int    nbytes =-1;    // the number of bytes of volume and directory info
     int    nchars = 0;
@@ -1617,7 +1634,7 @@ static WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
 /// @param file_size On return, this value is set to the current size of the file, in bytes.
 /// @param sector_size On return, this value is set to the size of the physical disk sector, in bytes.
 /// @return true if all operations were successful.
-static bool open_file_raw(char const *path, HANDLE iocp, DWORD access, DWORD share, DWORD create, DWORD flags, HANDLE &fd, int64_t &file_size, size_t &sector_size)
+internal_function bool open_file_raw(char const *path, HANDLE iocp, DWORD access, DWORD share, DWORD create, DWORD flags, HANDLE &fd, int64_t &file_size, size_t &sector_size)
 {
     LARGE_INTEGER fsize   = {0};
     HANDLE        hFile   = INVALID_HANDLE_VALUE;
@@ -1675,7 +1692,7 @@ error_cleanup:
 
 /// @summary Closes the file descriptors associated with a file.
 /// @param fd The raw file descriptor of the underlying file. On return, set to INVALID_HANDLE_VALUE.
-static void close_file_raw(HANDLE &fd)
+internal_function void close_file_raw(HANDLE &fd)
 {
     if (fd != INVALID_HANDLE_VALUE)
     {
@@ -1686,7 +1703,7 @@ static void close_file_raw(HANDLE &fd)
 
 /// @summary Resets the platform I/O statistics to zero.
 /// @param stats The counters to reset.
-static void init_io_stats(io_stats_t *stats)
+internal_function void init_io_stats(io_stats_t *stats)
 {
     if (stats != NULL)
     {
@@ -1703,7 +1720,7 @@ static void init_io_stats(io_stats_t *stats)
 /// @summary Allocates an iocb instance from the free list.
 /// @param aio The AIO driver state managing the free list.
 /// @return The next available iocb structure.
-static inline OVERLAPPED* asio_get(aio_state_t *aio)
+internal_function inline OVERLAPPED* asio_get(aio_state_t *aio)
 {
     assert(aio->ASIOFreeCount > 0);
     return aio->ASIOFree[--aio->ASIOFreeCount];
@@ -1712,7 +1729,7 @@ static inline OVERLAPPED* asio_get(aio_state_t *aio)
 /// @summary Returns an iocb instance to the free list.
 /// @param aio The AIO driver state managing the free list.
 /// @param asio The OVERLAPPED instance to return to the free list.
-static inline void asio_put(aio_state_t *aio, OVERLAPPED *asio)
+internal_function inline void asio_put(aio_state_t *aio, OVERLAPPED *asio)
 {
     assert(aio->ASIOFreeCount < AIO_MAX_ACTIVE);
     aio->ASIOFree[aio->ASIOFreeCount++] = asio;
@@ -1723,7 +1740,7 @@ static inline void asio_put(aio_state_t *aio, OVERLAPPED *asio)
 /// @param amount The amount of data returned.
 /// @param req The request associated with the result.
 /// @return The populated AIO result packet.
-static inline aio_res_t aio_result(DWORD error, uint32_t amount, aio_req_t const &req)
+internal_function inline aio_res_t aio_result(DWORD error, uint32_t amount, aio_req_t const &req)
 {
     aio_res_t res = {
         req.Fildes,      /* Fildes     */
@@ -1745,7 +1762,7 @@ static inline aio_res_t aio_result(DWORD error, uint32_t amount, aio_req_t const
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
 {
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
@@ -1795,7 +1812,7 @@ static int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-static int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error)
 {
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
@@ -1845,7 +1862,7 @@ static int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &error)
 {   // synchronously flush all pending writes to the file.
     BOOL result = FlushFileBuffers(req.Fildes);
     if (!result)  error = GetLastError();
@@ -1860,7 +1877,7 @@ static int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &erro
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the close operation.
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
-static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
+internal_function int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 {   // close the file descriptors associated with the file.
     if (req.Fildes != INVALID_HANDLE_VALUE) CloseHandle(req.Fildes);
 
@@ -1874,7 +1891,7 @@ static int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the finalize operation.
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
-static int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
+internal_function int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
 {
     DWORD ncharsp = 0;    // number of characters in source path; GetFinalPathNameByHandle().
     size_t  ssize = 0;    // the disk physical sector size, in bytes.
@@ -1943,7 +1960,7 @@ error_cleanup:
 /// INFINITE to block indefinitely. Note that aio_poll() just calls aio_tick() with
 /// a timeout of zero, which will return immediately if no events are available.
 /// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
-static int aio_tick(aio_state_t *aio, DWORD timeout)
+internal_function int aio_tick(aio_state_t *aio, DWORD timeout)
 {   // poll kernel AIO for any completed events, and process them first.
     OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];  // STACK: 8-16KB depending on OS.
     ULONG nevents = 0;
@@ -2055,7 +2072,7 @@ static int aio_tick(aio_state_t *aio, DWORD timeout)
 /// @summary Implements the main loop of the AIO driver.
 /// @param aio The AIO driver state to update.
 /// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
-static inline int aio_poll(aio_state_t *aio)
+internal_function inline int aio_poll(aio_state_t *aio)
 {   // configure a zero timeout so we won't block.
     return aio_tick(aio , 0);
 }
@@ -2063,7 +2080,7 @@ static inline int aio_poll(aio_state_t *aio)
 /// @summary Allocates a new AIO context and initializes the AIO state.
 /// @param aio The AIO state to allocate and initialize.
 /// @return 0 if the operation completed successfully; otherwise, the GetLastError value.
-static DWORD create_aio_state(aio_state_t *aio)
+internal_function DWORD create_aio_state(aio_state_t *aio)
 {
     HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
     if (iocp == NULL)
@@ -2088,7 +2105,7 @@ static DWORD create_aio_state(aio_state_t *aio)
 /// @summary Cancels all pending AIO operations and frees associated resources.
 /// This call may block until pending operations have completed.
 /// @param aio The AIO state to delete.
-static void delete_aio_state(aio_state_t *aio)
+internal_function void delete_aio_state(aio_state_t *aio)
 {
     if (aio->ASIOContext != NULL)
     {
@@ -2110,7 +2127,7 @@ static void delete_aio_state(aio_state_t *aio)
 /// @param index On return, this value is set to the zero-based index of the
 /// current slot in the active stream list associated with the input ASID.
 /// @return true if the ASID was located in the list.
-static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
+internal_function inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
 {
     intptr_t const  ASID      = asid;
     intptr_t const *ASIDList  = vfs->StInASID;
@@ -2126,10 +2143,33 @@ static inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t asid, size_
     return false;
 }
 
+/// @summary Searches the VFS driver state to determine the current index of an
+/// active stream-in decoder given the stream application-defined ID.
+/// @param vfs The VFS driver state to search.
+/// @param asid The application-defined stream ID to locate.
+/// @param index On return, this value is set to the zero-based index of the
+/// current slot in the active stream list associated with the input ASID.
+/// @return true if the ASID was located in the list.
+internal_function inline bool vfs_decoder_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
+{
+    intptr_t const  ASID      = asid;
+    intptr_t const *ASIDList  = vfs->SiDecASID;
+    size_t   const  ASIDCount = vfs->SiDecCount;
+    for (size_t i = 0; i < ASIDCount; ++i)
+    {
+        if (ASIDList[i] == ASID)
+        {
+            index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 /// @summary Determines whether a path references a file on a remote drive.
 /// @param path The NULL-terminated UTF-8 path of the file.
 /// @return true if the file exists on a remote drive.
-static bool is_remote(char const *path)
+internal_function bool is_remote(char const *path)
 {
     WCHAR  *hugebuf = NULL;
     WCHAR  *pathbuf = NULL;
@@ -2192,8 +2232,10 @@ static bool is_remote(char const *path)
 /// For native files, the logical  and physical file size are the same.
 /// @param offset On return, stores the byte offset of the first byte of the file.
 /// @param sector_size On return, stores the physical sector size of the disk.
+/// @param decoder On return, points to the initialized decoder instance used to decode
+/// the data. The specific decoder type depends on the source file type.
 /// @return true if the file could be resolved.
-static bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size)
+internal_function bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size, stream_decoder_t *&decoder)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
@@ -2212,13 +2254,15 @@ static bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HAND
         if (open_file_raw(path, iocp, access, share, create, flags, fd, psize, sector_size))
         {   // native files always begin at the first byte.
             // logical and physical size are the same.
-            lsize  = psize;
-            offset = 0;
+            decoder = new stream_decoder_t();
+            lsize   = psize;
+            offset  = 0;
             return true;
         }
         else
         {   // unable to open the file, so fail immediately.
             fd = INVALID_HANDLE_VALUE; lsize = psize = offset = sector_size = 0;
+            decoder = NULL;
             return false;
         }
     }
@@ -2227,7 +2271,7 @@ static bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HAND
 
 /// @summary Processes queued commands for creating a new stream-in.
 /// @param vfs The VFS driver state.
-static void vfs_process_sicreate(vfs_state_t *vfs)
+internal_function void vfs_process_sicreate(vfs_state_t *vfs)
 {
     while (vfs->ActiveCount < MAX_STREAMS_IN)
     {
@@ -2239,19 +2283,24 @@ static void vfs_process_sicreate(vfs_state_t *vfs)
 
         // the file is already open; it was opened during platform_load_file().
         // all we need to do is update our internal active file list.
-        size_t index = vfs->ActiveCount++;
-        vfs->StInASID[index]             = req.ASID;
-        vfs->StInType[index]             = req.Type;
-        vfs->Priority[index]             = req.Priority;
-        vfs->RdOffset[index]             = 0;
-        vfs->StInInfo[index].Fildes      = req.Fildes;
-        vfs->StInInfo[index].FileSize    = req.FileSize;
-        vfs->StInInfo[index].DataSize    = req.DataSize;
-        vfs->StInInfo[index].FileOffset  = req.FileOffset;
-        vfs->StInInfo[index].SectorSize  = req.SectorSize;
-        vfs->StInInfo[index].EndBehavior = req.Behavior;
-        vfs->StInStat[index].NPendingAIO = 0;
-        vfs->StInStat[index].StatusFlags = VFS_STATUS_NONE;
+        size_t indexa = vfs->ActiveCount++;
+        vfs->StInASID[indexa]             = req.ASID;
+        vfs->StInType[indexa]             = req.Type;
+        vfs->Priority[indexa]             = req.Priority;
+        vfs->RdOffset[indexa]             = 0;
+        vfs->StInInfo[indexa].Fildes      = req.Fildes;
+        vfs->StInInfo[indexa].FileSize    = req.FileSize;
+        vfs->StInInfo[indexa].DataSize    = req.DataSize;
+        vfs->StInInfo[indexa].FileOffset  = req.FileOffset;
+        vfs->StInInfo[indexa].SectorSize  = req.SectorSize;
+        vfs->StInInfo[indexa].EndBehavior = req.Behavior;
+        vfs->StInStat[indexa].NPendingAIO = 0;
+        vfs->StInStat[indexa].StatusFlags = VFS_STATUS_NONE;
+
+        // save the stream decoder state, used when processing read data.
+        size_t indexd = vfs->SiDecCount++;
+        vfs->SiDecASID[indexd] = req.ASID;
+        vfs->SiDecInfo[indexd] = req.Decoder;
     }
 }
 
@@ -2259,7 +2308,7 @@ static void vfs_process_sicreate(vfs_state_t *vfs)
 /// @param vfs The VFS driver state to update.
 /// @param i The zero-based index of the active file to close.
 /// @return The zero-based index of the next record to check.
-static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
+internal_function size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 {
     if (vfs->StInStat[i].NPendingAIO > 0)
     {   // there are pending AIO operations against this file.
@@ -2285,14 +2334,31 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
         aio_req->Type       = vfs->StInType[i];
         aio_req->Reserved   = 0;
 
+        // delete the decoder state for the file immediately.
+        // it is possible that we will get completed reads for the
+        // stream after the close command is received, but if the
+        // caller has closed the stream, it is assumed that any
+        // outstanding data is not wanted and will be discarded.
+        size_t      indexd  = 0;
+        size_t const lastd  = vfs->SiDecCount - 1;
+        if (vfs_decoder_by_asid(vfs, vfs->StInASID[i], indexd))
+        {   // free resources associated with the decoder state.
+            delete vfs->SiDecInfo[indexd];
+            vfs->SiDecInfo[indexd] = NULL;
+            // swap the last decoder info into slot 'index'.
+            vfs->SiDecASID[indexd] = vfs->SiDecASID[lastd];
+            vfs->SiDecInfo[indexd] = vfs->SiDecInfo[lastd];
+            vfs->SiDecCount = lastd;
+        }
+
         // delete the file from our internal state immediately.
-        size_t const last   = vfs->ActiveCount - 1;
-        vfs->StInASID[i]    = vfs->StInASID[last];
-        vfs->StInType[i]    = vfs->StInType[last];
-        vfs->Priority[i]    = vfs->Priority[last];
-        vfs->RdOffset[i]    = vfs->RdOffset[last];
-        vfs->StInInfo[i]    = vfs->StInInfo[last];
-        vfs->ActiveCount    = last;
+        size_t const lasta  = vfs->ActiveCount - 1;
+        vfs->StInASID[i]    = vfs->StInASID[lasta];
+        vfs->StInType[i]    = vfs->StInType[lasta];
+        vfs->Priority[i]    = vfs->Priority[lasta];
+        vfs->RdOffset[i]    = vfs->RdOffset[lasta];
+        vfs->StInInfo[i]    = vfs->StInInfo[lasta];
+        vfs->ActiveCount    = lasta;
         return i;
     }
     else
@@ -2305,7 +2371,7 @@ static size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
-static void vfs_process_closes(vfs_state_t *vfs)
+internal_function void vfs_process_closes(vfs_state_t *vfs)
 {
     for (size_t i = 0; i < vfs->ActiveCount; )
     {
@@ -2324,7 +2390,7 @@ static void vfs_process_closes(vfs_state_t *vfs)
 /// @summary Processes all completed file close notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
+internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     // there's nothing that the VFS driver needs to do here for the application.
@@ -2337,18 +2403,29 @@ static void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
 /// @summary Processes all completed file read notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
+internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     size_t    index = 0;
     while (srsw_fifo_get(&aio->ReadResults, res))
-    {   // convert the AIO result into something useful for the platform layer.
+    {   // locate the stream decoder state so we can pass it on to the platform layer.
+        if (vfs_decoder_by_asid(vfs, res.AFID, index) == false)
+        {   // the stream has been stopped; don't report the data.
+            if (vfs_find_by_asid(vfs, res.AFID, index))
+            {   // decrement the number of pending I/O operations.
+                vfs->StInStat[index].NPendingAIO--;
+            }
+            continue;
+        }
+
         vfs_sird_t read;
-        read.ASID       = res.AFID;
-        read.DataBuffer = res.DataBuffer;
-        read.FileOffset = res.FileOffset; // this is the relative offset
-        read.DataAmount = res.DataAmount;
-        read.OSError    = res.OSError;
+        // convert the AIO result into something useful for the platform layer.
+        read.ASID        = res.AFID;
+        read.DataBuffer  = res.DataBuffer;
+        read.FileOffset  = res.FileOffset; // this is the relative offset
+        read.DataAmount  = res.DataAmount;
+        read.OSError     = res.OSError;
+        read.Decoder     = vfs->SiDecInfo[index];
         if (srsw_fifo_put(&vfs->SiResult[res.Type], read))
         {   // a single read operation has completed.
             if (vfs_find_by_asid(vfs, res.AFID, index))
@@ -2366,7 +2443,7 @@ static void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 /// @summary Processes all completed file write notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
+internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     while (srsw_fifo_get(&aio->WriteResults, res))
@@ -2381,7 +2458,7 @@ static void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
 /// @summary Processes all completed file flush notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
+internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
 {
     aio_res_t res;
     // there's nothing that the VFS driver needs to do here for the application.
@@ -2395,7 +2472,7 @@ static void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
 
 /// @summary Processes all pending buffer returns and releases memory back to the pool.
 /// @param vfs The VFS driver state.
-static void vfs_process_buffer_returns(vfs_state_t *vfs)
+internal_function void vfs_process_buffer_returns(vfs_state_t *vfs)
 {
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
@@ -2413,7 +2490,7 @@ static void vfs_process_buffer_returns(vfs_state_t *vfs)
 /// @param vfs The VFS driver state.
 /// @return true if the tick should continue submitting I/O operations, or false if
 /// either buffer space is full or the I/O operation queue is full.
-static bool vfs_update_stream_in(vfs_state_t *vfs)
+internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
 {
     iobuf_alloc_t &allocator = vfs->IoAllocator;
     size_t const read_amount = allocator.AllocSize;
@@ -2444,7 +2521,7 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
                     break;
                 case STREAM_IN_SEEK:
                     if ((op.Argument & (vfs->StInInfo[i].SectorSize-1)) != 0)
-                    {   // align up to the nearest sector size multiple.
+                    {   // round up to the nearest sector size multiple.
                         // then, subtract the sector size to get the next lowest multiple.
                         op.Argument  = align_up(op.Argument, vfs->StInInfo[i].SectorSize);
                         op.Argument -= vfs->StInInfo[i].SectorSize;
@@ -2547,7 +2624,7 @@ static bool vfs_update_stream_in(vfs_state_t *vfs)
 /// @param vfs The VFS driver state to update.
 /// @return true if the tick should continue submitting I/O operations, or false if
 /// the I/O operation queue is full.
-static bool vfs_update_stream_out(vfs_state_t *vfs)
+internal_function bool vfs_update_stream_out(vfs_state_t *vfs)
 {
     vfs_sowr_t write;
     while (srmw_fifo_get(&vfs->StOutWriteQ, write))
@@ -2609,7 +2686,7 @@ static bool vfs_update_stream_out(vfs_state_t *vfs)
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
 /// @param stats Optional VFS and AIO counters. May be NULL.
-static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
+internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
     io_stats_t null_stats;
     if (stats == NULL)
@@ -2659,7 +2736,7 @@ static void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 /// @param vfs The VFS state that posted the I/O result.
 /// @param type One of file_type_e indicating the type of file being processed.
 /// @param buffer The buffer to return. This value may be NULL.
-static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
+internal_function void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 {
     void const *iobeg = (uint8_t const *)  vfs->IoAllocator.BaseAddress;
     void const *ioend = (uint8_t const *)  vfs->IoAllocator.BaseAddress + vfs->IoAllocator.TotalSize;
@@ -2673,7 +2750,7 @@ static void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
 /// @summary Initialize a VFS driver state object and allocate any I/O resources.
 /// @param vfs The VFS driver state to initialize.
 /// @return true if the VFS driver state is initialized.
-static bool create_vfs_state(vfs_state_t *vfs)
+internal_function bool create_vfs_state(vfs_state_t *vfs)
 {   // TODO: some error handling would be nice.
     create_iobuf_allocator(vfs->IoAllocator, VFS_IOBUF_SIZE, VFS_ALLOC_SIZE);
     create_srmw_fifo(&vfs->StOutWriteQ     , AIO_MAX_ACTIVE);
@@ -2688,12 +2765,13 @@ static bool create_vfs_state(vfs_state_t *vfs)
     }
     io_opq_clear(&vfs->IoOperations);
     vfs->ActiveCount = 0;
+    vfs->SiDecCount  = 0;
     return true;
 }
 
 /// @summary Free resources associated with a VFS driver state.
 /// @param vfs The VFS driver state to delete.
-static void delete_vfs_state(vfs_state_t *vfs)
+internal_function void delete_vfs_state(vfs_state_t *vfs)
 {
     vfs->ActiveCount = 0;
     io_opq_clear(&vfs->IoOperations);
@@ -2708,12 +2786,21 @@ static void delete_vfs_state(vfs_state_t *vfs)
         flush_srsw_fifo(&vfs->SiReturn[i]);
         flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
+    for (size_t i = 0; i < vfs->SiDecCount; ++i)
+    {
+        if (vfs->SiDecInfo[i] != NULL)
+        {
+            delete vfs->SiDecInfo[i];
+            vfs->SiDecInfo[i] = NULL;
+        }
+    }
+    vfs->SiDecCount = 0;
 }
 
 /// @summary Checks a file type value to make sure it is known.
 /// @param file_type One of the values of the file_type_e enumeration.
 /// @return true if the file type is known.
-static bool check_file_type(int32_t file_type)
+internal_function bool check_file_type(int32_t file_type)
 {
     size_t  const  ntypes   = sizeof(FILE_TYPE_LIST) / sizeof(FILE_TYPE_LIST[0]);
     int32_t const *typelist = (int32_t const*) FILE_TYPE_LIST;
@@ -2732,7 +2819,7 @@ static bool check_file_type(int32_t file_type)
 /// @param data Pointer to the data buffer. The data to read starts at offset 0.
 /// @param offset The starting offset of the buffered data within the file.
 /// @param size The number of valid bytes in the buffer.
-static void null_read_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
+internal_function void null_read_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
 {   // all parameters are unused. suppress compiler warnings.
     (void) sizeof(app_id);
     (void) sizeof(type);
@@ -2748,7 +2835,7 @@ static void null_read_func(intptr_t app_id, int32_t type, void const *data, int6
 /// @param data Pointer to the data buffer. The data written starts at offset 0.
 /// @param offset The byte offset of the start of the write operation within the file.
 /// @param size The number of bytes written to the file.
-static void null_write_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
+internal_function void null_write_func(intptr_t app_id, int32_t type, void const *data, int64_t offset, uint32_t size)
 {   // all parameters are unused. suppress compiler warnings.
     (void) sizeof(app_id);
     (void) sizeof(type);
@@ -2763,18 +2850,18 @@ static void null_write_func(intptr_t app_id, int32_t type, void const *data, int
 /// @param type One of the values of the file_type_e enumeration.
 /// @param error_code The system error code value.
 /// @param error_message An optional string description of the error.
-static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
+internal_function void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
 #ifdef DEBUG
     LPSTR  buffer = NULL;
     size_t size   = FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | 
-        FORMAT_MESSAGE_FROM_SYSTEM     | 
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM     |
         FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, 
-        error_code, 
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
-        (LPSTR)&buffer, 
+        NULL,
+        error_code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&buffer,
         0, NULL);
     fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, buffer);
     if (buffer != NULL) LocalFree(buffer);
@@ -2792,17 +2879,17 @@ static void null_error_func(intptr_t app_id, int32_t type, uint32_t error_code, 
 /// @param type The of the values of the file_type_e enumeration.
 /// @param error_code The system error code value.
 /// @param error_message An optional string description of the error.
-static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
+internal_function void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error_code, char const *error_message)
 {
     LPSTR  buffer = NULL;
     size_t size   = FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | 
-        FORMAT_MESSAGE_FROM_SYSTEM     | 
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM     |
         FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, 
-        error_code, 
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
-        (LPSTR)&buffer, 
+        NULL,
+        error_code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&buffer,
         0, NULL);
     fprintf(stderr, "I/O ERROR: %p(%s): %u(0x%08X): %s\n", (void*) app_id, FILE_TYPE_NAME[type], error_code, error_code, buffer);
     if (buffer != NULL) LocalFree(buffer);
@@ -2819,7 +2906,7 @@ static void platform_print_ioerror(intptr_t app_id, int32_t type, uint32_t error
 /// @param start Specify true to start streaming in the file data immediately.
 /// @param stream_size On return, this location is updated with the logical size of the stream.
 /// @return true if the file was successfully opened.
-static bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
+internal_function bool platform_open_stream(char const *path, intptr_t id, int32_t type, uint32_t priority, int32_t mode, bool start, int64_t &stream_size)
 {
     int     hint   = FILE_HINT_NONE;
     HANDLE  fd     = INVALID_HANDLE_VALUE;
@@ -2828,12 +2915,13 @@ static bool platform_open_stream(char const *path, intptr_t id, int32_t type, ui
     int64_t lsize  = 0;
     int64_t psize  = 0;
     int64_t offset = 0;
+    stream_decoder_t *decoder = NULL;
     if (mode == STREAM_IN_ONCE)
     {   // for files that will be streamed in only once, prefer unbuffered I/O.
         // this avoids polluting the page cache with their data.
         hint  = FILE_HINT_DIRECT;
     }
-    if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize))
+    if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize, decoder))
     {   // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
@@ -2846,6 +2934,7 @@ static bool platform_open_stream(char const *path, intptr_t id, int32_t type, ui
         req.Behavior   = mode;
         req.Priority   = priority;
         req.SectorSize = ssize;
+        req.Decoder    = decoder;
         stream_size    = lsize;  // return the logical size to the caller
         return srmw_fifo_put(&VFS_STATE.StInCreateQ, req);
     }
@@ -2867,7 +2956,7 @@ static bool platform_open_stream(char const *path, intptr_t id, int32_t type, ui
 /// @param priority The file loading priority, with 0 indicating the highest possible priority.
 /// @param stream_size On return, this location is updated with the logical size of the stream.
 /// @return true if the file was successfully opened and the load was queued.
-static bool platform_stream_in(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &stream_size)
+internal_function bool platform_stream_in(char const *path, intptr_t id, int32_t type, uint32_t priority, int64_t &stream_size)
 {   // just redirect to open stream, which will queue the appropriate requests.
     return platform_open_stream(path, id, type, priority, STREAM_IN_ONCE, true, stream_size);
 }
@@ -2875,7 +2964,7 @@ static bool platform_stream_in(char const *path, intptr_t id, int32_t type, uint
 /// @summary Pauses a stream without closing the underlying file.
 /// @param id The application-defined identifier of the stream.
 /// @return true if the stream pause was queued.
-static bool platform_pause_stream(intptr_t id)
+internal_function bool platform_pause_stream(intptr_t id)
 {
     vfs_siop_t   req;
     req.Next     = NULL;
@@ -2888,7 +2977,7 @@ static bool platform_pause_stream(intptr_t id)
 /// @summary Resumes streaming a paused stream.
 /// @param id The application-defined identifier of the stream.
 /// @return true if the stream start was queued.
-static bool platform_resume_stream(intptr_t id)
+internal_function bool platform_resume_stream(intptr_t id)
 {
     vfs_siop_t   req;
     req.Next     = NULL;
@@ -2901,7 +2990,7 @@ static bool platform_resume_stream(intptr_t id)
 /// @summary Starts streaming data from the beginning of the stream.
 /// @param id The application-defined identifier of the stream.
 /// @return true if the stream rewind was queued.
-static bool platform_rewind_stream(intptr_t id)
+internal_function bool platform_rewind_stream(intptr_t id)
 {
     vfs_siop_t   req;
     req.Next     = NULL;
@@ -2916,7 +3005,7 @@ static bool platform_rewind_stream(intptr_t id)
 /// @param absolute_offset The byte offset of the new playback position from the
 /// start of the stream. The stream loading will resume from at or before this position.
 /// @return true if the stream seek was queued.
-static bool platform_seek_stream(intptr_t id, int64_t absolute_offset)
+internal_function bool platform_seek_stream(intptr_t id, int64_t absolute_offset)
 {
     vfs_siop_t   req;
     req.Next     = NULL;
@@ -2929,7 +3018,7 @@ static bool platform_seek_stream(intptr_t id, int64_t absolute_offset)
 /// @summary Stops loading a stream and closes the underlying file.
 /// @param id The application-defined identifier of the stream.
 /// @return true if the stream close was queued.
-static bool platform_stop_stream(intptr_t id)
+internal_function bool platform_stop_stream(intptr_t id)
 {
     vfs_siop_t   req;
     req.Next     = NULL;
@@ -2944,7 +3033,7 @@ static bool platform_stop_stream(intptr_t id)
 /// @param type One of file_type_e indicating the type of data being streamed in.
 /// @param default_behavior One of stream_in_mode_e indicating the configured default behavior of the stream.
 /// @return true if the behavior was processed.
-static bool platform_default_eos(intptr_t id, int32_t type, int32_t default_behavior)
+internal_function bool platform_default_eos(intptr_t id, int32_t type, int32_t default_behavior)
 {
     switch (default_behavior)
     {
@@ -2964,7 +3053,7 @@ static bool platform_default_eos(intptr_t id, int32_t type, int32_t default_beha
 /// @param file_size On return this value indicates the current size of the file, in bytes.
 /// @param file On return, this value is set to the file record used for subsequent operations.
 /// @return true if the file was opened.
-static bool platform_open_file(char const *path, bool read_only, int64_t &file_size, file_t **file)
+internal_function bool platform_open_file(char const *path, bool read_only, int64_t &file_size, file_t **file)
 {   // TODO: consider extending this to use vfs_resolve_file_read?
     LARGE_INTEGER sz = {0};
     file_t     *f = NULL;
@@ -3021,7 +3110,7 @@ error_cleanup:
 /// @param bytes_read On return, this value is set to the number of bytes actually
 /// read. This may be less than the number of bytes requested, or 0 at end-of-file.
 /// @return true if the read operation was successful.
-static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_t size, size_t &bytes_read)
+internal_function bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_t size, size_t &bytes_read)
 {
     LARGE_INTEGER pos = {0};
     pos.QuadPart  = offset;
@@ -3072,7 +3161,7 @@ static bool platform_read_file(file_t *file, int64_t offset, void *buffer, size_
 /// @param bytes_written On return, this value is set to the number of bytes
 /// actually written to the file.
 /// @return true if the write operation was successful.
-static bool platform_write_file(file_t *file, int64_t offset, void const *buffer, size_t size, size_t &bytes_written)
+internal_function bool platform_write_file(file_t *file, int64_t offset, void const *buffer, size_t size, size_t &bytes_written)
 {
     LARGE_INTEGER pos = {0};
     pos.QuadPart  = offset;
@@ -3103,7 +3192,7 @@ static bool platform_write_file(file_t *file, int64_t offset, void const *buffer
 /// @summary Flushes any buffered writes to the file, and updates file metadata.
 /// @param file The file state returned from open_file().
 /// @return true if the flush operation was successful.
-static bool platform_flush_file(file_t *file)
+internal_function bool platform_flush_file(file_t *file)
 {
     return (FlushFileBuffers(file->Fildes) == TRUE);
 }
@@ -3111,7 +3200,7 @@ static bool platform_flush_file(file_t *file)
 /// @summary Closes a file.
 /// @param file The file state returned from open_file().
 /// @return true if the file is closed.
-static bool platform_close_file(file_t **file)
+internal_function bool platform_close_file(file_t **file)
 {   // TODO: consider extending this to support archive files?
     file_t *f = *file;
     *file  = NULL;
@@ -3131,7 +3220,7 @@ static bool platform_close_file(file_t **file)
 /// @param data The contents of the file.
 /// @param size The number of bytes to read from data and write to the file.
 /// @return true if the operation was successful.
-static bool platform_write_out(char const *path, void const *data, int64_t size)
+internal_function bool platform_write_out(char const *path, void const *data, int64_t size)
 {
     FILE_END_OF_FILE_INFO eof;
     FILE_ALLOCATION_INFO  sec;
@@ -3255,7 +3344,7 @@ error_cleanup:
 /// operations more efficient. Specify zero if unknown.
 /// @param writer On return, this value will point to the file writer state.
 /// @return true if the file is opened and ready for write operations.
-static bool platform_create_stream(char const *where, uint32_t priority, int64_t reserve_size, stream_writer_t **writer)
+internal_function bool platform_create_stream(char const *where, uint32_t priority, int64_t reserve_size, stream_writer_t **writer)
 {
     FILE_END_OF_FILE_INFO eof;
     FILE_ALLOCATION_INFO  sec;
@@ -3332,7 +3421,7 @@ error_cleanup:
 /// @param size The number of bytes to write.
 /// @param bytes_written On return, this value is updated with the number of bytes written.
 /// @return true if the write operation was successful.
-static bool platform_append_stream(stream_writer_t *writer, void const *data, uint32_t size, size_t &bytes_written)
+internal_function bool platform_append_stream(stream_writer_t *writer, void const *data, uint32_t size, size_t &bytes_written)
 {
     DWORD mem_flags   = MEM_RESERVE | MEM_COMMIT;
     DWORD mem_protect = PAGE_READWRITE;
@@ -3393,7 +3482,7 @@ static bool platform_append_stream(stream_writer_t *writer, void const *data, ui
 /// @param writer The stream writer state returned from the create stream call.
 /// @param path The target path and filename of the file, or NULL to delete the file.
 /// @return true if the finalize operation was successfully queued.
-static bool platform_close_stream(stream_writer_t **writer, char const *path)
+internal_function bool platform_close_stream(stream_writer_t **writer, char const *path)
 {
     stream_writer_t  *sw = *writer;
     void           *addr =  sw->BaseAddress;
@@ -3524,7 +3613,18 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
                 if (SUCCEEDED(read.OSError))
                 {   // echo the data to stdout.
                     // normally, you'd push the result to a callback.
-                    fwrite(read.DataBuffer, 1, read.DataAmount, stdout);
+                    // note that all of the reading of the data is performed
+                    // through the stream decoder, which transparently performs
+                    // any decompression and/or decryption that might be necessary.
+                    read.Decoder->push(read.DataBuffer, read.DataAmount);
+                    do
+                    {
+                        size_t amount = read.Decoder->amount();
+                        void  *buffer = read.Decoder->Cursor;
+                        fwrite(buffer , 1, amount, stdout);
+                        read.Decoder->Cursor += amount;
+                    }
+                    while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process
                     // the data, return the buffer so it can be used again.
                     vfs_return_buffer(&VFS_STATE, type, read.DataBuffer);
@@ -3541,7 +3641,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
                 fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                p->stop_stream(eos.ASID);
+                p->stop_stream(eos.ASID);//p->rewind_stream(eos.ASID);
             }
         }
     }
@@ -3639,8 +3739,8 @@ int main(int argc, char **argv)
     elevate_process_privileges();
 
     // TODO: dynamically load the application code.
-    //exit_code = test_stream_in(argc, argv, &platform_layer);
-    platform_write_out("C:\\Users\\rklenk\\abc.txt", "Hello, write out!", strlen("Hello, write out!"));
+    exit_code = test_stream_in(argc, argv, &platform_layer);
+    //platform_write_out("C:\\Users\\rklenk\\abc.txt", "Hello, write out!", strlen("Hello, write out!"));
 
     exit(exit_code);
 }

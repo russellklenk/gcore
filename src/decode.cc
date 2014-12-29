@@ -33,19 +33,55 @@ enum decode_error_e
     DECODE_ERROR_EOF    = 1,  /// Attempt to read beyond the end of the file.
 };
 
-/// @summary Defines the 'base class' for all types of stream decoders. Each
+/// @summary Defines the base class for all types of stream decoders. Each
 /// derived type that needed to perform a decode transformation might maintain
 /// a small, fixed-size buffer consumed by the parser, and refilled when the
 /// parser calls the stream_decoder_t::refill() function. It is important that
 /// the refill function be a function pointer, and not a virtual function, so
-/// that state machines can be implemented. Decoders can be layered.
-struct stream_decoder_t
+/// that state machines can be implemented. Decoders can be layered. The default
+/// decoder performs no transformation on the input data. Derived decoders do
+/// not need to call down to any base class methods.
+class stream_decoder_t
 {
+public:
     uint8_t  *BufferBeg;      /// The start of the buffer of available data.
     uint8_t  *BufferEnd;      /// One past the end of the buffer of available data.
     uint8_t  *Cursor;         /// The current read cursor within the buffer.
     int32_t   DecodeError;    /// The sticky error value for the decoder.
     int32_t (*refill)(stream_decoder_t *s); /// Decode the next chunk. Returns decode_result_e.
+
+public:
+    stream_decoder_t(void);
+    virtual ~stream_decoder_t(void);
+
+public:
+    /// @summary Calculate the amount of data available in the buffer.
+    /// @return The number of bytes available, calculated as BufferEnd - Cursor.
+    size_t amount(void) const;
+
+public:
+    /// @summary Pushes a buffer of encoded data to the decoder.
+    /// @param buffer The buffer of encoded data.
+    /// @param size The number of bytes of encoded data.
+    /// @return true if the decoder accepts the buffer.
+    virtual bool push(void *buffer, size_t size);
+};
+
+/// @summary Implements a decoder for a fixed-size memory block. The decoder
+/// does not perform any transformation on the input buffer. Attempting to read
+/// past the end of the buffer will result in the stream returning an EOF error.
+class memory_decoder_t final : public stream_decoder_t
+{
+public:
+    memory_decoder_t(void);
+    virtual ~memory_decoder_t(void);
+
+public:
+    /// @summary Pushes a buffer of encoded data to the decoder.
+    /// @param buffer The buffer of encoded data.
+    /// @param size The number of bytes of encoded data.
+    /// @return true if the decoder accepts the buffer.
+    virtual bool push(void *buffer, size_t size) override final;
 };
 
 /*///////////////
@@ -111,32 +147,75 @@ internal_function int32_t refill_memory(stream_decoder_t *s)
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
+stream_decoder_t::stream_decoder_t(void)
+    :
+    BufferBeg  (NULL),
+    BufferEnd  (NULL),
+    Cursor     (NULL),
+    DecodeError(DECODE_ERROR_NONE),
+    refill     (refill_zeroes)
+{
+    /* empty */
+}
+
+stream_decoder_t::~stream_decoder_t(void)
+{
+    /* empty */
+}
+
+/// @summary Calculate the amount of data available in the buffer.
+/// @return The number of bytes available, calculated as BufferEnd - Cursor.
+size_t stream_decoder_t::amount(void) const
+{
+    return size_t(BufferEnd - Cursor);
+}
+
 /// @summary Initializes a decoder for a chunked stream that does not perform
 /// any transformation on the stream data. When the current buffer is exhausted,
 /// the stream will cause the parser to yield.
-/// @param s The stream decoder being initialized.
 /// @param buffer The buffer being attached to the stream.
 /// @param size The number of bytes being attached to the stream.
-public_function void init_stream_decoder(stream_decoder_t *s, void *buffer, size_t size)
+/// @return true if the decoder accepts the buffer.
+bool stream_decoder_t::push(void *buffer, size_t size)
 {
-    s->BufferBeg   = (uint8_t*) buffer;
-    s->BufferEnd   = (uint8_t*) buffer + size;
-    s->Cursor      = (uint8_t*) buffer;
-    s->DecodeError = DECODE_ERROR_NONE;
-    s->refill      = refill_yield;
+    if (DecodeError == DECODE_ERROR_NONE)
+    {
+        BufferBeg   = (uint8_t*) buffer;
+        BufferEnd   = (uint8_t*) buffer + size;
+        Cursor      = (uint8_t*) buffer;
+        DecodeError = DECODE_ERROR_NONE;
+        refill      = refill_yield;
+        return true;
+    }
+    else return false;
+}
+
+memory_decoder_t::memory_decoder_t(void)
+{
+    /* empty */
+}
+
+memory_decoder_t::~memory_decoder_t(void)
+{
+    /* empty */
 }
 
 /// @summary Initializes a decoder for a fixed-length memory stream that does
 /// not perform any transformation on the stream data.
-/// @param s The stream decoder being initialized.
 /// @param buffer The buffer being attached to the stream.
 /// @param size The number of bytes being attached to the stream.
-public_function void init_memory_decoder(stream_decoder_t *s, void *buffer, size_t size)
+/// @return true if the decoder accepts the buffer.
+bool memory_decoder_t::push(void *buffer, size_t size)
 {
-    s->BufferBeg   = (uint8_t*) buffer;
-    s->BufferEnd   = (uint8_t*) buffer + size;
-    s->Cursor      = (uint8_t*) buffer;
-    s->DecodeError = DECODE_ERROR_NONE;
-    s->refill      = refill_memory;
+    if (DecodeError == DECODE_ERROR_NONE)
+    {
+        BufferBeg   = (uint8_t*) buffer;
+        BufferEnd   = (uint8_t*) buffer + size;
+        Cursor      = (uint8_t*) buffer;
+        DecodeError = DECODE_ERROR_NONE;
+        refill      = refill_memory;
+        return true;
+    }
+    else return false;
 }
 
