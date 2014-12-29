@@ -60,6 +60,10 @@ public:
     size_t amount(void) const;
 
 public:
+    /// @summary Called to indicate a stream restart. The decoder should reset
+    /// to its initial state as if no data has been received.
+    virtual void restart(void);
+
     /// @summary Pushes a buffer of encoded data to the decoder.
     /// @param buffer The buffer of encoded data.
     /// @param size The number of bytes of encoded data.
@@ -77,6 +81,10 @@ public:
     virtual ~memory_decoder_t(void);
 
 public:
+    /// @summary Called to indicate a stream restart. The decoder should reset
+    /// to its initial state as if no data has been received.
+    virtual void restart(void) override final;
+
     /// @summary Pushes a buffer of encoded data to the decoder.
     /// @param buffer The buffer of encoded data.
     /// @param size The number of bytes of encoded data.
@@ -165,9 +173,20 @@ stream_decoder_t::~stream_decoder_t(void)
 
 /// @summary Calculate the amount of data available in the buffer.
 /// @return The number of bytes available, calculated as BufferEnd - Cursor.
-size_t stream_decoder_t::amount(void) const
+inline size_t stream_decoder_t::amount(void) const
 {
     return size_t(BufferEnd - Cursor);
+}
+
+/// @summary Called to indicate a stream restart. The decoder should reset
+/// to its initial state as if no data has been received.
+void stream_decoder_t::restart(void)
+{
+    BufferBeg   = NULL;
+    BufferEnd   = NULL;
+    Cursor      = NULL;
+    DecodeError = DECODE_ERROR_NONE;
+    refill      = refill_zeroes;
 }
 
 /// @summary Initializes a decoder for a chunked stream that does not perform
@@ -198,6 +217,15 @@ memory_decoder_t::memory_decoder_t(void)
 memory_decoder_t::~memory_decoder_t(void)
 {
     /* empty */
+}
+
+/// @summary Called to indicate a stream restart. The decoder should reset
+/// to its initial state as if no data has been received.
+void memory_decoder_t::restart(void)
+{
+    Cursor      = BufferBeg;
+    DecodeError = DECODE_ERROR_NONE;
+    refill      = refill_memory;
 }
 
 /// @summary Initializes a decoder for a fixed-length memory stream that does
