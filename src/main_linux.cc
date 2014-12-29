@@ -2116,12 +2116,32 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             if (vfs_find_by_asid(vfs, res.AFID, index))
             {   // decrement the number of pending I/O operations.
                 vfs->StInStat[index].NPendingAIO--;
+                // generate end-of-stream notifications if appropriate.
+                if (res.FileOffset + res.DataAmount >= vfs->StInInfo[index].FileSize)
+                {   // the end-of-stream notification gives the listener a chance to
+                    // take some appropriate action. we could handle it automatically,
+                    // but for some usages we might do the wrong thing - for example,
+                    // some data is at the end of the stream, but after reading it,
+                    // the application wants to seek to some other offset and resume
+                    // instead of closing - neither STREAM_IN_ONCE and STREAM_IN_LOOP fit.
+                    // the stream remains paused until a STOP, SEEK or REWIND is received.
+                    if ((vfs->StInStat[index].StatusFlags & VFS_STATUS_PAUSE) == 0)
+                    {
+                        vfs_sies_t eos = {
+                            vfs->StInASID[index],
+                            vfs->StInInfo[index].EndBehavior
+                        };
+                        srsw_fifo_put(&vfs->SiEndOfS[vfs->StInType[index]], eos);
+                        vfs->StInStat[index].StatusFlags |= VFS_STATUS_PAUSE;
+                    }
+                }
             }
         }
         else
         {   // TODO: track this statistic somewhere.
             // This should not be happening.
         }
+
     }
 }
 
@@ -2277,27 +2297,9 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
         // this value is decremented as operations are completed.
         vfs->StInStat[index].NPendingAIO += nqueued;
 
-        if (vfs->RdOffset[index] >= vfs->StInInfo[index].FileSize)
-        {   // the end-of-stream notification gives the listener a chance to
-            // take some appropriate action. we could handle it automatically,
-            // but for some usages we might do the wrong thing - for example,
-            // some data is at the end of the stream, but after reading it,
-            // the application wants to seek to some other offset and resume
-            // instead of closing - neither STREAM_IN_ONCE and STREAM_IN_LOOP fit.
-            // the stream remains paused until a STOP, SEEK or REWIND is received.
-            if ((vfs->StInStat[index].StatusFlags & VFS_STATUS_PAUSE) == 0)
-            {
-                vfs_sies_t eos = {
-                    vfs->StInASID[index],
-                    vfs->StInInfo[index].EndBehavior
-                };
-                srsw_fifo_put(&vfs->SiEndOfS[vfs->StInType[index]], eos);
-                vfs->StInStat[index].StatusFlags |= VFS_STATUS_PAUSE;
-            }
-        }
-        else if (nqueued == 0)
-        {   // we ran out of I/O buffer space; there's no point in continuing.
-            // TODO: track this statistic somewhere.
+        // if we ran out of I/O buffer space there's no point in continuing.
+        if (nqueued == 0)
+        {   // TODO: track this statistic somewhere.
             return false;
         }
     }
