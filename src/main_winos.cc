@@ -163,8 +163,13 @@ static size_t    const MAX_STREAMS_IN = WINOS_MAX_STREAMS_IN;
 
 /// @summary Define the maximum number of concurrently active decoder streams.
 /// This needs to be larger than the maximum number of active stream-in files,
+/// as decode will lag behind raw I/O slightly in most cases.
+static size_t   const MAX_STREAMS_LIVE = MAX_STREAMS_IN * 2;
+
+/// @summary Define the maximum number of concurrently active decoder streams.
+/// This needs to be larger than the maximum number of active stream-in files,
 /// as decode will lag behind I/O slightly in most cases.
-static size_t   const MAX_DECODER_IN = MAX_STREAMS_IN * 2;
+static size_t   const MAX_DECODER_IN  = MAX_STREAMS_IN * 2;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
@@ -225,7 +230,8 @@ enum vfs_stream_in_status_e
 {
     VFS_STATUS_NONE   = (0 << 0), /// No special status bits are set.
     VFS_STATUS_PAUSE  = (1 << 0), /// The stream is currently paused.
-    VFS_STATUS_CLOSE  = (1 << 0), /// The stream is marked as having a close pending.
+    VFS_STATUS_CLOSE  = (1 << 1), /// The stream is marked as having a close pending.
+    VFS_STATUS_CLOSED = (1 << 2), /// The stream is fully closed.
 };
 
 /// @summary Defines the supported VFS stream-in control operations.
@@ -422,6 +428,13 @@ struct vfs_sies_t
     int32_t            Behavior;     /// The configured behavior of the stream.
 };
 
+/// @summary Defines the data associated with a stream-in buffer return notification.
+struct vfs_sibr_t
+{
+    intptr_t           ASID;         /// The application-defined ID for the stream.
+    void              *DataBuffer;   /// The data buffer being returned.
+};
+
 /// @summary Defines the data associated with a stream-out write request passed
 /// to the VFS driver. This structure is intended for storage in a srmw_fifo_t.
 struct vfs_sowr_t
@@ -452,7 +465,7 @@ typedef srmw_fifo_t<vfs_socs_t>      vfs_socloseq_t;   /// A stream-out close qu
 typedef srmw_fifo_t<vfs_siop_t>      vfs_sicommandq_t; /// A stream-in command queue.
 typedef srmw_fifo_t<vfs_sics_t>      vfs_sicreateq_t;  /// A stream-in create queue.
 typedef srsw_fifo_t<vfs_sird_t, QC>  vfs_siresultq_t;  /// A stream-in result queue.
-typedef srsw_fifo_t<void*     , QC>  vfs_sireturnq_t;  /// A stream-in return queue.
+typedef srsw_fifo_t<vfs_sibr_t, QC>  vfs_sireturnq_t;  /// A stream-in return queue.
 typedef srsw_fifo_t<vfs_sies_t, MS>  vfs_siendq_t;     /// A stream-in end-of-stream queue.
 #undef  MS
 #undef  QC
@@ -468,14 +481,17 @@ struct vfs_siinfo_t
     int32_t            EndBehavior;  /// The end-of-stream behavior, one of stream_in_mode_e.
 };
 
-/// @summary Status information associated with an active stream-in. This information
+/// @summary Status information associated with a 'live' stream-in. This information
 /// is required to properly process (for example) close operations, where there may be
 /// one or more in-progress read operations against the file; in which case the close
 /// must be deferred until all in-progress read operations have completed.
 struct vfs_sistat_t
 {
-    uint64_t           NPendingAIO;  /// The number of pending AIO operations on the file.
     uint32_t           StatusFlags;  /// A combination of vfs_stream_in_status_e.
+    uint32_t           NLiveIoOps;   /// The number of pending AIO operations against the stream.
+    uint32_t           NLiveDecode;  /// The number of pending decode operations against the stream.
+    uint32_t           Priority;     /// The priority value of the stream.
+    stream_decoder_t  *Decoder;      /// The decoder state for the stream.
 };
 
 /// @summary Defines the data associated with a priority queue of pending AIO operations.
@@ -497,14 +513,14 @@ struct vfs_io_fpq_t
     #define MS         MAX_STREAMS_IN
     int32_t            Count;        /// The number of items in the queue.
     uint32_t           Priority[MS]; /// The priority value for each file.
-    uint16_t           RecIndex[MS]; /// The index of the file record.
+    uint32_t           RecIndex[MS]; /// The packed index of the stream record.
     #undef MS
 };
 
 /// @summary Defines the state data maintained by a VFS driver instance.
 struct vfs_state_t
 {
-    #define MD         MAX_DECODER_IN
+    #define ML         MAX_STREAMS_LIVE
     #define MS         MAX_STREAMS_IN
     #define NT         FILE_TYPE_COUNT
     vfs_sowriteq_t     StOutWriteQ;  /// Stream-out write operation queue.
@@ -523,12 +539,12 @@ struct vfs_state_t
     vfs_siresultq_t    SiResult[NT]; /// The per-file type queue for stream-in I/O results.
     vfs_sireturnq_t    SiReturn[NT]; /// The per-file type queue for stream-in I/O buffer returns.
     vfs_siendq_t       SiEndOfS[NT]; /// The per-file type queue for stream-in end-of-stream events.
-    size_t             SiDecCount;   /// The number of stream-in with active decode state.
-    intptr_t           SiDecASID[MD];/// The stream ID for each active-decode stream-in.
-    stream_decoder_t  *SiDecInfo[MD];/// The decode state for each active-decode stream-in.
+    size_t             LiveCount;    /// The number of 'live' stream-in objects.
+    intptr_t           LiveASID[ML]; /// The stream ID for each 'live' stream-in.
+    vfs_sistat_t       LiveStat[ML]; /// The current status for each 'live' stream-in.
     #undef NT       // per-file type
     #undef MS       // per-active stream
-    #undef MD       // per-active decode
+    #undef ML       // per-active decode
 };
 
 /// @summary Statistics tracked by the platform I/O system.
@@ -1386,12 +1402,14 @@ internal_function void io_fpq_clear(vfs_io_fpq_t *pq)
 /// @summary Attempts to insert a file into the file priority queue.
 /// @param pq The priority queue to update.
 /// @param priority The priority value associated with the item being inserted.
-/// @param index The zero-based index of the file record being inserted.
+/// @param index_a The zero-based index of the stream record in the active list.
+/// @param index_l The zero-based index of the stream record in the live list.
 /// @return true if the item was inserted in the queue, or false if the queue is full.
-internal_function bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t index)
+internal_function bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, size_t index_a, size_t index_l)
 {
     if (pq->Count < MAX_STREAMS_IN)
     {   // there's room in the queue for this operation.
+        uint32_t id = uint32_t(index_a << 16) | uint32_t(index_l);
         int32_t pos = pq->Count++;
         int32_t idx =(pos - 1) / 2;
         while  (pos > 0 && priority < pq->Priority[idx])
@@ -1402,7 +1420,7 @@ internal_function bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t 
             idx =(idx - 1) / 2;
         }
         pq->Priority[pos] = priority;
-        pq->RecIndex[pos] = index;
+        pq->RecIndex[pos] = id;
         return true;
     }
     else return false;
@@ -1410,15 +1428,17 @@ internal_function bool io_fpq_put(vfs_io_fpq_t *pq, uint32_t priority, uint16_t 
 
 /// @summary Retrieves the highest priority active file.
 /// @param pq The priority queue to update.
-/// @param index On return, this location is updated with the file record index.
+/// @param index_a On return, this location is updated with the stream index in the active list.
+/// @param index_l On return, this location is updated with the stream index in the live list.
 /// @param priority On return, this location is updated with the file priority.
 /// @return true if a file was retrieved, or false if the queue is empty.
-internal_function bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &priority)
+internal_function bool io_fpq_get(vfs_io_fpq_t *pq, size_t &index_a, size_t &index_l, uint32_t &priority)
 {
     if (pq->Count > 0)
     {   // the highest-priority operation is located at index 0.
         priority  = pq->Priority[0];
-        index     = pq->RecIndex[0];
+        index_a   = pq->RecIndex[0] >> 16;
+        index_l   = pq->RecIndex[0]  & 0xFFFF;
 
         // swap the last item into the position vacated by the first item.
         int32_t       n  = pq->Count - 1;
@@ -1447,7 +1467,7 @@ internal_function bool io_fpq_get(vfs_io_fpq_t *pq, uint16_t &index, uint32_t &p
 
             // swap the parent with the largest child.
             uint32_t temp_p   = pq->Priority[pos];
-            uint16_t temp_i   = pq->RecIndex[pos];
+            uint32_t temp_i   = pq->RecIndex[pos];
             pq->Priority[pos] = pq->Priority[m];
             pq->RecIndex[pos] = pq->RecIndex[m];
             pq->Priority[m]   = temp_p;
@@ -2150,11 +2170,11 @@ internal_function inline bool vfs_find_by_asid(vfs_state_t const *vfs, intptr_t 
 /// @param index On return, this value is set to the zero-based index of the
 /// current slot in the active stream list associated with the input ASID.
 /// @return true if the ASID was located in the list.
-internal_function inline bool vfs_decoder_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
+internal_function inline bool vfs_stat_by_asid(vfs_state_t const *vfs, intptr_t asid, size_t &index)
 {
     intptr_t const  ASID      = asid;
-    intptr_t const *ASIDList  = vfs->SiDecASID;
-    size_t   const  ASIDCount = vfs->SiDecCount;
+    intptr_t const *ASIDList  = vfs->LiveASID;
+    size_t   const  ASIDCount = vfs->LiveCount;
     for (size_t i = 0; i < ASIDCount; ++i)
     {
         if (ASIDList[i] == ASID)
@@ -2170,7 +2190,8 @@ internal_function inline bool vfs_decoder_by_asid(vfs_state_t const *vfs, intptr
 /// @param path The NULL-terminated UTF-8 path of the file.
 /// @return true if the file exists on a remote drive.
 internal_function bool is_remote(char const *path)
-{
+{   // TODO: This function doesn't need to be re-entrant. Can maybe just
+    // statically-allocate the huge 32KB buffer for the hugebuf?
     WCHAR  *hugebuf = NULL;
     WCHAR  *pathbuf = NULL;
     UINT    drvtype = DRIVE_UNKNOWN;
@@ -2193,16 +2214,16 @@ internal_function bool is_remote(char const *path)
     // AFAIK there is no way to get the length, so allocate
     // a temporary 64KB buffer - the maximum length is 32767
     // wide characters - just to get the stupid volume name.
-    hugebuf = (WCHAR*) malloc(32768 * sizeof(WCHAR));
+    hugebuf = (WCHAR*) malloc(32 * 1024 * sizeof(WCHAR));
     if (hugebuf == NULL)
     {   // cannot allocate our gargantuan temp buffer.
         free(pathbuf);
         return false;
     }
     // MSDN doesn't indicate whether GetVolumePathName() zero-terminates...
-    memset(hugebuf, 0, 32768 * sizeof(WCHAR));
+    memset(hugebuf, 0, 32 * 1024 * sizeof(WCHAR));
     // figure out what volume this file path refers to.
-    if (!GetVolumePathName(pathbuf, hugebuf, 32768))
+    if (!GetVolumePathName(pathbuf, hugebuf, 32 * 1024))
     {   // the file might not exist, etc.
         free(hugebuf);
         free(pathbuf);
@@ -2281,91 +2302,29 @@ internal_function void vfs_process_sicreate(vfs_state_t *vfs)
             break;
         }
 
-        // the file is already open; it was opened during platform_load_file().
-        // all we need to do is update our internal active file list.
-        size_t indexa = vfs->ActiveCount++;
-        vfs->StInASID[indexa]             = req.ASID;
-        vfs->StInType[indexa]             = req.Type;
-        vfs->Priority[indexa]             = req.Priority;
-        vfs->RdOffset[indexa]             = 0;
-        vfs->StInInfo[indexa].Fildes      = req.Fildes;
-        vfs->StInInfo[indexa].FileSize    = req.FileSize;
-        vfs->StInInfo[indexa].DataSize    = req.DataSize;
-        vfs->StInInfo[indexa].FileOffset  = req.FileOffset;
-        vfs->StInInfo[indexa].SectorSize  = req.SectorSize;
-        vfs->StInInfo[indexa].EndBehavior = req.Behavior;
-        vfs->StInStat[indexa].NPendingAIO = 0;
-        vfs->StInStat[indexa].StatusFlags = VFS_STATUS_NONE;
+        // the file is already open; it was opened during platform_open_stream().
+        // all we need to do is update our internal active stream list.
+        size_t index = vfs->ActiveCount++;
+        vfs->StInASID[index]             = req.ASID;
+        vfs->StInType[index]             = req.Type;
+        vfs->Priority[index]             = req.Priority;
+        vfs->RdOffset[index]             = 0;
+        vfs->StInInfo[index].Fildes      = req.Fildes;
+        vfs->StInInfo[index].FileSize    = req.FileSize;
+        vfs->StInInfo[index].DataSize    = req.DataSize;
+        vfs->StInInfo[index].FileOffset  = req.FileOffset;
+        vfs->StInInfo[index].SectorSize  = req.SectorSize;
+        vfs->StInInfo[index].EndBehavior = req.Behavior;
 
         // save the stream decoder state, used when processing read data.
-        size_t indexd = vfs->SiDecCount++;
-        vfs->SiDecASID[indexd] = req.ASID;
-        vfs->SiDecInfo[indexd] = req.Decoder;
-    }
-}
-
-/// @summary Attempts to queue a file close request for the AIO driver.
-/// @param vfs The VFS driver state to update.
-/// @param i The zero-based index of the active file to close.
-/// @return The zero-based index of the next record to check.
-internal_function size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
-{
-    if (vfs->StInStat[i].NPendingAIO > 0)
-    {   // there are pending AIO operations against this file.
-        // the file cannot be closed until all operations have completed.
-        // the file close will be queued after the last operation completes.
-        vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
-        return (i + 1);
-    }
-
-    // queue the file close operation for the AIO driver.
-    aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[i]);
-    if (aio_req != NULL)
-    {   // fill out the request. it will be processed at a later time.
-        aio_req->Command    = AIO_COMMAND_CLOSE;
-        aio_req->Fildes     = vfs->StInInfo[i].Fildes;
-        aio_req->DataAmount = 0;
-        aio_req->BaseOffset = vfs->StInInfo[i].FileOffset;
-        aio_req->FileOffset = 0;
-        aio_req->DataBuffer = NULL;
-        aio_req->QTimeNanos = nanotime();
-        aio_req->ATimeNanos = 0;
-        aio_req->AFID       = vfs->StInASID[i];
-        aio_req->Type       = vfs->StInType[i];
-        aio_req->Reserved   = 0;
-
-        // delete the decoder state for the file immediately.
-        // it is possible that we will get completed reads for the
-        // stream after the close command is received, but if the
-        // caller has closed the stream, it is assumed that any
-        // outstanding data is not wanted and will be discarded.
-        size_t      indexd  = 0;
-        size_t const lastd  = vfs->SiDecCount - 1;
-        if (vfs_decoder_by_asid(vfs, vfs->StInASID[i], indexd))
-        {   // free resources associated with the decoder state.
-            delete vfs->SiDecInfo[indexd];
-            vfs->SiDecInfo[indexd] = NULL;
-            // swap the last decoder info into slot 'index'.
-            vfs->SiDecASID[indexd] = vfs->SiDecASID[lastd];
-            vfs->SiDecInfo[indexd] = vfs->SiDecInfo[lastd];
-            vfs->SiDecCount = lastd;
-        }
-
-        // delete the file from our internal state immediately.
-        size_t const lasta  = vfs->ActiveCount - 1;
-        vfs->StInASID[i]    = vfs->StInASID[lasta];
-        vfs->StInType[i]    = vfs->StInType[lasta];
-        vfs->Priority[i]    = vfs->Priority[lasta];
-        vfs->RdOffset[i]    = vfs->RdOffset[lasta];
-        vfs->StInInfo[i]    = vfs->StInInfo[lasta];
-        vfs->ActiveCount    = lasta;
-        return i;
-    }
-    else
-    {   // there's no more space in the pending I/O operation queue.
-        // we'll try closing the file again when there's space.
-        vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
-        return (i + 1);
+        // maintained in a separate list; this has a different lifetime.
+        index = vfs->LiveCount++;
+        vfs->LiveASID[index] = req.ASID;
+        vfs->LiveStat[index].StatusFlags = VFS_STATUS_NONE;
+        vfs->LiveStat[index].NLiveIoOps  = 0;
+        vfs->LiveStat[index].NLiveDecode = 0;
+        vfs->LiveStat[index].Priority    = req.Priority;
+        vfs->LiveStat[index].Decoder     = req.Decoder;
     }
 }
 
@@ -2373,17 +2332,60 @@ internal_function size_t vfs_queue_close(vfs_state_t *vfs, size_t i)
 /// @param vfs The VFS driver state.
 internal_function void vfs_process_closes(vfs_state_t *vfs)
 {
-    for (size_t i = 0; i < vfs->ActiveCount; )
+    size_t  index = 0;
+    for (size_t i = 0, n = vfs->LiveCount; i < n; ++i)
     {
-        if (vfs->StInStat[i].StatusFlags & VFS_STATUS_CLOSE)
-        {   // there's a pending close operation against this file.
-            // vfs_queue_close() returns the next index to check;
-            // either i (if a close was queued), or i + 1.
-            // note that VFS_STATUS_CLOSE is never explicitly cleared,
-            // as when the close is queued, the record is overwritten.
-            i = vfs_queue_close(vfs, i);
+        vfs_sistat_t &st = vfs->LiveStat[i];
+        if (st.StatusFlags & VFS_STATUS_CLOSE)
+        {   // locate the stream by ID within the active stream list.
+            if (vfs_find_by_asid(vfs, vfs->LiveASID[i], index) == false)
+            {   // this stream isn't active, so it can't be closed.
+                // TODO: assert; this should not ever happen.
+            }
+            if (st.NLiveIoOps > 0)
+            {   // there are pending I/O operations against this file.
+                // the file cannot be closed until all operations have completed.
+                // the file close will be queued after the last operation completes.
+                st.StatusFlags |= VFS_STATUS_CLOSE;
+                continue;
+            }
+
+            // queue the file close operation for the AIO driver.
+            aio_req_t *aio_req = io_opq_put(&vfs->IoOperations, vfs->Priority[index]);
+            if (aio_req != NULL)
+            {   // fill out the request. it will be processed at a later time.
+                aio_req->Command     = AIO_COMMAND_CLOSE;
+                aio_req->Fildes      = vfs->StInInfo[index].Fildes;
+                aio_req->DataAmount  = 0;
+                aio_req->BaseOffset  = vfs->StInInfo[index].FileOffset;
+                aio_req->FileOffset  = 0;
+                aio_req->DataBuffer  = NULL;
+                aio_req->QTimeNanos  = nanotime();
+                aio_req->ATimeNanos  = 0;
+                aio_req->AFID        = vfs->StInASID[index];
+                aio_req->Type        = vfs->StInType[index];
+                aio_req->Reserved    = 0;
+
+                // delete the file from our internal state immediately.
+                size_t const  lasti  = vfs->ActiveCount - 1;
+                vfs->StInASID[index] = vfs->StInASID[lasti];
+                vfs->StInType[index] = vfs->StInType[lasti];
+                vfs->Priority[index] = vfs->Priority[lasti];
+                vfs->RdOffset[index] = vfs->RdOffset[lasti];
+                vfs->StInInfo[index] = vfs->StInInfo[lasti];
+                vfs->ActiveCount     = lasti;
+
+                // mark the file as closed in the live list.
+                st.StatusFlags &=~VFS_STATUS_CLOSE;
+                st.StatusFlags |= VFS_STATUS_CLOSED;
+            }
+            else
+            {   // there's no more space in the pending I/O operation queue.
+                // we'll try closing the file again when there's space.
+                st.StatusFlags |= VFS_STATUS_CLOSE;
+                break;
+            }
         }
-        else i++; // no pending close; check the next file.
     }
 }
 
@@ -2405,56 +2407,49 @@ internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_
 /// @param aio The AIO driver state.
 internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
 {
-    aio_res_t res;
-    size_t    index = 0;
+    aio_res_t  res;
+    vfs_sird_t read;
+    size_t     index_a = 0; // index in the active stream list
+    size_t     index_l = 0; // index if the live stream list
     while (srsw_fifo_get(&aio->ReadResults, res))
-    {   // locate the stream decoder state so we can pass it on to the platform layer.
-        if (vfs_decoder_by_asid(vfs, res.AFID, index) == false)
-        {   // the stream has been stopped; don't report the data.
-            if (vfs_find_by_asid(vfs, res.AFID, index))
-            {   // decrement the number of pending I/O operations.
-                vfs->StInStat[index].NPendingAIO--;
+    {   // locate the stream in the active streams list. if the stream isn't
+        // found in the active list, just return the I/O buffer.
+        if (vfs_find_by_asid(vfs, res.AFID, index_a))
+        {   // all active streams must have an active decoder state.
+            vfs_stat_by_asid(vfs, res.AFID, index_l);
+            // decrement the number of pending I/O operations.
+            vfs->LiveStat[index_l].NLiveIoOps--;
+            // generate an end-of-stream notification, if appropriate.
+            if (res.FileOffset + res.DataAmount >= vfs->StInInfo[index_a].FileSize)
+            {
+                vfs_sies_t eos = { res.AFID, vfs->StInInfo[index_a].EndBehavior };
+                srsw_fifo_put(&vfs->SiEndOfS[res.Type], eos);
             }
-            continue;
-        }
-
-        vfs_sird_t read;
-        // convert the AIO result into something useful for the platform layer.
-        read.ASID        = res.AFID;
-        read.DataBuffer  = res.DataBuffer;
-        read.FileOffset  = res.FileOffset; // this is the relative offset
-        read.DataAmount  = res.DataAmount;
-        read.OSError     = res.OSError;
-        read.Decoder     = vfs->SiDecInfo[index];
-        if (srsw_fifo_put(&vfs->SiResult[res.Type], read))
-        {   // a single read operation has completed.
-            if (vfs_find_by_asid(vfs, res.AFID, index))
-            {   // decrement the number of pending I/O operations.
-                vfs->StInStat[index].NPendingAIO--;
-                // generate end-of-stream notifications if appropriate.
-                if (res.FileOffset + res.DataAmount >= vfs->StInInfo[index].FileSize)
-                {   // the end-of-stream notification gives the listener a chance to
-                    // take some appropriate action. we could handle it automatically,
-                    // but for some usages we might do the wrong thing - for example,
-                    // some data is at the end of the stream, but after reading it,
-                    // the application wants to seek to some other offset and resume
-                    // instead of closing - neither STREAM_IN_ONCE and STREAM_IN_LOOP fit.
-                    // the stream remains paused until a STOP, SEEK or REWIND is received.
-                    if ((vfs->StInStat[index].StatusFlags & VFS_STATUS_PAUSE) == 0)
-                    {
-                        vfs_sies_t eos = {
-                            vfs->StInASID[index],
-                            vfs->StInInfo[index].EndBehavior
-                        };
-                        srsw_fifo_put(&vfs->SiEndOfS[vfs->StInType[index]], eos);
-                        vfs->StInStat[index].StatusFlags |= VFS_STATUS_PAUSE;
-                    }
-                }
+            // populate and enqueue a pending decode operation.
+            read.ASID        = res.AFID;
+            read.DataBuffer  = res.DataBuffer;
+            read.FileOffset  = res.FileOffset; // relative offset
+            read.DataAmount  = res.DataAmount;
+            read.OSError     = res.OSError;
+            read.Decoder     = vfs->LiveStat[index_l].Decoder;
+            if (srsw_fifo_put(&vfs->SiResult[res.Type], read))
+            {   // bump the number of pending decode operations.
+                vfs->LiveStat[index_l].NLiveDecode++;
+            }
+            else
+            {   // TODO: log this statistic; this should not happen.
+                iobuf_put(vfs->IoAllocator, res.DataBuffer);
             }
         }
         else
-        {   // TODO: track this statistic somewhere.
-            // This should not be happening.
+        {   // directly return the buffer - the application closed the stream;
+            // we're just receiving remenants of the streaming process.
+            iobuf_put(vfs->IoAllocator, res.DataBuffer);
+            // even though the stream might not be active, it might still be live.
+            if (vfs_stat_by_asid(vfs, res.AFID, index_l))
+            {   // decrement the number of pending I/O operations.
+                vfs->LiveStat[index_l].NLiveIoOps--;
+            }
         }
     }
 }
@@ -2495,12 +2490,33 @@ internal_function void vfs_process_buffer_returns(vfs_state_t *vfs)
 {
     for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
     {
-        void            *buffer;
+        vfs_sibr_t       ret;
+        size_t           index_l   = 0;
         vfs_sireturnq_t *returnq   = &vfs->SiReturn[i];
         iobuf_alloc_t   &allocator =  vfs->IoAllocator;
-        while (srsw_fifo_get(returnq, buffer))
+        while (srsw_fifo_get(returnq, ret))
         {
-            iobuf_put(allocator, buffer);
+            iobuf_put(allocator, ret.DataBuffer);
+            if (vfs_stat_by_asid(vfs, ret.ASID, index_l))
+            {
+                vfs_sistat_t &st = vfs->LiveStat[index_l];
+                // decrement the number of outstanding decode operations.
+                st.NLiveDecode--;
+                // check to see whether the decoder state should be deleted.
+                if (st.StatusFlags & VFS_STATUS_CLOSED)
+                {   // if there are no more outstanding operations, the decode state can be deleted safely.
+                    // TODO: can probably loosen this to st.NLiveDecode == 0.
+                    if (st.NLiveDecode == 0 && st.NLiveIoOps == 0)
+                    {   // delete the decoder state object.
+                        delete st.Decoder; st.Decoder = NULL;
+                        // now swap the last item in the live list into slot index_l.
+                        size_t last_l  = vfs->LiveCount - 1;
+                        vfs->LiveASID[index_l] = vfs->LiveASID[last_l];
+                        vfs->LiveStat[index_l] = vfs->LiveStat[last_l];
+                        vfs->LiveCount = last_l;
+                    }
+                }
+            }
         }
     }
 }
@@ -2513,43 +2529,43 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
 {
     iobuf_alloc_t &allocator = vfs->IoAllocator;
     size_t const read_amount = allocator.AllocSize;
-    size_t const file_count  = vfs->ActiveCount;
     uint32_t     priority    = 0;
-    uint16_t     index       = 0;
+    size_t       index_a     = 0;
+    size_t       index_l     = 0;
     vfs_io_fpq_t file_queue;
     vfs_siop_t   op;
 
     // process any pending stream-in control operations.
     while (srmw_fifo_get(&vfs->StInCommandQ, op))
     {
-        size_t i = 0;
-        if (vfs_find_by_asid(vfs, op.ASID, i))
+        if (vfs_find_by_asid(vfs, op.ASID, index_a))
         {   // the stream is currently in the active list, so process the control.
+            vfs_stat_by_asid(vfs, op.ASID, index_l);
             switch (op.OpId)
             {
                 case STREAM_IN_PAUSE:
-                    vfs->StInStat[i].StatusFlags |=  VFS_STATUS_PAUSE;
-                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_PAUSE;
+                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_CLOSE);
                     break;
                 case STREAM_IN_RESUME:
-                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
                     break;
                 case STREAM_IN_REWIND:
-                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
-                    vfs->RdOffset[i] = 0;
+                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->RdOffset[index_a] = 0;
                     break;
                 case STREAM_IN_SEEK:
-                    if ((op.Argument & (vfs->StInInfo[i].SectorSize-1)) != 0)
+                    if ((op.Argument & (vfs->StInInfo[index_a].SectorSize-1)) != 0)
                     {   // round up to the nearest sector size multiple.
                         // then, subtract the sector size to get the next lowest multiple.
-                        op.Argument  = align_up(op.Argument, vfs->StInInfo[i].SectorSize);
-                        op.Argument -= vfs->StInInfo[i].SectorSize;
+                        op.Argument  = align_up(op.Argument, vfs->StInInfo[index_a].SectorSize);
+                        op.Argument -= vfs->StInInfo[index_a].SectorSize;
                     }
-                    vfs->StInStat[i].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
-                    vfs->RdOffset[i] = op.Argument;
+                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->RdOffset[index_a] = op.Argument;
                     break;
                 case STREAM_IN_STOP:
-                    vfs->StInStat[i].StatusFlags |= VFS_STATUS_CLOSE;
+                    vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_CLOSE;
                     break;
             }
         }
@@ -2559,14 +2575,15 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
     // starting with the highest-priority file. the goal here is to fill up
     // the queue of pending I/O operations and stay maximally busy.
     io_fpq_clear(&file_queue);
-    for (size_t i = 0; i < file_count; ++i)
+    for (size_t i = 0, n = vfs->LiveCount; i < n; ++i)
     {
-        if (vfs->StInStat[i].StatusFlags == VFS_STATUS_NONE)
+        if (vfs->LiveStat[i].StatusFlags == VFS_STATUS_NONE)
         {   // only update streams that are active (not paused, not closed.)
-            io_fpq_put(&file_queue, vfs->Priority[i], uint16_t(i));
+            vfs_find_by_asid(vfs  , vfs->LiveASID[i], index_a);
+            io_fpq_put(&file_queue, vfs->LiveStat[i].Priority, index_a, i);
         }
     }
-    while(io_fpq_get(&file_queue, index, priority))
+    while(io_fpq_get(&file_queue, index_a, index_l, priority))
     {   // we want to submit as many sequential reads against the file as
         // possible for maximum efficiency. these operations will be
         // processed in-order, so this minimizes seeking as much as possible.
@@ -2581,22 +2598,22 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
             if (req != NULL)
             {   // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
-                req->Fildes     = vfs->StInInfo[index].Fildes;
+                req->Fildes     = vfs->StInInfo[index_a].Fildes;
                 req->DataAmount = uint32_t(read_amount);
-                req->BaseOffset = vfs->StInInfo[index].FileOffset;
-                req->FileOffset = vfs->RdOffset[index];
+                req->BaseOffset = vfs->StInInfo[index_a].FileOffset;
+                req->FileOffset = vfs->RdOffset[index_a];
                 req->DataBuffer = iobuf_get(allocator);
                 req->QTimeNanos = nanotime();
                 req->ATimeNanos = 0;
-                req->AFID       = vfs->StInASID[index];
-                req->Type       = vfs->StInType[index];
+                req->AFID       = vfs->StInASID[index_a];
+                req->Type       = vfs->StInType[index_a];
                 req->Reserved   = 0;
                 nqueued++;
 
                 // update the byte offset to the next read.
-                int64_t newofs  = vfs->RdOffset[index] + read_amount;
-                vfs->RdOffset[index] = newofs;
-                if (newofs >= vfs->StInInfo[index].FileSize)
+                int64_t newofs  = vfs->RdOffset[index_a] + read_amount;
+                vfs->RdOffset[index_a] = newofs;
+                if (newofs >= vfs->StInInfo[index_a].FileSize)
                 {   // reached or passed end-of-file.
                     // continue processing the next file.
                     break;
@@ -2610,11 +2627,27 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
 
         // update the number of pending AIO operations against the file.
         // this value is decremented as operations are completed.
-        vfs->StInStat[index].NPendingAIO += nqueued;
+        vfs->LiveStat[index_l].NLiveIoOps += nqueued;
 
-        // if we ran out of I/O buffer space there's no point in continuing.
-        if (nqueued == 0)
-        {   // TODO: track this statistic somewhere.
+        // handle end-of-stream using the default behavior for the stream.
+        if (vfs->RdOffset[index_a] >= vfs->StInInfo[index_a].FileSize)
+        {
+            switch (vfs->StInInfo[index_a].EndBehavior)
+            {
+                case STREAM_IN_ONCE:
+                    // immediately place the stream in a paused state.
+                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
+                    break;
+                case STREAM_IN_LOOP:
+                    // seek back to the beginning of the stream to avoid
+                    // hitching due to wating until end-of-stream is processed.
+                    vfs->RdOffset[index_a] = 0;
+                    break;
+            }
+        }
+        else if (nqueued == 0)
+        {   // if we ran out of I/O buffer space there's no point in continuing.
+            // TODO: track this statistic somewhere.
             return false;
         }
     }
@@ -2732,19 +2765,19 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     vfs_process_sicreate(vfs);
 }
 
-/// @summary Returns an I/O buffer to the pool. This function should be called
-/// for every read result that the platform layer dequeues.
 /// @param vfs The VFS state that posted the I/O result.
+/// @param asid The application-defined stream identifier.
 /// @param type One of file_type_e indicating the type of file being processed.
 /// @param buffer The buffer to return. This value may be NULL.
-internal_function void vfs_return_buffer(vfs_state_t *vfs, int32_t type, void *buffer)
+internal_function void vfs_return_buffer(vfs_state_t *vfs, intptr_t asid, int32_t type, void *buffer)
 {
     void const *iobeg = (uint8_t const *)  vfs->IoAllocator.BaseAddress;
     void const *ioend = (uint8_t const *)  vfs->IoAllocator.BaseAddress + vfs->IoAllocator.TotalSize;
     if (buffer >= iobeg && buffer < ioend)
     {   // only return the buffer if it's within the address range handed out
         // by the I/O buffer allocator. this excludes user-allocated buffers.
-        srsw_fifo_put(&vfs->SiReturn[type], buffer);
+        vfs_sibr_t ret = { asid , buffer };
+        srsw_fifo_put(&vfs->SiReturn[type], ret);
     }
 }
 
@@ -2766,7 +2799,7 @@ internal_function bool create_vfs_state(vfs_state_t *vfs)
     }
     io_opq_clear(&vfs->IoOperations);
     vfs->ActiveCount = 0;
-    vfs->SiDecCount  = 0;
+    vfs->LiveCount   = 0;
     return true;
 }
 
@@ -2774,6 +2807,7 @@ internal_function bool create_vfs_state(vfs_state_t *vfs)
 /// @param vfs The VFS driver state to delete.
 internal_function void delete_vfs_state(vfs_state_t *vfs)
 {
+    vfs->LiveCount   = 0;
     vfs->ActiveCount = 0;
     io_opq_clear(&vfs->IoOperations);
     delete_srmw_fifo(&vfs->StInCreateQ);
@@ -2787,15 +2821,6 @@ internal_function void delete_vfs_state(vfs_state_t *vfs)
         flush_srsw_fifo(&vfs->SiReturn[i]);
         flush_srsw_fifo(&vfs->SiEndOfS[i]);
     }
-    for (size_t i = 0; i < vfs->SiDecCount; ++i)
-    {
-        if (vfs->SiDecInfo[i] != NULL)
-        {
-            delete vfs->SiDecInfo[i];
-            vfs->SiDecInfo[i] = NULL;
-        }
-    }
-    vfs->SiDecCount = 0;
 }
 
 /// @summary Checks a file type value to make sure it is known.
@@ -3607,28 +3632,33 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
         // needs to be done with the data and who needs access to it.
         for (size_t i = 0; i < FILE_TYPE_COUNT; ++i)
         {
-            int32_t    type = int32_t(i); // the file_type_e.
             vfs_sird_t read;
+            int32_t    type = int32_t(i); // the file_type_e.
             while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
             {
-                if (SUCCEEDED(read.OSError))
+                if (read.OSError == 0)
                 {   // echo the data to stdout.
                     // normally, you'd push the result to a callback.
                     // note that all of the reading of the data is performed
                     // through the stream decoder, which transparently performs
                     // any decompression and/or decryption that might be necessary.
+                    if (read.FileOffset == 0)
+                    {   // reset the decoder to its initial state.
+                        read.Decoder->restart();
+                    }
+                    // attach the input buffer to the decoder.
                     read.Decoder->push(read.DataBuffer, read.DataAmount);
                     do
-                    {
+                    {   // read as much data as is available, and then call
+                        // refill to decode the next chunk of the input buffer.
                         size_t amount = read.Decoder->amount();
                         void  *buffer = read.Decoder->Cursor;
                         fwrite(buffer , 1, amount, stdout);
                         read.Decoder->Cursor += amount;
-                    }
-                    while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
+                    } while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process
                     // the data, return the buffer so it can be used again.
-                    vfs_return_buffer(&VFS_STATE, type, read.DataBuffer);
+                    vfs_return_buffer(&VFS_STATE, read.ASID, type, read.DataBuffer);
                 }
                 else
                 {   // an error occurred, so display it and then exit.
