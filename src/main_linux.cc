@@ -64,19 +64,19 @@
 //   Constants   //
 /////////////////*/
 /// The scale used to convert from seconds into nanoseconds.
-static uint64_t const SEC_TO_NANOSEC = 1000000000ULL;
+static uint64_t const SEC_TO_NANOSEC   = 1000000000ULL;
 
 /// @summary Define the number of times per-second we want the I/O system to
 /// update (assuming it's on a background thread and we have that control).
 /// The lower the update rate of the I/O system, the more latency there is in
 /// processing and completing I/O requests, and the lower the I/O thoroughput.
-static size_t   const IO_SYSTEM_RATE = 60;
+static size_t   const IO_SYSTEM_RATE   = 60;
 
 /// @summary Define the maximum number of concurrent stream-in files.
 #ifndef LINUX_MAX_STREAMS_IN
 #define LINUX_MAX_STREAMS_IN    16
 #endif
-static size_t   const MAX_STREAMS_IN = LINUX_MAX_STREAMS_IN;
+static size_t   const MAX_STREAMS_IN   = LINUX_MAX_STREAMS_IN;
 
 /// @summary Define the maximum number of concurrently active decoder streams.
 /// This needs to be larger than the maximum number of active stream-in files,
@@ -455,7 +455,7 @@ struct vfs_state_t
     vfs_sistat_t       LiveStat[ML]; /// The current status for each 'live' stream-in.
     #undef NT       // per-file type
     #undef MS       // per-active stream
-    #undef MD       // per-active decode
+    #undef ML       // per-active decode
 };
 
 /// @summary Statistics tracked by the platform I/O system.
