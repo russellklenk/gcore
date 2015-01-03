@@ -256,6 +256,47 @@ enum vfs_file_hint_e
     FILE_HINT_DIRECT  = (1 << 0), /// Prefer unbuffered I/O.
 };
 
+/// @summary Define the various statistic counters maintained by the I/O system.
+/// These values should start from zero and increase monotonically.
+enum io_count_e
+{
+    IO_COUNT_AIO_READ_SUBMIT = 0,
+    IO_COUNT_AIO_READ_COMPLETE,
+    IO_COUNT_AIO_WRITE_SUBMIT,
+    IO_COUNT_AIO_WRITE_COMPLETE,
+    IO_COUNT_AIO_FSYNC_SUBMIT,
+    IO_COUNT_AIO_FSYNC_COMPLETE,
+    IO_COUNT_AIO_FDSYNC_SUBMIT,
+    IO_COUNT_AIO_FDSYNC_COMPLETE,
+    IO_COUNT_AIO_CLOSE_SUBMIT,
+    IO_COUNT_AIO_CLOSE_COMPLETE,
+    IO_COUNT_AIO_FINALIZE_SUBMIT,
+    IO_COUNT_AIO_FINALIZE_COMPLETE,
+    IO_COUNT_STREAM_IN_BYTES,
+    IO_COUNT_STREAM_OUT_BYTES,
+    IO_COUNT_COUNT
+};
+
+/// @summary Define the various error counters maintained by the I/O system.
+/// These values should start from zero and increase monotonically.
+enum io_error_e
+{
+    IO_ERROR_ORPHANED_IOCB = 0,
+    IO_ERROR_BAD_AIO_CMD,
+    IO_ERROR_COUNT
+};
+
+/// @summary Define the various stall counters maintained by the I/O system.
+/// These values should start from zero and increase monotonically.
+enum io_stall_e
+{
+    IO_STALL_FULL_AIO_QUEUE = 0,
+    IO_STALL_FULL_VFS_QUEUE,
+    IO_STALL_OUT_OF_IOBUFS,
+    IO_STALL_FULL_RESULT_QUEUE,
+    IO_STALL_COUNT
+};
+
 /// @summary Defines the data associated with a fixed-size lookaside queue.
 /// Lookaside means that the storage for items are stored and managed outside
 /// of the structure. The queue is safe for concurrent access by a single reader
@@ -539,10 +580,10 @@ struct vfs_state_t
 /// @summary Statistics tracked by the platform I/O system.
 struct io_stats_t
 {
-    uint64_t           NStallsAIOQ;                  /// Stalls due to full AIO operation queue.
-    uint64_t           NStallsVFSQ;                  /// Stalls due to full VFS operation queue.
-    uint64_t           NStallsIOBuf;                 /// Stalls due to exhausted I/O buffer space.
-    uint64_t           NStallsProc[THREAD_ID_COUNT]; /// Stalls due to slow file data processing.
+    uint64_t           Counts[IO_COUNT_COUNT];       /// I/O driver event counters.
+    uint64_t           Errors[IO_ERROR_COUNT];       /// I/O driver error counters.
+    uint64_t           Stalls[IO_STALL_COUNT];       /// I/O driver stall counters.
+    uint64_t           StallsSIRQ[THREAD_ID_COUNT];  /// Stalls due to a full stream-in result queue.
 };
 
 /// @summary Defines the data associated with a file opened for buffered, synchronous I/O.
@@ -1716,6 +1757,35 @@ internal_function void close_file_raw(HANDLE &fd)
     }
 }
 
+/// @summary Increments an I/O statistics counter.
+/// @param stats The I/O statistics to update.
+/// @param count_id The counter ID, one of io_count_e.
+internal_function inline void io_count(io_stats_t *stats, int count_id)
+{
+    stats->Counts[count_id]++;
+}
+
+/// @summary Increments an I/O error counter.
+/// @param stats The I/O statistics to update.
+/// @param error_id The counter ID, one of io_error_e.
+internal_function inline void io_error(io_stats_t *stats, int error_id)
+{
+    stats->Errors[error_id]++;
+}
+
+/// @summary Increments an I/O stall counter.
+/// @param stats The I/O statistics to update.
+/// @param stall_id The counter ID, one of io_stall_e.
+/// @param thread_id The optional thread ID. Specified if stall_id has a thread-specific counterpart.
+internal_function inline void io_stall(io_stats_t *stats, int stall_id, int thread_id=0)
+{
+    stats->Stalls[stall_id]++;
+    if (stall_id == IO_STALL_FULL_RESULT_QUEUE)
+    {
+        stats->StallsSIRQ[thread_id]++;
+    }
+}
+
 /// @summary Given a file type, return the ID of the thread on which I/O should be processed.
 /// @param file_type One of the values of the file_type_e enumeration.
 /// @return One of the values of the thread_id_e enumeration indicating the thread on which
@@ -1742,13 +1812,10 @@ internal_function void init_io_stats(io_stats_t *stats)
 {
     if (stats != NULL)
     {
-        stats->NStallsAIOQ   = 0;
-        stats->NStallsVFSQ   = 0;
-        stats->NStallsIOBuf  = 0;
-        for (size_t i = 0; i < THREAD_ID_COUNT; ++i)
-        {
-            stats->NStallsProc[i] = 0;
-        }
+        for (size_t i = 0; i < IO_COUNT_COUNT ; ++i) stats->Counts[i] = 0;
+        for (size_t i = 0; i < IO_ERROR_COUNT ; ++i) stats->Errors[i] = 0;
+        for (size_t i = 0; i < IO_STALL_COUNT ; ++i) stats->Stalls[i] = 0;
+        for (size_t i = 0; i < THREAD_ID_COUNT; ++i) stats->StallsSIRQ[i] = 0;
     }
 }
 
@@ -1796,8 +1863,9 @@ internal_function inline aio_res_t aio_result(DWORD error, uint32_t amount, aio_
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DWORD &error, io_stats_t *stats)
 {
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
@@ -1846,8 +1914,9 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, DWORD &error, io_stats_t *stats)
 {
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
@@ -1896,8 +1965,9 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the read operation.
 /// @param error On return, this location stores the error return value.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero if the operation was successfully submitted, or -1 if an error occurred.
-internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &error)
+internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, DWORD &error, io_stats_t *stats)
 {   // synchronously flush all pending writes to the file.
     BOOL result = FlushFileBuffers(req.Fildes);
     if (!result)  error = GetLastError();
@@ -1911,8 +1981,9 @@ internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, 
 /// @summary Synchronously processes a file close operation.
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the close operation.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
-internal_function int aio_process_close(aio_state_t *aio, aio_req_t const &req)
+internal_function int aio_process_close(aio_state_t *aio, aio_req_t const &req, io_stats_t *stats)
 {   // close the file descriptors associated with the file.
     if (req.Fildes != INVALID_HANDLE_VALUE) CloseHandle(req.Fildes);
 
@@ -1925,8 +1996,9 @@ internal_function int aio_process_close(aio_state_t *aio, aio_req_t const &req)
 /// file and safely moves it to the destination file path.
 /// @param aio The AIO driver state processing the AIO request.
 /// @param req The AIO request corresponding to the finalize operation.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero if the result was successfully submitted, or -1 if the result queue is full.
-internal_function int aio_process_finalize(aio_state_t *aio, aio_req_t const &req)
+internal_function int aio_process_finalize(aio_state_t *aio, aio_req_t const &req, io_stats_t *stats)
 {
     DWORD ncharsp = 0;    // number of characters in source path; GetFinalPathNameByHandle().
     size_t  ssize = 0;    // the disk physical sector size, in bytes.
@@ -1991,11 +2063,12 @@ error_cleanup:
 
 /// @summary Implements the main loop of the AIO driver using a polling mechanism.
 /// @param aio The AIO driver state to update.
+/// @param stats The I/O driver statistics to update.
 /// @param timeout The timeout value indicating the amount of time to wait, or
 /// INFINITE to block indefinitely. Note that aio_poll() just calls aio_tick() with
 /// a timeout of zero, which will return immediately if no events are available.
 /// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
-internal_function int aio_tick(aio_state_t *aio, DWORD timeout)
+internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeout)
 {   // poll kernel AIO for any completed events, and process them first.
     OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];  // STACK: 8-16KB depending on OS.
     ULONG nevents = 0;
@@ -2082,19 +2155,19 @@ internal_function int aio_tick(aio_state_t *aio, DWORD timeout)
         switch (req.Command)
         {
             case AIO_COMMAND_READ:
-                result = aio_submit_read (aio, req, error);
+                result = aio_submit_read (aio, req, error, stats);
                 break;
             case AIO_COMMAND_WRITE:
-                result = aio_submit_write(aio, req, error);
+                result = aio_submit_write(aio, req, error, stats);
                 break;
             case AIO_COMMAND_FLUSH:
-                result = aio_process_flush(aio, req, error);
+                result = aio_process_flush(aio, req, error, stats);
                 break;
             case AIO_COMMAND_CLOSE:
-                result = aio_process_close(aio, req);
+                result = aio_process_close(aio, req, stats);
                 break;
             case AIO_COMMAND_FINAL:
-                result = aio_process_finalize(aio, req);
+                result = aio_process_finalize(aio, req, stats);
                 break;
             default:
                 error  = ERROR_INVALID_PARAMETER;
@@ -2106,10 +2179,11 @@ internal_function int aio_tick(aio_state_t *aio, DWORD timeout)
 
 /// @summary Implements the main loop of the AIO driver.
 /// @param aio The AIO driver state to update.
+/// @param stats The I/O driver statistics to update.
 /// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
-internal_function inline int aio_poll(aio_state_t *aio)
+internal_function inline int aio_poll(aio_state_t *aio, io_stats_t *stats)
 {   // configure a zero timeout so we won't block.
-    return aio_tick(aio , 0);
+    return aio_tick(aio, stats, 0);
 }
 
 /// @summary Allocates a new AIO context and initializes the AIO state.
@@ -2203,8 +2277,9 @@ internal_function inline bool vfs_stat_by_asid(vfs_state_t const *vfs, intptr_t 
 
 /// @summary Determines whether a path references a file on a remote drive.
 /// @param path The NULL-terminated UTF-8 path of the file.
+/// @param stats The I/O driver statistics to update.
 /// @return true if the file exists on a remote drive.
-internal_function bool is_remote(char const *path)
+internal_function bool is_remote(char const *path, io_stats_t *stats)
 {   // the following prevents this function from being re-entrant.
     local_persist WCHAR hugebuf[32 * 1024];
 
@@ -2262,8 +2337,9 @@ internal_function bool is_remote(char const *path)
 /// @param sector_size On return, stores the physical sector size of the disk.
 /// @param decoder On return, points to the initialized decoder instance used to decode
 /// the data. The specific decoder type depends on the source file type.
+/// @param stats The I/O driver statistics to update.
 /// @return true if the file could be resolved.
-internal_function bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size, stream_decoder_t *&decoder)
+internal_function bool vfs_resolve_file_read(char const *path, int hints, HANDLE iocp, HANDLE &fd, int64_t &lsize, int64_t &psize, int64_t &offset, size_t &sector_size, stream_decoder_t *&decoder, io_stats_t *stats)
 {   // TODO: determine whether this path references a file contained within an archive.
     // for now, we only handle native file paths, which may be absolute or relative.
     bool native_path = true;
@@ -2273,7 +2349,7 @@ internal_function bool vfs_resolve_file_read(char const *path, int hints, HANDLE
         DWORD share  = FILE_SHARE_READ;
         DWORD create = OPEN_EXISTING;
         DWORD flags  = FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
-        if (((hints  & FILE_HINT_DIRECT) != 0) && is_remote(path) == false)
+        if (((hints  & FILE_HINT_DIRECT) != 0) && is_remote(path, stats) == false)
         {   // ideally we would also check based on file size, but Windows
             // doesn't provide any way to set FILE_FLAG_NO_BUFFERING after the fact.
             // TODO: could stat the file beforehand...
@@ -2299,7 +2375,8 @@ internal_function bool vfs_resolve_file_read(char const *path, int hints, HANDLE
 
 /// @summary Processes queued commands for creating a new stream-in.
 /// @param vfs The VFS driver state.
-internal_function void vfs_process_sicreate(vfs_state_t *vfs)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_sicreate(vfs_state_t *vfs, io_stats_t *stats)
 {
     while (vfs->ActiveCount < MAX_STREAMS_IN)
     {
@@ -2337,7 +2414,8 @@ internal_function void vfs_process_sicreate(vfs_state_t *vfs)
 
 /// @summary Processes any pending file close requests.
 /// @param vfs The VFS driver state.
-internal_function void vfs_process_closes(vfs_state_t *vfs)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_closes(vfs_state_t *vfs, io_stats_t *stats)
 {
     size_t  index = 0;
     for (size_t i = 0, n = vfs->LiveCount; i < n; ++i)
@@ -2398,7 +2476,8 @@ internal_function void vfs_process_closes(vfs_state_t *vfs)
 /// @summary Processes all completed file close notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
     aio_res_t res;
     size_t  index;
@@ -2425,7 +2504,8 @@ internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_
 /// @summary Processes all completed file read notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
     aio_res_t  res;
     vfs_sird_t read;
@@ -2480,7 +2560,8 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
 /// @summary Processes all completed file write notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
     aio_res_t res;
     while (srsw_fifo_get(&aio->WriteResults, res))
@@ -2495,7 +2576,8 @@ internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_
 /// @summary Processes all completed file flush notifications from AIO.
 /// @param vfs The VFS driver state.
 /// @param aio The AIO driver state.
-internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
     aio_res_t res;
     // there's nothing that the VFS driver needs to do here for the application.
@@ -2507,7 +2589,8 @@ internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state
 
 /// @summary Processes all pending buffer returns and releases memory back to the pool.
 /// @param vfs The VFS driver state.
-internal_function void vfs_process_buffer_returns(vfs_state_t *vfs)
+/// @param stats The I/O driver statistics to update.
+internal_function void vfs_process_buffer_returns(vfs_state_t *vfs, io_stats_t *stats)
 {
     for (size_t i = 0; i < THREAD_ID_COUNT; ++i)
     {
@@ -2544,9 +2627,10 @@ internal_function void vfs_process_buffer_returns(vfs_state_t *vfs)
 
 /// @summary Updates the status of all active input streams, and submits I/O operations.
 /// @param vfs The VFS driver state.
+/// @param stats The I/O driver statistics to update.
 /// @return true if the tick should continue submitting I/O operations, or false if
 /// either buffer space is full or the I/O operation queue is full.
-internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
+internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
 {
     iobuf_alloc_t &allocator = vfs->IoAllocator;
     size_t const read_amount = allocator.AllocSize;
@@ -2677,9 +2761,10 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs)
 
 /// @summary Processes as many pending stream-out operations as possible.
 /// @param vfs The VFS driver state to update.
+/// @param stats The I/O driver statistics to update.
 /// @return true if the tick should continue submitting I/O operations, or false if
 /// the I/O operation queue is full.
-internal_function bool vfs_update_stream_out(vfs_state_t *vfs)
+internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats)
 {
     vfs_sowr_t write;
     while (srmw_fifo_get(&vfs->StOutWriteQ, write))
@@ -2751,14 +2836,14 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     }
 
     // free up as much buffer state as possible.
-    vfs_process_buffer_returns(vfs);
+    vfs_process_buffer_returns(vfs, stats);
 
     // generate read and write I/O operations. this increments the number of
     // pending I/O operations across the set of active files. process stream
     // out first, as there are likely few of these operations, and we don't
     // want them to be starved out by the stream-in operations.
-    vfs_update_stream_out(vfs);
-    vfs_update_stream_in(vfs);
+    vfs_update_stream_out(vfs, stats);
+    vfs_update_stream_in(vfs, stats);
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
@@ -2773,19 +2858,19 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     // dispatch any completed I/O operations to the per-type queues for
     // processing by the platform layer and dispatching to the application.
     // this decrements the number of pending I/O operations across the file set.
-    vfs_process_completed_reads  (vfs, aio);
-    vfs_process_completed_writes (vfs, aio);
-    vfs_process_completed_flushes(vfs, aio);
-    vfs_process_completed_closes (vfs, aio);
+    vfs_process_completed_reads  (vfs, aio, stats);
+    vfs_process_completed_writes (vfs, aio, stats);
+    vfs_process_completed_flushes(vfs, aio, stats);
+    vfs_process_completed_closes (vfs, aio, stats);
 
     // close file requests should be processed after all read and write requests.
     // this ensures that all I/O has been submitted before closing the file.
     // files with pending I/O will not be closed until the I/O completes.
-    vfs_process_closes(vfs);
+    vfs_process_closes(vfs, stats);
 
     // open file requests should be processed after all close requests.
     // this increases the likelyhood that we'll have open file slots.
-    vfs_process_sicreate(vfs);
+    vfs_process_sicreate(vfs, stats);
 }
 
 /// @param vfs The VFS state that posted the I/O result.
@@ -2971,7 +3056,7 @@ internal_function bool platform_open_stream(char const *path, intptr_t id, int32
         // this avoids polluting the page cache with their data.
         hint  = FILE_HINT_DIRECT;
     }
-    if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize, decoder))
+    if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize, decoder, &IO_STATS))
     {   // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
@@ -3643,7 +3728,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
     {   // update the VFS and AIO drivers. this generates AIO operations,
         // updates stream-in status, and pushes data to the application.
         vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
-        aio_poll(&AIO_STATE);
+        aio_poll(&AIO_STATE, &IO_STATS);
 
         if (VFS_STATE.ActiveCount == 0)
         {   // we could have closed due to an error in this test case.
