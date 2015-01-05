@@ -586,8 +586,137 @@ global_variable char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
     "JSON"  /* FILE_TYPE_JSON */
 };
 
+/// @summary A list of all of the valid I/O statistic counters.
+global_variable io_count_e  IO_COUNT_LIST[IO_COUNT_COUNT] = {
+    IO_COUNT_STREAM_IN_OPEN,
+    IO_COUNT_STREAM_IN_OPEN_ONCE,
+    IO_COUNT_STREAM_IN_OPEN_LOOP,
+    IO_COUNT_STREAM_IN_EOS,
+    IO_COUNT_STREAM_IN_REWIND,
+    IO_COUNT_STREAM_IN_SEEK,
+    IO_COUNT_STREAM_IN_STOP,
+    IO_COUNT_STREAM_IN_PAUSE,
+    IO_COUNT_STREAM_IN_RESUME,
+    IO_COUNT_READS_STARTED,
+    IO_COUNT_READS_COMPLETE_SUCCESS,
+    IO_COUNT_READS_COMPLETE_ERROR,
+    IO_COUNT_WRITES_STARTED,
+    IO_COUNT_WRITES_COMPLETE_SUCCESS,
+    IO_COUNT_WRITES_COMPLETE_ERROR,
+    IO_COUNT_FLUSHES_STARTED,
+    IO_COUNT_FLUSHES_COMPLETE_SUCCESS,
+    IO_COUNT_FLUSHES_COMPLETE_ERROR,
+    IO_COUNT_CLOSES_STARTED,
+    IO_COUNT_CLOSES_COMPLETE_SUCCESS,
+    IO_COUNT_CLOSES_COMPLETE_ERROR,
+    IO_COUNT_BYTES_READ_REQUEST,
+    IO_COUNT_BYTES_READ_ACTUAL,
+    IO_COUNT_BYTES_WRITE_REQUEST,
+    IO_COUNT_BYTES_WRITE_ACTUAL,
+    IO_COUNT_NANOS_ELAPSED_AIO,
+    IO_COUNT_NANOS_ELAPSED_VFS,
+    IO_COUNT_TICKS_ELAPSED_AIO,
+    IO_COUNT_TICKS_ELAPSED_VFS,
+    IO_COUNT_MAX_OPS_QUEUED,
+    IO_COUNT_MAX_STREAM_IN_BYTES_USED,
+    IO_COUNT_MAX_TICK_DURATION_AIO,
+    IO_COUNT_MAX_TICK_DURATION_VFS,
+    IO_COUNT_MIN_TICK_DURATION_AIO,
+    IO_COUNT_MIN_TICK_DURATION_VFS
+};
+
+/// @summary A list of printable names for each valid I/O statistic counter.
+global_variable char const *IO_COUNT_NAME[IO_COUNT_COUNT] = {
+    "Stream-In Opens",
+    "Stream-In Opens (ONCE)",
+    "Stream-In Opens (LOOP)",
+    "Stream-In End-of-Stream",
+    "Stream-In Rewinds",
+    "Stream-In Seeks",
+    "Stream-In Stops",
+    "Stream-In Pauses",
+    "Stream-In Resumes",
+    "I/O Reads Started",
+    "I/O Reads Succeeded",
+    "I/O Reads Failed",
+    "I/O Writes Started",
+    "I/O Writes Succeeded",
+    "I/O Writes Failed",
+    "I/O Flushes Started",
+    "I/O Flushes Succeeded",
+    "I/O Flushes Failed",
+    "I/O Closes Started",
+    "I/O Closes Succeeded",
+    "I/O Closes Failed",
+    "I/O Read Bytes Requested",
+    "I/O Read Bytes Actual",
+    "I/O Write Bytes Requested",
+    "I/O Write Bytes Actual",
+    "Nanoseconds in aio_tick()",
+    "Nanoseconds in vfs_tick()",
+    "Number of AIO ticks",
+    "Number of VFS ticks",
+    "Maximum In-Flight I/O Ops",
+    "Maximum Stream-In Buffer",
+    "Maximum AIO tick duration",
+    "Maximum VFS tick duration",
+    "Minimum AIO tick duration",
+    "Minimum VFS tick duration"
+};
+
+/// @summary A list of all of the valid I/O error counters.
+global_variable io_error_e  IO_ERROR_LIST[IO_ERROR_COUNT] = {
+    IO_ERROR_FULL_READRESULTS,
+    IO_ERROR_FULL_WRITERESULTS,
+    IO_ERROR_FULL_CLOSERESULTS,
+    IO_ERROR_FULL_RESULTQUEUE,
+    IO_ERROR_INVALID_AIO_CMD,
+    IO_ERROR_ORPHANED_IOCB
+};
+
+/// @summary A list of printable names for each valid I/O error counter.
+global_variable char const *IO_ERROR_NAME[IO_ERROR_COUNT] = {
+    "Full ReadResults Queue",
+    "Full WriteResults Queue",
+    "Full CloseResults Queue",
+    "Full Thread Result Queue",
+    "Invalid AIO Command ID",
+    "Orphaned struct iocb"
+};
+
+/// @summary A list of all of the valid I/O stall counters.
+global_variable io_stall_e  IO_STALL_LIST[IO_STALL_COUNT] = {
+    IO_STALL_FULL_AIO_QUEUE,
+    IO_STALL_FULL_VFS_QUEUE,
+    IO_STALL_OUT_OF_IOBUFS
+};
+
+/// @summary A list of printable names for each valid I/O stall counter.
+global_variable char const *IO_STALL_NAME[IO_STALL_COUNT] = {
+    "Full AIO Operation Queue",
+    "Full VFS Operation Queue",
+    "Out of Stream-In Buffers"
+};
+
+/// @summary A list of all of the valid I/O rate slots.
+global_variable io_rate_e   IO_RATE_LIST [IO_RATE_COUNT]  = {
+    IO_RATE_BYTES_PER_SEC_IN,
+    IO_RATE_BYTES_PER_SEC_OUT
+};
+
+/// @summary A list of printable names for each valid I/O rate slot.
+global_variable char const *IO_RATE_NAME [IO_RATE_COUNT]  = {
+    "Stream-In Bytes/Second",
+    "Stream-Out Bytes/Second"
+};
+
+/// @summary The state of our VFS process (part of the I/O system).
 global_variable vfs_state_t VFS_STATE;
+
+/// @summary The state of our AIO process (part of the I/O system).
 global_variable aio_state_t AIO_STATE;
+
+/// @summary Profiling and statistic information for the I/O system.
 global_variable io_stats_t  IO_STATS;
 
 /*///////////////////////
@@ -1587,6 +1716,39 @@ internal_function void init_io_stats(io_stats_t *stats)
         for (size_t i = 0; i < IO_RATE_COUNT ; ++i) stats->Rates [i] = 0.0;
         stats->StartTimeNanos = nanotime();
     }
+}
+
+/// @summary Pretty-prints a set of I/O system counters to the specified stream.
+/// @param fp The output stream.
+/// @param stats The set of I/O system counters to format.
+internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
+{
+    for (size_t i = 0; i < IO_COUNT_COUNT; ++i)
+    {
+        fprintf(fp, "Count: %20s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
+    }
+    for (size_t i = 0; i < IO_ERROR_COUNT; ++i)
+    {
+        fprintf(fp, "Error: %20s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
+    }
+    for (size_t i = 0; i < IO_STALL_COUNT; ++i)
+    {
+        fprintf(fp, "Stall: %20s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
+    }
+    for (size_t i = 0; i < IO_RATE_COUNT ; ++i)
+    {
+        fprintf(fp, "Rate : %20s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
+    }
+}
+
+/// @summary Pretty-prints the system I/O streaming rates to the specified stream.
+/// @param fp The output stream.
+/// @param stats The set of I/O system counters to format.
+internal_function void print_io_rates(FILE *fp, io_stats_t const *stats)
+{
+    fprintf(fp, "Stream-In Bytes/Sec: %0.3f    Stream-Out Bytes/Sec: %0.3f\r",
+            stats->Rates[IO_RATE_BYTES_PER_SEC_IN],
+            stats->Rates[IO_RATE_BYTES_PER_SEC_OUT]);
 }
 
 /// @summary Allocates an iocb instance from the free list.
@@ -3497,6 +3659,7 @@ internal_function bool platform_close_stream(stream_writer_t **writer, char cons
 static int test_stream_in(int argc, char **argv, platform_layer_t *p)
 {
     int64_t ss = 0;
+    size_t num = 0;
     int result = EXIT_SUCCESS;
     bool  done = false;
 
@@ -3540,6 +3703,9 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             done = true;
         }
 
+        // print statistic counters:
+        print_io_rates(stdout, &IO_STATS);
+
         // process data received from the I/O system. normally, different
         // threads would handle one or more file types, depending on what
         // needs to be done with the data and who needs access to it.
@@ -3566,7 +3732,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
                         // refill to decode the next chunk of the input buffer.
                         size_t amount = read.Decoder->amount();
                         void  *buffer = read.Decoder->Cursor;
-                        fwrite(buffer , 1, amount, stdout);
+                        //fwrite(buffer , 1, amount, stdout);
                         read.Decoder->Cursor += amount;
                     } while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process
@@ -3584,11 +3750,19 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             vfs_sies_t eos;
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
-                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                p->stop_stream(eos.ASID);//p->rewind_stream(eos.ASID);
+                //fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
+                if (num < 1000)
+                {
+                    p->rewind_stream(eos.ASID);
+                    num++;
+                }
+                else p->stop_stream(eos.ASID);
             }
         }
     }
+
+    // print counters as a sanity check.
+    print_io_stats(stdout, &IO_STATS);
 
 cleanup:
     delete_vfs_state(&VFS_STATE);
