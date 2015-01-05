@@ -202,6 +202,7 @@ enum io_count_e
     IO_COUNT_TICKS_ELAPSED_VFS,
     IO_COUNT_MAX_OPS_QUEUED,
     IO_COUNT_MAX_STREAM_IN_BYTES_USED,
+    IO_COUNT_STREAM_IN_BYTES_USED,
     IO_COUNT_MAX_TICK_DURATION_AIO,
     IO_COUNT_MAX_TICK_DURATION_VFS,
     IO_COUNT_MIN_TICK_DURATION_AIO,
@@ -619,6 +620,7 @@ global_variable io_count_e  IO_COUNT_LIST[IO_COUNT_COUNT] = {
     IO_COUNT_TICKS_ELAPSED_VFS,
     IO_COUNT_MAX_OPS_QUEUED,
     IO_COUNT_MAX_STREAM_IN_BYTES_USED,
+    IO_COUNT_STREAM_IN_BYTES_USED,
     IO_COUNT_MAX_TICK_DURATION_AIO,
     IO_COUNT_MAX_TICK_DURATION_VFS,
     IO_COUNT_MIN_TICK_DURATION_AIO,
@@ -658,6 +660,7 @@ global_variable char const *IO_COUNT_NAME[IO_COUNT_COUNT] = {
     "Number of VFS ticks",
     "Maximum In-Flight I/O Ops",
     "Maximum Stream-In Buffer",
+    "Stream-In Bytes Used",
     "Maximum AIO tick duration",
     "Maximum VFS tick duration",
     "Minimum AIO tick duration",
@@ -1739,6 +1742,7 @@ internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
     {
         fprintf(fp, "Rate : %20s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
     }
+    fprintf(fp, "TOTAL SECONDS ELAPSED: %0.3f\n", seconds(nanotime() - stats->StartTimeNanos));
 }
 
 /// @summary Pretty-prints the system I/O streaming rates to the specified stream.
@@ -2843,6 +2847,7 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     // want them to be starved out by the stream-in operations.
     vfs_update_stream_out(vfs, stats);
     vfs_update_stream_in(vfs, stats);
+    io_count_assign(stats, IO_COUNT_STREAM_IN_BYTES_USED, iobuf_bytes_used(vfs->IoAllocator));
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
@@ -3760,8 +3765,11 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             }
         }
     }
+    vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+    aio_poll(&AIO_STATE, &IO_STATS);
 
     // print counters as a sanity check.
+    fprintf(stdout, "\n\n");
     print_io_stats(stdout, &IO_STATS);
 
 cleanup:
