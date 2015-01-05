@@ -260,20 +260,42 @@ enum vfs_file_hint_e
 /// These values should start from zero and increase monotonically.
 enum io_count_e
 {
-    IO_COUNT_AIO_READ_SUBMIT = 0,
-    IO_COUNT_AIO_READ_COMPLETE,
-    IO_COUNT_AIO_WRITE_SUBMIT,
-    IO_COUNT_AIO_WRITE_COMPLETE,
-    IO_COUNT_AIO_FSYNC_SUBMIT,
-    IO_COUNT_AIO_FSYNC_COMPLETE,
-    IO_COUNT_AIO_FDSYNC_SUBMIT,
-    IO_COUNT_AIO_FDSYNC_COMPLETE,
-    IO_COUNT_AIO_CLOSE_SUBMIT,
-    IO_COUNT_AIO_CLOSE_COMPLETE,
-    IO_COUNT_AIO_FINALIZE_SUBMIT,
-    IO_COUNT_AIO_FINALIZE_COMPLETE,
-    IO_COUNT_STREAM_IN_BYTES,
-    IO_COUNT_STREAM_OUT_BYTES,
+    IO_COUNT_STREAM_IN_OPEN = 0,
+    IO_COUNT_STREAM_IN_OPEN_ONCE,
+    IO_COUNT_STREAM_IN_OPEN_LOOP,
+    IO_COUNT_STREAM_IN_EOS,
+    IO_COUNT_STREAM_IN_REWIND,
+    IO_COUNT_STREAM_IN_SEEK,
+    IO_COUNT_STREAM_IN_STOP,
+    IO_COUNT_STREAM_IN_PAUSE,
+    IO_COUNT_STREAM_IN_RESUME,
+    IO_COUNT_READS_STARTED,
+    IO_COUNT_READS_COMPLETE_SUCCESS,
+    IO_COUNT_READS_COMPLETE_ERROR,
+    IO_COUNT_WRITES_STARTED,
+    IO_COUNT_WRITES_COMPLETE_SUCCESS,
+    IO_COUNT_WRITES_COMPLETE_ERROR,
+    IO_COUNT_FLUSHES_STARTED,
+    IO_COUNT_FLUSHES_COMPLETE_SUCCESS,
+    IO_COUNT_FLUSHES_COMPLETE_ERROR,
+    IO_COUNT_CLOSES_STARTED,
+    IO_COUNT_CLOSES_COMPLETE_SUCCESS,
+    IO_COUNT_CLOSES_COMPLETE_ERROR,
+    IO_COUNT_BYTES_READ_REQUEST,
+    IO_COUNT_BYTES_READ_ACTUAL,
+    IO_COUNT_BYTES_WRITE_REQUEST,
+    IO_COUNT_BYTES_WRITE_ACTUAL,
+    IO_COUNT_NANOS_ELAPSED_AIO,
+    IO_COUNT_NANOS_ELAPSED_VFS,
+    IO_COUNT_TICKS_ELAPSED_AIO,
+    IO_COUNT_TICKS_ELAPSED_VFS,
+    IO_COUNT_MAX_OPS_QUEUED,
+    IO_COUNT_MAX_STREAM_IN_BYTES_USED,
+    IO_COUNT_STREAM_IN_BYTES_USED,
+    IO_COUNT_MAX_TICK_DURATION_AIO,
+    IO_COUNT_MAX_TICK_DURATION_VFS,
+    IO_COUNT_MIN_TICK_DURATION_AIO,
+    IO_COUNT_MIN_TICK_DURATION_VFS,
     IO_COUNT_COUNT
 };
 
@@ -281,8 +303,12 @@ enum io_count_e
 /// These values should start from zero and increase monotonically.
 enum io_error_e
 {
-    IO_ERROR_ORPHANED_IOCB = 0,
-    IO_ERROR_BAD_AIO_CMD,
+    IO_ERROR_FULL_READRESULTS = 0,
+    IO_ERROR_FULL_WRITERESULTS,
+    IO_ERROR_FULL_CLOSERESULTS,
+    IO_ERROR_FULL_RESULTQUEUE,
+    IO_ERROR_INVALID_AIO_CMD,
+    IO_ERROR_ORPHANED_IOCB,
     IO_ERROR_COUNT
 };
 
@@ -293,8 +319,16 @@ enum io_stall_e
     IO_STALL_FULL_AIO_QUEUE = 0,
     IO_STALL_FULL_VFS_QUEUE,
     IO_STALL_OUT_OF_IOBUFS,
-    IO_STALL_FULL_RESULT_QUEUE,
     IO_STALL_COUNT
+};
+
+/// @summary Define the various rate counters maintained by the I/O system.
+/// These values should start from zero and increase monotonically.
+enum io_rate_e
+{
+    IO_RATE_BYTES_PER_SEC_IN = 0,
+    IO_RATE_BYTES_PER_SEC_OUT,
+    IO_RATE_COUNT
 };
 
 /// @summary Defines the data associated with a fixed-size lookaside queue.
@@ -583,7 +617,8 @@ struct io_stats_t
     uint64_t           Counts[IO_COUNT_COUNT];       /// I/O driver event counters.
     uint64_t           Errors[IO_ERROR_COUNT];       /// I/O driver error counters.
     uint64_t           Stalls[IO_STALL_COUNT];       /// I/O driver stall counters.
-    uint64_t           StallsSIRQ[THREAD_ID_COUNT];  /// Stalls due to a full stream-in result queue.
+    double             Rates [IO_RATE_COUNT];        /// I/O driver rate buckets.
+    uint64_t           StartTimeNanos;               /// Nanosecond timestamp at which stats were initialized.
 };
 
 /// @summary Defines the data associated with a file opened for buffered, synchronous I/O.
@@ -635,8 +670,139 @@ global_variable char const *FILE_TYPE_NAME[FILE_TYPE_COUNT] = {
     "JSON"  /* FILE_TYPE_JSON */
 };
 
+/// @summary A list of all of the valid I/O statistic counters.
+global_variable io_count_e  IO_COUNT_LIST[IO_COUNT_COUNT] = {
+    IO_COUNT_STREAM_IN_OPEN,
+    IO_COUNT_STREAM_IN_OPEN_ONCE,
+    IO_COUNT_STREAM_IN_OPEN_LOOP,
+    IO_COUNT_STREAM_IN_EOS,
+    IO_COUNT_STREAM_IN_REWIND,
+    IO_COUNT_STREAM_IN_SEEK,
+    IO_COUNT_STREAM_IN_STOP,
+    IO_COUNT_STREAM_IN_PAUSE,
+    IO_COUNT_STREAM_IN_RESUME,
+    IO_COUNT_READS_STARTED,
+    IO_COUNT_READS_COMPLETE_SUCCESS,
+    IO_COUNT_READS_COMPLETE_ERROR,
+    IO_COUNT_WRITES_STARTED,
+    IO_COUNT_WRITES_COMPLETE_SUCCESS,
+    IO_COUNT_WRITES_COMPLETE_ERROR,
+    IO_COUNT_FLUSHES_STARTED,
+    IO_COUNT_FLUSHES_COMPLETE_SUCCESS,
+    IO_COUNT_FLUSHES_COMPLETE_ERROR,
+    IO_COUNT_CLOSES_STARTED,
+    IO_COUNT_CLOSES_COMPLETE_SUCCESS,
+    IO_COUNT_CLOSES_COMPLETE_ERROR,
+    IO_COUNT_BYTES_READ_REQUEST,
+    IO_COUNT_BYTES_READ_ACTUAL,
+    IO_COUNT_BYTES_WRITE_REQUEST,
+    IO_COUNT_BYTES_WRITE_ACTUAL,
+    IO_COUNT_NANOS_ELAPSED_AIO,
+    IO_COUNT_NANOS_ELAPSED_VFS,
+    IO_COUNT_TICKS_ELAPSED_AIO,
+    IO_COUNT_TICKS_ELAPSED_VFS,
+    IO_COUNT_MAX_OPS_QUEUED,
+    IO_COUNT_MAX_STREAM_IN_BYTES_USED,
+    IO_COUNT_STREAM_IN_BYTES_USED,
+    IO_COUNT_MAX_TICK_DURATION_AIO,
+    IO_COUNT_MAX_TICK_DURATION_VFS,
+    IO_COUNT_MIN_TICK_DURATION_AIO,
+    IO_COUNT_MIN_TICK_DURATION_VFS
+};
+
+/// @summary A list of printable names for each valid I/O statistic counter.
+global_variable char const *IO_COUNT_NAME[IO_COUNT_COUNT] = {
+    "Stream-In Opens",
+    "Stream-In Opens (ONCE)",
+    "Stream-In Opens (LOOP)",
+    "Stream-In End-of-Stream",
+    "Stream-In Rewinds",
+    "Stream-In Seeks",
+    "Stream-In Stops",
+    "Stream-In Pauses",
+    "Stream-In Resumes",
+    "I/O Reads Started",
+    "I/O Reads Succeeded",
+    "I/O Reads Failed",
+    "I/O Writes Started",
+    "I/O Writes Succeeded",
+    "I/O Writes Failed",
+    "I/O Flushes Started",
+    "I/O Flushes Succeeded",
+    "I/O Flushes Failed",
+    "I/O Closes Started",
+    "I/O Closes Succeeded",
+    "I/O Closes Failed",
+    "I/O Read Bytes Requested",
+    "I/O Read Bytes Actual",
+    "I/O Write Bytes Requested",
+    "I/O Write Bytes Actual",
+    "Nanoseconds in aio_tick()",
+    "Nanoseconds in vfs_tick()",
+    "Number of AIO ticks",
+    "Number of VFS ticks",
+    "Maximum In-Flight I/O Ops",
+    "Maximum Stream-In Buffer",
+    "Stream-In Bytes Used",
+    "Maximum AIO tick duration",
+    "Maximum VFS tick duration",
+    "Minimum AIO tick duration",
+    "Minimum VFS tick duration"
+};
+
+/// @summary A list of all of the valid I/O error counters.
+global_variable io_error_e  IO_ERROR_LIST[IO_ERROR_COUNT] = {
+    IO_ERROR_FULL_READRESULTS,
+    IO_ERROR_FULL_WRITERESULTS,
+    IO_ERROR_FULL_CLOSERESULTS,
+    IO_ERROR_FULL_RESULTQUEUE,
+    IO_ERROR_INVALID_AIO_CMD,
+    IO_ERROR_ORPHANED_IOCB
+};
+
+/// @summary A list of printable names for each valid I/O error counter.
+global_variable char const *IO_ERROR_NAME[IO_ERROR_COUNT] = {
+    "Full ReadResults Queue",
+    "Full WriteResults Queue",
+    "Full CloseResults Queue",
+    "Full Thread Result Queue",
+    "Invalid AIO Command ID",
+    "Orphaned struct iocb"
+};
+
+/// @summary A list of all of the valid I/O stall counters.
+global_variable io_stall_e  IO_STALL_LIST[IO_STALL_COUNT] = {
+    IO_STALL_FULL_AIO_QUEUE,
+    IO_STALL_FULL_VFS_QUEUE,
+    IO_STALL_OUT_OF_IOBUFS
+};
+
+/// @summary A list of printable names for each valid I/O stall counter.
+global_variable char const *IO_STALL_NAME[IO_STALL_COUNT] = {
+    "Full AIO Operation Queue",
+    "Full VFS Operation Queue",
+    "Out of Stream-In Buffers"
+};
+
+/// @summary A list of all of the valid I/O rate slots.
+global_variable io_rate_e   IO_RATE_LIST [IO_RATE_COUNT]  = {
+    IO_RATE_BYTES_PER_SEC_IN,
+    IO_RATE_BYTES_PER_SEC_OUT
+};
+
+/// @summary A list of printable names for each valid I/O rate slot.
+global_variable char const *IO_RATE_NAME [IO_RATE_COUNT]  = {
+    "Stream-In Bytes/Second",
+    "Stream-Out Bytes/Second"
+};
+
+/// @summary The state of our VFS process (part of the I/O system).
 global_variable vfs_state_t VFS_STATE;
+
+/// @summary The state of our AIO process (part of the I/O system).
 global_variable aio_state_t AIO_STATE;
+
+/// @summary Profiling and statistic information for the I/O system.
 global_variable io_stats_t  IO_STATS;
 
 // The following functions are not available under MinGW, so kernel32.dll is
@@ -774,6 +940,14 @@ internal_function inline uint64_t nanotime(void)
     LARGE_INTEGER tsf = CLOCK_FREQUENCY;
     QueryPerformanceCounter(&tsc);
     return (SEC_TO_NANOSEC * uint64_t(tsc.QuadPart) / uint64_t(tsf.QuadPart));
+}
+
+/// @summary Convert a value specified in nanoseconds to a value specified in seconds.
+/// @param nanos The nanoseconds value.
+/// @return The input value, converted to seconds.
+internal_function inline double seconds(uint64_t nanos)
+{
+    return double(nanos) / double(SEC_TO_NANOSEC);
 }
 
 /// @summary Atomically writes a 32-bit unsigned integer value to a given address.
@@ -1765,6 +1939,47 @@ internal_function inline void io_count(io_stats_t *stats, int count_id)
     stats->Counts[count_id]++;
 }
 
+/// @summary Directly assigns an I/O statistics counter.
+/// @param stats The I/O statistics to update.
+/// @param count_id The counter ID, one of io_count_e.
+/// @param value The value to assign to the counter.
+internal_function inline void io_count_assign(io_stats_t *stats, int count_id, uint64_t value)
+{
+    stats->Counts[count_id] = value;
+}
+
+/// @summary Assigns a counter to the specified value if the value is less than
+/// the current value of the counter.
+/// @param stats The I/O statistics to update.
+/// @param count_id The counter ID, one of io_count_e.
+/// @param value The value to test and assigned to the counter.
+internal_function inline void io_count_assign_min(io_stats_t *stats, int count_id, uint64_t value)
+{
+    uint64_t      min_value = stats->Counts[count_id] < value ? stats->Counts[count_id] : value;
+    stats->Counts[count_id] = min_value;
+}
+
+/// @summary Assigns a counter to the specified value if the value is greater
+/// than the current value of the counter.
+/// @param stats The I/O statistics to update.
+/// @param count_id The counter ID, one of io_count_e.
+/// @param value The value to test and assigned to the counter.
+internal_function inline void io_count_assign_max(io_stats_t *stats, int count_id, uint64_t value)
+{
+    uint64_t      max_value = stats->Counts[count_id] > value ? stats->Counts[count_id] : value;
+    stats->Counts[count_id] = max_value;
+
+}
+
+/// @summary Increments an I/O statistics counter by a given amount.
+/// @param stats The I/O statistics to update.
+/// @param count_id The counter ID, one of io_count_e.
+/// @param amount The amount by which the counter should be incremented.
+internal_function inline void io_count_increment(io_stats_t *stats, int count_id, uint64_t amount)
+{
+    stats->Counts[count_id] += amount;
+}
+
 /// @summary Increments an I/O error counter.
 /// @param stats The I/O statistics to update.
 /// @param error_id The counter ID, one of io_error_e.
@@ -1776,14 +1991,18 @@ internal_function inline void io_error(io_stats_t *stats, int error_id)
 /// @summary Increments an I/O stall counter.
 /// @param stats The I/O statistics to update.
 /// @param stall_id The counter ID, one of io_stall_e.
-/// @param thread_id The optional thread ID. Specified if stall_id has a thread-specific counterpart.
-internal_function inline void io_stall(io_stats_t *stats, int stall_id, int thread_id=0)
+internal_function inline void io_stall(io_stats_t *stats, int stall_id)
 {
     stats->Stalls[stall_id]++;
-    if (stall_id == IO_STALL_FULL_RESULT_QUEUE)
-    {
-        stats->StallsSIRQ[thread_id]++;
-    }
+}
+
+/// @summary Assigns an I/O rate counter.
+/// @param stats The I/O statistics to update.
+/// @param rate_id The counter ID, one of io_rate_e.
+/// @param value The computed rate value.
+internal_function inline void io_rate(io_stats_t *stats, int rate_id, double value)
+{
+    stats->Rates[rate_id] = value;
 }
 
 /// @summary Given a file type, return the ID of the thread on which I/O should be processed.
@@ -1812,11 +2031,46 @@ internal_function void init_io_stats(io_stats_t *stats)
 {
     if (stats != NULL)
     {
-        for (size_t i = 0; i < IO_COUNT_COUNT ; ++i) stats->Counts[i] = 0;
-        for (size_t i = 0; i < IO_ERROR_COUNT ; ++i) stats->Errors[i] = 0;
-        for (size_t i = 0; i < IO_STALL_COUNT ; ++i) stats->Stalls[i] = 0;
-        for (size_t i = 0; i < THREAD_ID_COUNT; ++i) stats->StallsSIRQ[i] = 0;
+        for (size_t i = 0; i < IO_COUNT_COUNT; ++i) stats->Counts[i] = 0;
+        for (size_t i = 0; i < IO_ERROR_COUNT; ++i) stats->Errors[i] = 0;
+        for (size_t i = 0; i < IO_STALL_COUNT; ++i) stats->Stalls[i] = 0;
+        for (size_t i = 0; i < IO_RATE_COUNT ; ++i) stats->Rates [i] = 0.0;
+        stats->StartTimeNanos = nanotime();
     }
+}
+
+/// @summary Pretty-prints a set of I/O system counters to the specified stream.
+/// @param fp The output stream.
+/// @param stats The set of I/O system counters to format.
+internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
+{
+    for (size_t i = 0; i < IO_COUNT_COUNT; ++i)
+    {
+        fprintf(fp, "Count: %20s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
+    }
+    for (size_t i = 0; i < IO_ERROR_COUNT; ++i)
+    {
+        fprintf(fp, "Error: %20s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
+    }
+    for (size_t i = 0; i < IO_STALL_COUNT; ++i)
+    {
+        fprintf(fp, "Stall: %20s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
+    }
+    for (size_t i = 0; i < IO_RATE_COUNT ; ++i)
+    {
+        fprintf(fp, "Rate : %20s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
+    }
+    fprintf(fp, "TOTAL SECONDS ELAPSED: %0.3f\n", seconds(nanotime() - stats->StartTimeNanos));
+}
+
+/// @summary Pretty-prints the system I/O streaming rates to the specified stream.
+/// @param fp The output stream.
+/// @param stats The set of I/O system counters to format.
+internal_function void print_io_rates(FILE *fp, io_stats_t const *stats)
+{
+    fprintf(fp, "Stream-In Bytes/Sec: %0.3f    Stream-Out Bytes/Sec: %0.3f\r",
+            stats->Rates[IO_RATE_BYTES_PER_SEC_IN],
+            stats->Rates[IO_RATE_BYTES_PER_SEC_OUT]);
 }
 
 /// @summary Allocates an iocb instance from the free list.
@@ -2070,6 +2324,8 @@ error_cleanup:
 /// @return Zero to continue with the next tick, 1 if the shutdown signal was received, -1 if an error occurred.
 internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeout)
 {   // poll kernel AIO for any completed events, and process them first.
+    uint64_t s_nanos = nanotime();
+    uint64_t e_nanos = 0;
     OVERLAPPED_ENTRY events[AIO_MAX_ACTIVE];  // STACK: 8-16KB depending on OS.
     ULONG nevents = 0;
     BOOL  iocpres = GetQueuedCompletionStatusEx_Func(aio->ASIOContext, events, AIO_MAX_ACTIVE, &nevents, timeout, FALSE);
@@ -2131,8 +2387,8 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeou
                 return 1;
             }
             else
-            {   // TODO: track this statistic somewhere.
-                // this should not happen.
+            {   // this should never happen. this is a serious programming error.
+                io_error(stats, IO_ERROR_ORPHANED_IOCB);
             }
         }
     }
@@ -2155,9 +2411,11 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeou
         switch (req.Command)
         {
             case AIO_COMMAND_READ:
+                io_count(stats, IO_COUNT_READS_STARTED);
                 result = aio_submit_read (aio, req, error, stats);
                 break;
             case AIO_COMMAND_WRITE:
+                io_count(stats, IO_COUNT_WRITES_STARTED);
                 result = aio_submit_write(aio, req, error, stats);
                 break;
             case AIO_COMMAND_FLUSH:
@@ -2170,10 +2428,16 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeou
                 result = aio_process_finalize(aio, req, stats);
                 break;
             default:
+                io_error(stats, IO_ERROR_INVALID_AIO_CMD);
                 error  = ERROR_INVALID_PARAMETER;
                 break;
         }
     }
+    e_nanos = nanotime();
+    io_count(stats, IO_COUNT_TICKS_ELAPSED_AIO);
+    io_count_increment (stats, IO_COUNT_NANOS_ELAPSED_AIO    , e_nanos - s_nanos);
+    io_count_assign_min(stats, IO_COUNT_MIN_TICK_DURATION_AIO, e_nanos - s_nanos);
+    io_count_assign_max(stats, IO_COUNT_MAX_TICK_DURATION_AIO, e_nanos - s_nanos);
     return 0;
 }
 
@@ -2409,6 +2673,11 @@ internal_function void vfs_process_sicreate(vfs_state_t *vfs, io_stats_t *stats)
         vfs->LiveStat[index].NLiveDecode = 0;
         vfs->LiveStat[index].Priority    = req.Priority;
         vfs->LiveStat[index].Decoder     = req.Decoder;
+
+        // update statistics:
+        io_count(stats, IO_COUNT_STREAM_IN_OPEN);
+        if (req.Behavior == STREAM_IN_ONCE) io_count(stats, IO_COUNT_STREAM_IN_OPEN_ONCE);
+        if (req.Behavior == STREAM_IN_LOOP) io_count(stats, IO_COUNT_STREAM_IN_OPEN_LOOP);
     }
 }
 
@@ -2425,7 +2694,8 @@ internal_function void vfs_process_closes(vfs_state_t *vfs, io_stats_t *stats)
         {   // locate the stream by ID within the active stream list.
             if (vfs_find_by_asid(vfs, vfs->LiveASID[i], index) == false)
             {   // this stream isn't active, so it can't be closed.
-                // TODO: assert; this should not ever happen.
+                assert(false && "Inactive stream-in marked for close.");
+                continue;
             }
             if (st.NLiveIoOps > 0)
             {   // there are pending I/O operations against this file.
@@ -2462,11 +2732,13 @@ internal_function void vfs_process_closes(vfs_state_t *vfs, io_stats_t *stats)
                 // mark the file as closed in the live list.
                 st.StatusFlags &=~VFS_STATUS_CLOSE;
                 st.StatusFlags |= VFS_STATUS_CLOSED;
+                io_count(stats, IO_COUNT_CLOSES_STARTED);
             }
             else
             {   // there's no more space in the pending I/O operation queue.
                 // we'll try closing the file again when there's space.
                 st.StatusFlags |= VFS_STATUS_CLOSE;
+                io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
                 break;
             }
         }
@@ -2498,6 +2770,8 @@ internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_
                 vfs->LiveCount = last_index;
             }
         }
+        if (res.OSError == 0) io_count(stats, IO_COUNT_CLOSES_COMPLETE_SUCCESS);
+        else io_count(stats, IO_COUNT_CLOSES_COMPLETE_ERROR);
     }
 }
 
@@ -2526,6 +2800,7 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             {
                 vfs_sies_t eos = { res.AFID, vfs->StInInfo[index_a].EndBehavior };
                 srsw_fifo_put(&vfs->SiEndOfS[thread_id], eos);
+                io_count(stats, IO_COUNT_STREAM_IN_EOS);
             }
             // populate and enqueue a pending decode operation.
             read.ASID        = res.AFID;
@@ -2540,8 +2815,9 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
                 vfs->LiveStat[index_l].NLiveDecode++;
             }
             else
-            {   // TODO: log this statistic; this should not happen.
+            {   // the result queue is full. this is a serious error.
                 iobuf_put(vfs->IoAllocator, res.DataBuffer);
+                io_error(stats, IO_ERROR_FULL_RESULTQUEUE);
             }
         }
         else
@@ -2554,6 +2830,9 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
                 vfs->LiveStat[index_l].NLiveIoOps--;
             }
         }
+        io_count_increment(stats, IO_COUNT_BYTES_READ_ACTUAL, res.DataAmount);
+        if (res.OSError == 0) io_count(stats, IO_COUNT_READS_COMPLETE_SUCCESS);
+        else io_count(stats, IO_COUNT_READS_COMPLETE_ERROR);
     }
 }
 
@@ -2570,6 +2849,9 @@ internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_
         {   // free the fixed-size write buffer.
             VirtualFree(res.DataBuffer, 0, MEM_RELEASE);
         }
+        io_count_increment(stats, IO_COUNT_BYTES_WRITE_ACTUAL, res.DataAmount);
+        if (res.OSError == 0) io_count(stats, IO_COUNT_WRITES_COMPLETE_SUCCESS);
+        else io_count(stats, IO_COUNT_WRITES_COMPLETE_ERROR);
     }
 }
 
@@ -2583,7 +2865,8 @@ internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state
     // there's nothing that the VFS driver needs to do here for the application.
     while (srsw_fifo_get(&aio->FlushResults, res))
     {
-        /* empty */
+        if (res.OSError == 0) io_count(stats, IO_COUNT_FLUSHES_COMPLETE_SUCCESS);
+        else io_count(stats, IO_COUNT_FLUSHES_COMPLETE_ERROR);
     }
 }
 
@@ -2651,13 +2934,16 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                 case STREAM_IN_PAUSE:
                     vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_PAUSE;
                     vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_CLOSE);
+                    io_count(stats, IO_COUNT_STREAM_IN_PAUSE);
                     break;
                 case STREAM_IN_RESUME:
                     vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    io_count(stats, IO_COUNT_STREAM_IN_RESUME);
                     break;
                 case STREAM_IN_REWIND:
                     vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
                     vfs->RdOffset[index_a] = 0;
+                    io_count(stats, IO_COUNT_STREAM_IN_REWIND);
                     break;
                 case STREAM_IN_SEEK:
                     if ((op.Argument & (vfs->StInInfo[index_a].SectorSize-1)) != 0)
@@ -2668,9 +2954,11 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                     }
                     vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
                     vfs->RdOffset[index_a] = op.Argument;
+                    io_count(stats, IO_COUNT_STREAM_IN_SEEK);
                     break;
                 case STREAM_IN_STOP:
                     vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_CLOSE;
+                    io_count(stats, IO_COUNT_STREAM_IN_STOP);
                     break;
             }
         }
@@ -2715,6 +3003,11 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                 req->Reserved   = 0;
                 nqueued++;
 
+                // update statistics.
+                io_count(stats, IO_COUNT_READS_STARTED);
+                io_count_increment(stats, IO_COUNT_BYTES_READ_REQUEST, read_amount);
+                io_count_assign_max(stats, IO_COUNT_MAX_STREAM_IN_BYTES_USED, iobuf_bytes_used(allocator));
+
                 // update the byte offset to the next read.
                 int64_t newofs  = vfs->RdOffset[index_a] + read_amount;
                 vfs->RdOffset[index_a] = newofs;
@@ -2724,10 +3017,11 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                     break;
                 }
             }
-            // we ran out of I/O queue space; no point in continuing.
-            // TODO: track this statistic somewhere, we want to know
-            // how often this happens.
-            else return false;
+            else
+            {   // we ran out of I/O queue space; no point in continuing.
+                io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
+                return false;
+            }
         }
 
         // update the number of pending AIO operations against the file.
@@ -2752,7 +3046,7 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         }
         else if (nqueued == 0)
         {   // if we ran out of I/O buffer space there's no point in continuing.
-            // TODO: track this statistic somewhere.
+            io_stall(stats, IO_STALL_OUT_OF_IOBUFS);
             return false;
         }
     }
@@ -2783,10 +3077,15 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
             req->AFID       = 0;
             req->Type       = 0;
             req->Reserved   = 0;
+
+            // update statistics.
+            io_count(stats, IO_COUNT_WRITES_STARTED);
+            io_count_increment(stats, IO_COUNT_BYTES_WRITE_REQUEST, write.DataSize);
         }
         else
         {   // the internal operation queue is full.
             // put the write back in the queue, and return.
+            io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
             srmw_fifo_put(&vfs->StOutWriteQ, write);
             return false;
         }
@@ -2809,10 +3108,14 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
             req->AFID       = 0;
             req->Type       = 0;
             req->Reserved   = 0;
+
+            // update statistics.
+            io_count(stats, IO_COUNT_CLOSES_STARTED);
         }
         else
         {   // the internal operation queue is full.
             // put the close back in the queue, and return.
+            io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
             srmw_fifo_put(&vfs->StOutCloseQ, close);
             return false;
         }
@@ -2828,6 +3131,8 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
 /// @param stats Optional VFS and AIO counters. May be NULL.
 internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *stats)
 {
+    uint64_t   s_nanos = nanotime();
+    uint64_t   e_nanos = 0;
     io_stats_t null_stats;
     if (stats == NULL)
     {   // prevent everything from constantly having to NULL-check this.
@@ -2844,16 +3149,23 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     // want them to be starved out by the stream-in operations.
     vfs_update_stream_out(vfs, stats);
     vfs_update_stream_in(vfs, stats);
+    io_count_assign(stats, IO_COUNT_STREAM_IN_BYTES_USED, iobuf_bytes_used(vfs->IoAllocator));
 
     // we're done generating operations, so push as much as possible to AIO.
     aio_req_t request;
+    size_t    qsize  = vfs->IoOperations.Count;
     while (io_opq_top(&vfs->IoOperations, request))
     {   // we were able to retrieve an operation from our internal queue.
         if (srsw_fifo_put(&aio->RequestQueue, request))
         {   // we were able to push it to AIO, so remove it from our queue.
             io_opq_get(&vfs->IoOperations, request);
         }
+        else
+        {   // the AIO request queue was full, so stall out.
+            io_stall(stats, IO_STALL_FULL_AIO_QUEUE);
+        }
     }
+    io_count_assign_max(stats, IO_COUNT_MAX_OPS_QUEUED, qsize);
 
     // dispatch any completed I/O operations to the per-type queues for
     // processing by the platform layer and dispatching to the application.
@@ -2871,6 +3183,20 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     // open file requests should be processed after all close requests.
     // this increases the likelyhood that we'll have open file slots.
     vfs_process_sicreate(vfs, stats);
+
+    // update statistics.
+    e_nanos = nanotime();
+    io_count(stats, IO_COUNT_TICKS_ELAPSED_VFS);
+    io_count_increment (stats, IO_COUNT_NANOS_ELAPSED_VFS    , e_nanos - s_nanos);
+    io_count_assign_min(stats, IO_COUNT_MIN_TICK_DURATION_VFS, e_nanos - s_nanos);
+    io_count_assign_max(stats, IO_COUNT_MAX_TICK_DURATION_VFS, e_nanos - s_nanos);
+
+    // update rates.
+    double   sec = seconds(e_nanos - stats->StartTimeNanos);
+    uint64_t bsi = stats->Counts[IO_COUNT_BYTES_READ_ACTUAL];
+    uint64_t bso = stats->Counts[IO_COUNT_BYTES_WRITE_ACTUAL];
+    io_rate(stats, IO_RATE_BYTES_PER_SEC_IN , bsi / sec);
+    io_rate(stats, IO_RATE_BYTES_PER_SEC_OUT, bso / sec);
 }
 
 /// @param vfs The VFS state that posted the I/O result.
@@ -3693,6 +4019,7 @@ internal_function bool platform_close_stream(stream_writer_t **writer, char cons
 static int test_stream_in(int argc, char **argv, platform_layer_t *p)
 {
     int64_t ss = 0;
+    size_t num = 0;
     int result = EXIT_SUCCESS;
     bool  done = false;
 
@@ -3735,6 +4062,9 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             // normally, you wouldn't have this check.
             done = true;
         }
+
+        // print statistic counters:
+        print_io_rates(stdout, &IO_STATS);
 
         // process data received from the I/O system. normally, different
         // threads would handle one or more file types, depending on what
@@ -3780,11 +4110,22 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             vfs_sies_t eos;
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
-                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                p->stop_stream(eos.ASID);//p->rewind_stream(eos.ASID);
+                //fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
+                if (num < 1000)
+                {
+                    p->rewind_stream(eos.ASID);
+                    num++;
+                }
+                else p->stop_stream(eos.ASID);
             }
         }
     }
+    vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+    aio_poll(&AIO_STATE, &IO_STATS);
+
+    // print counters as a sanity check.
+    fprintf(stdout, "\n\n");
+    print_io_stats(stdout, &IO_STATS);
 
 cleanup:
     delete_vfs_state(&VFS_STATE);
