@@ -2411,11 +2411,9 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeou
         switch (req.Command)
         {
             case AIO_COMMAND_READ:
-                io_count(stats, IO_COUNT_READS_STARTED);
                 result = aio_submit_read (aio, req, error, stats);
                 break;
             case AIO_COMMAND_WRITE:
-                io_count(stats, IO_COUNT_WRITES_STARTED);
                 result = aio_submit_write(aio, req, error, stats);
                 break;
             case AIO_COMMAND_FLUSH:
