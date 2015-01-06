@@ -2671,7 +2671,7 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
             io_fpq_put(&file_queue, vfs->LiveStat[i].Priority, index_a, i);
         }
     }
-    while(io_fpq_get(&file_queue, index_a, index_l, priority))
+    while (io_fpq_get(&file_queue, index_a, index_l, priority))
     {   // we want to submit as many sequential reads against the file as
         // possible for maximum efficiency. these operations will be
         // processed in-order, so this minimizes seeking as much as possible.
@@ -2679,10 +2679,10 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         // 1. we've reached the end of the file data. continue with the next file.
         // 2. we've run out of pending queue space. stop processing for the tick.
         // 3. we've run out of I/O buffer space. stop processing for the tick.
-        size_t nqueued = 0;
+        uint32_t  nqueued = 0;
         while (iobuf_bytes_free(allocator) > 0)
         {   // allocate a new request in our internal operation queue.
-            aio_req_t *req  = io_opq_put(&vfs->IoOperations, priority);
+            aio_req_t *req = io_opq_put(&vfs->IoOperations, priority);
             if (req != NULL)
             {   // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
