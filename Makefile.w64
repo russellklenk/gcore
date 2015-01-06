@@ -19,7 +19,7 @@ PROJ_LDFLAGS  = -s -Wl,--subsystem,console
 all:: ${TARGET}
 
 ${TARGET}: ${OBJECTS}
-	${CC} ${LDFLAGS} ${PROJ_LDFLAGS} -o $@ $^ ${LIBRARIES}
+	${CC} ${LIBRARY_DIRS} ${LDFLAGS} ${PROJ_LDFLAGS} -o $@ $^ ${LIBRARIES}
 
 ${OBJECTS}: %.o: %.cc ${DEPENDENCIES}
 	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -o $@ -c $<
