@@ -4075,7 +4075,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
             int32_t    type = int32_t(i); // the file_type_e.
             while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
             {
-                if (read.OSError == 0)
+                if (SUCCEEDED(read.OSError))
                 {   // echo the data to stdout.
                     // normally, you'd push the result to a callback.
                     // note that all of the reading of the data is performed
