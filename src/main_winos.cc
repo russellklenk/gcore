@@ -2046,19 +2046,19 @@ internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
 {
     for (size_t i = 0; i < IO_COUNT_COUNT; ++i)
     {
-        fprintf(fp, "Count: %20s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
+        fprintf(fp, "Count: %30s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
     }
     for (size_t i = 0; i < IO_ERROR_COUNT; ++i)
     {
-        fprintf(fp, "Error: %20s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
+        fprintf(fp, "Error: %30s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
     }
     for (size_t i = 0; i < IO_STALL_COUNT; ++i)
     {
-        fprintf(fp, "Stall: %20s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
+        fprintf(fp, "Stall: %30s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
     }
     for (size_t i = 0; i < IO_RATE_COUNT ; ++i)
     {
-        fprintf(fp, "Rate : %20s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
+        fprintf(fp, "Rate : %30s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
     }
     fprintf(fp, "TOTAL SECONDS ELAPSED: %0.3f\n", seconds(nanotime() - stats->StartTimeNanos));
 }
@@ -2770,7 +2770,7 @@ internal_function void vfs_process_completed_closes(vfs_state_t *vfs, aio_state_
                 vfs->LiveCount = last_index;
             }
         }
-        if (res.OSError == 0) io_count(stats, IO_COUNT_CLOSES_COMPLETE_SUCCESS);
+        if (SUCCEEDED(res.OSError)) io_count(stats, IO_COUNT_CLOSES_COMPLETE_SUCCESS);
         else io_count(stats, IO_COUNT_CLOSES_COMPLETE_ERROR);
     }
 }
@@ -2797,7 +2797,13 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             int32_t  thread_id = io_thread_for_file_type(res.Type);
             // generate an end-of-stream notification, if appropriate.
             if (res.FileOffset + res.DataAmount >= vfs->StInInfo[index_a].FileSize)
-            {
+            {   // handle end-of-stream using the default behavior for the stream.
+                if (vfs->StInInfo[index_a].EndBehavior == STREAM_IN_LOOP)
+                {   // unpause and rewind the stream.
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
+                    vfs->RdOffset[index_a] = 0;
+                }
+                // post the end-of-stream notification for the data consumer.
                 vfs_sies_t eos = { res.AFID, vfs->StInInfo[index_a].EndBehavior };
                 srsw_fifo_put(&vfs->SiEndOfS[thread_id], eos);
                 io_count(stats, IO_COUNT_STREAM_IN_EOS);
@@ -2831,7 +2837,7 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             }
         }
         io_count_increment(stats, IO_COUNT_BYTES_READ_ACTUAL, res.DataAmount);
-        if (res.OSError == 0) io_count(stats, IO_COUNT_READS_COMPLETE_SUCCESS);
+        if (SUCCEEDED(res.OSError)) io_count(stats, IO_COUNT_READS_COMPLETE_SUCCESS);
         else io_count(stats, IO_COUNT_READS_COMPLETE_ERROR);
     }
 }
@@ -2850,7 +2856,7 @@ internal_function void vfs_process_completed_writes(vfs_state_t *vfs, aio_state_
             VirtualFree(res.DataBuffer, 0, MEM_RELEASE);
         }
         io_count_increment(stats, IO_COUNT_BYTES_WRITE_ACTUAL, res.DataAmount);
-        if (res.OSError == 0) io_count(stats, IO_COUNT_WRITES_COMPLETE_SUCCESS);
+        if (SUCCEEDED(res.OSError)) io_count(stats, IO_COUNT_WRITES_COMPLETE_SUCCESS);
         else io_count(stats, IO_COUNT_WRITES_COMPLETE_ERROR);
     }
 }
@@ -2865,7 +2871,7 @@ internal_function void vfs_process_completed_flushes(vfs_state_t *vfs, aio_state
     // there's nothing that the VFS driver needs to do here for the application.
     while (srsw_fifo_get(&aio->FlushResults, res))
     {
-        if (res.OSError == 0) io_count(stats, IO_COUNT_FLUSHES_COMPLETE_SUCCESS);
+        if (SUCCEEDED(res.OSError)) io_count(stats, IO_COUNT_FLUSHES_COMPLETE_SUCCESS);
         else io_count(stats, IO_COUNT_FLUSHES_COMPLETE_ERROR);
     }
 }
@@ -2932,16 +2938,16 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
             switch (op.OpId)
             {
                 case STREAM_IN_PAUSE:
-                    vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_PAUSE;
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_CLOSE;
                     io_count(stats, IO_COUNT_STREAM_IN_PAUSE);
                     break;
                 case STREAM_IN_RESUME:
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     io_count(stats, IO_COUNT_STREAM_IN_RESUME);
                     break;
                 case STREAM_IN_REWIND:
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     vfs->RdOffset[index_a] = 0;
                     io_count(stats, IO_COUNT_STREAM_IN_REWIND);
                     break;
@@ -2952,7 +2958,7 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                         op.Argument  = align_up(op.Argument, vfs->StInInfo[index_a].SectorSize);
                         op.Argument -= vfs->StInInfo[index_a].SectorSize;
                     }
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     vfs->RdOffset[index_a] = op.Argument;
                     io_count(stats, IO_COUNT_STREAM_IN_SEEK);
                     break;
@@ -3028,21 +3034,18 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         // this value is decremented as operations are completed.
         vfs->LiveStat[index_l].NLiveIoOps += nqueued;
 
-        // handle end-of-stream using the default behavior for the stream.
+        // handle end-of-stream conditions. the stream will be paused 
+        // until AIO has completed all outstanding requests for the 
+        // stream, at which point the end-of-stream notification will 
+        // be generated for the data consumer. in the case of looping 
+        // streams, this prevents the stream from consuming too much 
+        // space in the VFS I/O operation queue. to avoid hitching, 
+        // we won't wait until the data consumer has actually processed
+        // the end-of-stream notification, or the data. the stream may
+        // be unpaused in vfs_process_completed_reads().
         if (vfs->RdOffset[index_a] >= vfs->StInInfo[index_a].FileSize)
-        {
-            switch (vfs->StInInfo[index_a].EndBehavior)
-            {
-                case STREAM_IN_ONCE:
-                    // immediately place the stream in a paused state.
-                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
-                    break;
-                case STREAM_IN_LOOP:
-                    // seek back to the beginning of the stream to avoid
-                    // hitching due to wating until end-of-stream is processed.
-                    vfs->RdOffset[index_a] = 0;
-                    break;
-            }
+        {   // place the stream into the paused state.
+            vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
         }
         else if (nqueued == 0)
         {   // if we ran out of I/O buffer space there's no point in continuing.
@@ -4092,7 +4095,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
                         // refill to decode the next chunk of the input buffer.
                         size_t amount = read.Decoder->amount();
                         void  *buffer = read.Decoder->Cursor;
-                        fwrite(buffer , 1, amount, stdout);
+                        //fwrite(buffer , 1, amount, stdout);
                         read.Decoder->Cursor += amount;
                     } while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process

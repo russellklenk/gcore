@@ -2492,7 +2492,13 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             int32_t  thread_id = io_thread_for_file_type(res.Type);
             // generate an end-of-stream notification, if appropriate.
             if (res.FileOffset + res.DataAmount >= vfs->StInInfo[index_a].FileSize)
-            {
+            {   // handle end-of-stream notification using the default behavior for the stream.
+                if (vfs->StInInfo[index_a].EndBehavior == STREAM_IN_LOOP)
+                {   // unpause and rewind the stream.
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
+                    vfs->RdOffset[index_a] = 0;
+                }
+                // post the end-of-stream notification for the data consumer.
                 vfs_sies_t eos = { res.AFID, vfs->StInInfo[index_a].EndBehavior };
                 srsw_fifo_put(&vfs->SiEndOfS[thread_id], eos);
                 io_count(stats, IO_COUNT_STREAM_IN_EOS);
@@ -2627,16 +2633,16 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
             switch (op.OpId)
             {
                 case STREAM_IN_PAUSE:
-                    vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_PAUSE;
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_CLOSE;
                     io_count(stats, IO_COUNT_STREAM_IN_PAUSE);
                     break;
                 case STREAM_IN_RESUME:
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     io_count(stats, IO_COUNT_STREAM_IN_RESUME);
                     break;
                 case STREAM_IN_REWIND:
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     vfs->RdOffset[index_a] = 0;
                     io_count(stats, IO_COUNT_STREAM_IN_REWIND);
                     break;
@@ -2647,12 +2653,12 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                         op.Argument  = align_up(op.Argument, vfs->StInInfo[index_a].SectorSize);
                         op.Argument -= vfs->StInInfo[index_a].SectorSize;
                     }
-                    vfs->LiveStat[index_l].StatusFlags &=~(VFS_STATUS_PAUSE | VFS_STATUS_CLOSE);
+                    vfs->LiveStat[index_l].StatusFlags &=~VFS_STATUS_PAUSE;
                     vfs->RdOffset[index_a] = op.Argument;
                     io_count(stats, IO_COUNT_STREAM_IN_SEEK);
                     break;
                 case STREAM_IN_STOP:
-                    vfs->LiveStat[index_l].StatusFlags |=  VFS_STATUS_CLOSE;
+                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_CLOSE;
                     io_count(stats, IO_COUNT_STREAM_IN_STOP);
                     break;
             }
@@ -2724,21 +2730,18 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         // this value is decremented as operations are completed.
         vfs->LiveStat[index_l].NLiveIoOps += nqueued;
 
-        // handle end-of-stream using the default behavior for the stream.
+        // handle end-of-stream conditions. the stream will be paused
+        // until AIO has completed all outstanding requests for the 
+        // stream, at which point an end-of-stream notification will 
+        // be generated for the data consumer. in the case of looping 
+        // streams, this prevents the stream from consuming too much
+        // space in the VFS I/O operation queue. to avoid hitching, 
+        // we won't wait until the data consumer has actually processed
+        // the end-of-stream notification, or the data. the stream may
+        // be unpaused in vfs_process_completed_reads().
         if (vfs->RdOffset[index_a] >= vfs->StInInfo[index_a].FileSize)
-        {
-            switch (vfs->StInInfo[index_a].EndBehavior)
-            {
-                case STREAM_IN_ONCE:
-                    // immediately place the stream in a paused state.
-                    vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
-                    break;
-                case STREAM_IN_LOOP:
-                    // seek back to the beginning of the stream to avoid hitching
-                    // due to wating until end-of-stream is processed.
-                    vfs->RdOffset[index_a] = 0;
-                    break;
-            }
+        {   // place the stream into the paused state.
+            vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
         }
         else if (nqueued == 0)
         {   // if we ran out of I/O buffer space there's no point in continuing.
