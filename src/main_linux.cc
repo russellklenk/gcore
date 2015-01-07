@@ -239,6 +239,8 @@ enum io_rate_e
 {
     IO_RATE_BYTES_PER_SEC_IN = 0,
     IO_RATE_BYTES_PER_SEC_OUT,
+    IO_RATE_AIO_TICK_DURATION,
+    IO_RATE_VFS_TICK_DURATION,
     IO_RATE_COUNT
 };
 
@@ -704,13 +706,17 @@ global_variable char const *IO_STALL_NAME[IO_STALL_COUNT] = {
 /// @summary A list of all of the valid I/O rate slots.
 global_variable io_rate_e   IO_RATE_LIST [IO_RATE_COUNT]  = {
     IO_RATE_BYTES_PER_SEC_IN,
-    IO_RATE_BYTES_PER_SEC_OUT
+    IO_RATE_BYTES_PER_SEC_OUT,
+    IO_RATE_AIO_TICK_DURATION,
+    IO_RATE_VFS_TICK_DURATION
 };
 
 /// @summary A list of printable names for each valid I/O rate slot.
 global_variable char const *IO_RATE_NAME [IO_RATE_COUNT]  = {
     "Stream-In Bytes/Second",
-    "Stream-Out Bytes/Second"
+    "Stream-Out Bytes/Second",
+    "AIO Tick Duration (ns)",
+    "VFS Tick Duration (ns)"
 };
 
 /// @summary The state of our VFS process (part of the I/O system).
@@ -1718,6 +1724,9 @@ internal_function void init_io_stats(io_stats_t *stats)
         for (size_t i = 0; i < IO_STALL_COUNT; ++i) stats->Stalls[i] = 0;
         for (size_t i = 0; i < IO_RATE_COUNT ; ++i) stats->Rates [i] = 0.0;
         stats->StartTimeNanos = nanotime();
+        // initialize the 'minimum' counters to some large value.
+        stats->Counts[IO_COUNT_MIN_TICK_DURATION_AIO] = 0xFFFFFFFFFFFFFFFFULL;
+        stats->Counts[IO_COUNT_MIN_TICK_DURATION_VFS] = 0xFFFFFFFFFFFFFFFFULL;
     }
 }
 
@@ -1728,19 +1737,19 @@ internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
 {
     for (size_t i = 0; i < IO_COUNT_COUNT; ++i)
     {
-        fprintf(fp, "Count: %20s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
+        fprintf(fp, "Count: %30s    %" PRIu64 "\n", IO_COUNT_NAME[i], stats->Counts[i]);
     }
     for (size_t i = 0; i < IO_ERROR_COUNT; ++i)
     {
-        fprintf(fp, "Error: %20s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
+        fprintf(fp, "Error: %30s    %" PRIu64 "\n", IO_ERROR_NAME[i], stats->Errors[i]);
     }
     for (size_t i = 0; i < IO_STALL_COUNT; ++i)
     {
-        fprintf(fp, "Stall: %20s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
+        fprintf(fp, "Stall: %30s    %" PRIu64 "\n", IO_STALL_NAME[i], stats->Stalls[i]);
     }
     for (size_t i = 0; i < IO_RATE_COUNT ; ++i)
     {
-        fprintf(fp, "Rate : %20s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
+        fprintf(fp, "Rate : %30s    %0.3f\n", IO_RATE_NAME[i], stats->Rates[i]);
     }
     fprintf(fp, "TOTAL SECONDS ELAPSED: %0.3f\n", seconds(nanotime() - stats->StartTimeNanos));
 }
@@ -1750,9 +1759,11 @@ internal_function void print_io_stats(FILE *fp, io_stats_t const *stats)
 /// @param stats The set of I/O system counters to format.
 internal_function void print_io_rates(FILE *fp, io_stats_t const *stats)
 {
-    fprintf(fp, "Stream-In Bytes/Sec: %0.3f    Stream-Out Bytes/Sec: %0.3f\r",
+    fprintf(fp, "Stream-In Bytes/Sec: %0.3f  Stream-Out Bytes/Sec: %0.3f  AIO Tick: %0.1f  VFS Tick: %0.1f\r",
             stats->Rates[IO_RATE_BYTES_PER_SEC_IN],
-            stats->Rates[IO_RATE_BYTES_PER_SEC_OUT]);
+            stats->Rates[IO_RATE_BYTES_PER_SEC_OUT],
+            stats->Rates[IO_RATE_AIO_TICK_DURATION],
+            stats->Rates[IO_RATE_VFS_TICK_DURATION]);
 }
 
 /// @summary Allocates an iocb instance from the free list.
@@ -2150,6 +2161,7 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, struct times
     io_count_increment (stats, IO_COUNT_NANOS_ELAPSED_AIO    , e_nanos - s_nanos);
     io_count_assign_min(stats, IO_COUNT_MIN_TICK_DURATION_AIO, e_nanos - s_nanos);
     io_count_assign_max(stats, IO_COUNT_MAX_TICK_DURATION_AIO, e_nanos - s_nanos);
+    io_rate(stats, IO_RATE_AIO_TICK_DURATION, double(e_nanos - s_nanos));
     return 0;
 }
 
@@ -2729,11 +2741,11 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         vfs->LiveStat[index_l].NLiveIoOps += nqueued;
 
         // handle end-of-stream conditions. the stream will be paused
-        // until AIO has completed all outstanding requests for the 
-        // stream, at which point an end-of-stream notification will 
-        // be generated for the data consumer. in the case of looping 
+        // until AIO has completed all outstanding requests for the
+        // stream, at which point an end-of-stream notification will
+        // be generated for the data consumer. in the case of looping
         // streams, this prevents the stream from consuming too much
-        // space in the VFS I/O operation queue. to avoid hitching, 
+        // space in the VFS I/O operation queue. to avoid hitching,
         // we won't wait until the data consumer has actually processed
         // the end-of-stream notification, or the data. the stream may
         // be unpaused in vfs_process_completed_reads().
@@ -2896,6 +2908,7 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
     uint64_t bso = stats->Counts[IO_COUNT_BYTES_WRITE_ACTUAL];
     io_rate(stats, IO_RATE_BYTES_PER_SEC_IN , bsi / sec);
     io_rate(stats, IO_RATE_BYTES_PER_SEC_OUT, bso / sec);
+    io_rate(stats, IO_RATE_VFS_TICK_DURATION, double(e_nanos - s_nanos));
 }
 
 /// @summary Returns an I/O buffer to the pool. This function should be called
