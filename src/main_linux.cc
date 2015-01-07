@@ -2700,13 +2700,17 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         {   // allocate a new request in our internal operation queue.
             aio_req_t *req = io_opq_put(&vfs->IoOperations, priority);
             if (req != NULL)
-            {   // populate the (already queued) request.
+            {
+                int64_t fileofs = vfs->RdOffset[index_a];
+                int64_t filesz  = vfs->StInInfo[index_a].FileSize;
+
+                // populate the (already queued) request.
                 req->Command    = AIO_COMMAND_READ;
                 req->Fildes     = vfs->StInInfo[index_a].Fildes;
                 req->Eventfd    = vfs->StInInfo[index_a].Eventfd;
                 req->DataAmount = uint32_t(read_amount);
                 req->BaseOffset = vfs->StInInfo[index_a].FileOffset;
-                req->FileOffset = vfs->RdOffset[index_a];
+                req->FileOffset = fileofs;
                 req->DataBuffer = iobuf_get(allocator);
                 req->QTimeNanos = nanotime();
                 req->ATimeNanos = 0;
@@ -2715,17 +2719,23 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
                 req->Reserved   = 0;
                 nqueued++;
 
+                // calculate the new (relative) file offset, and also the actual
+                // amount we are attempting to read, so that we can accurately
+                // update the I/O stat counters. we don't queue the AIO read for
+                // the actual amount because there may be size restrictions.
+                int64_t newofs  = fileofs + read_amount;
+                int64_t nremain = filesz  - fileofs;
+                size_t  realamt = newofs  < filesz ? read_amount : size_t(nremain);
+
                 // update statistics.
                 io_count(stats, IO_COUNT_READS_STARTED);
-                io_count_increment(stats, IO_COUNT_BYTES_READ_REQUEST, read_amount);
+                io_count_increment(stats, IO_COUNT_BYTES_READ_REQUEST, realamt);
                 io_count_assign_max(stats, IO_COUNT_MAX_STREAM_IN_BYTES_USED, iobuf_bytes_used(allocator));
 
                 // update the byte offset to the next read.
-                int64_t newofs  = vfs->RdOffset[index_a] + read_amount;
                 vfs->RdOffset[index_a] = newofs;
-                if (newofs >= vfs->StInInfo[index_a].FileSize)
-                {   // reached or passed end-of-file.
-                    // continue processing the next file.
+                if (newofs >= filesz)
+                {   // reached/passed end-of-file. stop processing this file.
                     break;
                 }
             }
