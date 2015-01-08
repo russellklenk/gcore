@@ -202,11 +202,19 @@ static int64_t  const VFS_DIRECT_IO_THRESHOLD = WINOS_VFS_DIRECT_IO_THRESHOLD;
 
 /// @summary The spin count used on critical sections protecting shared resources
 /// of srmw_freelist_t and srmw_fifo_t.
-static DWORD     const SPIN_COUNT_Q   = 4096;
+static DWORD     const SPIN_COUNT_Q    = 4096;
 
 /// @summary The special I/O completion port completion key used to notify the
 /// AIO driver to begin its shutdown process.
-static ULONG_PTR const AIO_SHUTDOWN   = ULONG_PTR(-1);
+static ULONG_PTR const AIO_SHUTDOWN    = ULONG_PTR(-1);
+
+/// @summary Path storage for a file list grows in 1024 item increments after
+/// it hits 1024 items in size; prior to that point, it doubles in size.
+static size_t    const PATH_GROW_LIMIT =  1024;
+
+/// @summary Blob storage for a file list grows in 64KB chunks after it hits
+/// 64KB in size; prior to that point, it doubles in size.
+static size_t    const BLOB_GROW_LIMIT = (64 * 1024 * 1024);
 
 /*///////////////////
 //   Local Types   //
@@ -384,6 +392,23 @@ struct srmw_fifo_t
     T                 *Tail;         /// The current end-of-queue.
     srmw_freelist_t<T> FreeList;     /// The SRMW free list for node recycling.
     T                 *XXXX;         /// Pointer to a dummy node.
+};
+
+/// @summary Represents a growable list of UTF-8 file paths. Designed to support
+/// load-in-place, so everything must be explicitly sized, and should generally
+/// store byte offsets instead of pointers within data buffers.
+struct file_list_t
+{
+    uint32_t           PathCapacity; /// The current capacity, in paths.
+    uint32_t           PathCount;    /// The number of paths items currently in the list.
+    uint32_t           BlobCapacity; /// The current capacity of PathData, in bytes.
+    uint32_t           BlobCount;    /// The number of bytes used in PathData.
+    uint32_t           MaxPathBytes; /// The maximum length of any path in the list, in bytes.
+    uint32_t           TotalBytes;   /// The total number of bytes allocated.
+    uint32_t          *HashList;     /// Hash values calculated for the paths in the list.
+    uint32_t          *SizeList;     /// Length values (not including the zero byte) for each path.
+    uint32_t          *PathOffset;   /// Offsets, in bytes, into PathData to the start of each path.
+    char              *PathData;     /// Raw character data. PathList points into this blob.
 };
 
 /// @summary Defines the state associated with a direct I/O buffer manager.
@@ -1724,6 +1749,53 @@ internal_function size_t physical_sector_size(HANDLE file)
     else return desc.BytesPerPhysicalSector;
 }
 
+/// @summary Calculates the number of items by which to grow a dynamic list.
+/// @param value The current capacity.
+/// @param limit The number of items beyond which the capacity stops doubling.
+/// @param min_value The minimum acceptable capacity.
+internal_function inline size_t grow_size(size_t value, size_t limit, size_t min_value)
+{
+    size_t new_value = 0;
+
+    if (value >= limit)
+        new_value = value + limit;
+    else
+        new_value = value * 2;
+
+    return new_value >= min_value ? new_value : min_value;
+}
+
+/// @summary Retrieves the next UTF-8 codepoint from a string.
+/// @param str Pointer to the start of the codepoint.
+/// @param cp On return, this value stores the current codepoint.
+/// @return A pointer to the start of the next codepoint.
+internal_function inline char const* next_codepoint(char const *str, uint32_t &cp)
+{
+    if ((str[0] & 0x80) == 0)
+    {   // cp in [0x00000, 0x0007F], most likely case.
+        cp = str[0];
+        return str + 1;
+    }
+    if ((str[0] & 0xFF) >= 0xC2 &&   (str[0] & 0xFF) <= 0xDF && (str[1] & 0xC0) == 0x80)
+    {   // cp in [0x00080, 0x007FF]
+        cp = (str[0] & 0x1F) <<  6 | (str[1] & 0x3F);
+        return str + 2;
+    }
+    if ((str[0] & 0xF0) == 0xE0 &&   (str[1] & 0xC0) == 0x80 && (str[2] & 0xC0) == 0x80)
+    {   // cp in [0x00800, 0x0FFFF]
+        cp = (str[0] & 0x0F) << 12 | (str[1] & 0x3F) << 6  |    (str[2] & 0x3F);
+        return str + 3;
+    }
+    if ((str[0] & 0xFF) == 0xF0 &&   (str[1] & 0xC0) == 0x80 && (str[2] & 0xC0) == 0x80 && (str[3] & 0xC0) == 0x80)
+    {   // cp in [0x10000, 0x3FFFF]
+        cp = (str[1] & 0x3F) << 12 | (str[2] & 0x3F) << 6  |    (str[3] & 0x3F);
+        return str + 4;
+    }
+    // else, invalid UTF-8 codepoint.
+    cp = 0xFFFFFFFFU;
+    return str + 1;
+}
+
 /// @summary Find the end of a volume and directory information portion of a path.
 /// @param path The path string to search.
 /// @param out_pathlen On return, indicates the number of bytes in the volume and
@@ -1787,6 +1859,378 @@ internal_function char const* extpart(char const *path, size_t &out_extlen)
         out_extlen = 0;
     }
     return last;
+}
+
+/// @summary Perform string matching with support for wildcards.
+/// @param str The string to check.
+/// @param filter The filter string, which may contain wildcards '?' and '*'.
+/// The '?' character matches any string except an empty string, while '*'
+/// matches any string including the empty string.
+/// @return true if str matches the filter pattern.
+internal_function bool match(char const *str, char const *filter)
+{
+    char    ch = 0;
+    while ((ch = *filter) != 0)
+    {
+        if (ch == '?')
+        {
+            if (*str == 0) return false;
+            ++filter;
+            ++str;
+        }
+        else if (ch == '*')
+        {
+            if (match(str, filter + 1))
+                return true;
+            if (*str && match(str + 1, filter))
+                return true;
+            return false;
+        }
+        else
+        {   // standard comparison of two characters, ignoring case.
+            if (toupper(*str++) != toupper(*filter++))
+                return false;
+        }
+    }
+    return (*str == 0 && *filter == 0);
+}
+
+/// @summary Calculates a 32-bit hash value for a path string. Forward and backslashes are treated as equivalent.
+/// @param path A NULL-terminated UTF-8 path string.
+/// @param out_end On return, points to one byte past the zero byte.
+/// @return The hash of the specified string.
+internal_function uint32_t hash_path(char const *path, char const **out_end)
+{
+    if (path == NULL)
+    {
+        if (out_end) *out_end = NULL;
+        return 0;
+    }
+
+    uint32_t    cp   = 0;
+    uint32_t    cp2  = 0;
+    uint32_t    hash = 0;
+    char const *iter = next_codepoint(path, cp);
+    while (cp != 0)
+    {
+        cp2    = cp != '\\' ? cp : '/'; // ignore separator differences
+        hash   = _lrotl(hash, 7) + cp2; // rotate left 7 bits + cp2
+        iter   = next_codepoint(iter, cp);
+    }
+    if (out_end)
+    {
+       *out_end = iter + 1;
+    }
+    return hash;
+}
+
+/// @summary Allocates resources for and initializes a new file list.
+/// @param list The file list to initialize.
+/// @param capacity The initial capacity, in number of paths.
+/// @param path_bytes The total number of bytes to allocate for path data.
+/// @return true if the file list was initialized successfully.
+internal_function bool create_file_list(file_list_t *list, size_t capacity, size_t path_bytes)
+{
+    if (list)
+    {
+        list->PathCapacity = uint32_t(capacity);
+        list->PathCount    = 0;
+        list->BlobCapacity = uint32_t(path_bytes);
+        list->BlobCount    = 0;
+        list->MaxPathBytes = 0;
+        list->TotalBytes   = 0;
+        list->HashList     = NULL;
+        list->SizeList     = NULL;
+        list->PathOffset   = NULL;
+        list->PathData     = NULL;
+        if (capacity > 0)
+        {
+            list->HashList    = (uint32_t *) malloc(capacity * sizeof(uint32_t));
+            list->SizeList    = (uint32_t *) malloc(capacity * sizeof(uint32_t));
+            list->PathOffset  = (uint32_t *) malloc(capacity * sizeof(uint32_t));
+            list->TotalBytes +=  uint32_t          (capacity * sizeof(uint32_t) * 3);
+        }
+        if (path_bytes > 0)
+        {
+            list->PathData    = (char*) malloc(path_bytes * sizeof(char));
+            list->TotalBytes +=  uint32_t     (path_bytes * sizeof(char));
+        }
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Releases resources associated with a file list.
+/// @param list The file list to delete.
+internal_function void delete_file_list(file_list_t *list)
+{
+    if (list)
+    {
+        if (list->PathData   != NULL) free(list->PathData);
+        if (list->PathOffset != NULL) free(list->PathOffset);
+        if (list->SizeList   != NULL) free(list->SizeList);
+        if (list->HashList   != NULL) free(list->HashList);
+        list->PathCapacity    = 0;
+        list->PathCount       = 0;
+        list->BlobCapacity    = 0;
+        list->BlobCount       = 0;
+        list->MaxPathBytes    = 0;
+        list->TotalBytes      = 0;
+        list->HashList        = NULL;
+        list->SizeList        = NULL;
+        list->PathOffset      = NULL;
+        list->PathData        = NULL;
+    }
+}
+
+/// @summary Ensures that the file list has a specified minimum capacity, and if not, grows.
+/// @param list The file list to check and possibly grow.
+/// @param capacity The minimum number of paths that can be stored.
+/// @param path_bytes The minimum number of bytes for storing path data.
+/// @return true if the file list has the specified capacity.
+internal_function bool ensure_file_list(file_list_t *list, size_t capacity, size_t path_bytes)
+{
+    if (list)
+    {
+        if (list->PathCapacity >= capacity && list->BlobCapacity >= path_bytes)
+        {
+            // the list already meets the specified capacity; nothing to do.
+            return true;
+        }
+        if (list->PathCapacity < capacity)
+        {
+            uint32_t *hash     = (uint32_t*) realloc(list->HashList  , capacity * sizeof(uint32_t));
+            uint32_t *size     = (uint32_t*) realloc(list->SizeList  , capacity * sizeof(uint32_t));
+            uint32_t *offset   = (uint32_t*) realloc(list->PathOffset, capacity * sizeof(uint32_t));
+            if (hash   != NULL)  list->HashList    = hash;
+            if (size   != NULL)  list->SizeList    = size;
+            if (offset != NULL)  list->PathOffset  = offset;
+            if (offset == NULL || size == NULL || hash == NULL)
+            {
+                return false;
+            }
+            list->TotalBytes  += uint32_t((capacity - list->PathCapacity) * sizeof(uint32_t) * 3);
+            list->PathCapacity = uint32_t (capacity);
+        }
+        if (list->BlobCapacity < path_bytes)
+        {
+            char *blob = (char*) realloc(list->PathData, path_bytes * sizeof(char));
+            if (blob  != NULL)   list->PathData = blob;
+            else return false;
+            list->TotalBytes  += uint32_t((path_bytes - list->BlobCapacity) * sizeof(char));
+            list->BlobCapacity = uint32_t (path_bytes);
+        }
+        return true;
+    }
+    else return false;
+}
+
+/// @summary Appends an item to the file list, growing it if necessary.
+/// @param list The file list to modify.
+/// @param path A NULL-terminated UTF-8 file path to append.
+internal_function void append_file_list(file_list_t *list, char const *path)
+{
+    if (list->PathCount == list->PathCapacity)
+    {
+        // need to grow the list of path attributes.
+        size_t new_items = grow_size(list->PathCapacity, PATH_GROW_LIMIT, list->PathCapacity + 1);
+        ensure_file_list(list, new_items, list->BlobCapacity);
+    }
+
+    char const  *endp = NULL;
+    uint32_t     hash = hash_path(path, &endp);
+    size_t       nb   = endp  - path + 1;
+    if (list->BlobCount + nb >= list->BlobCapacity)
+    {
+        size_t new_bytes = grow_size(list->BlobCapacity, BLOB_GROW_LIMIT, list->BlobCount + nb);
+        ensure_file_list(list, list->PathCapacity, new_bytes);
+    }
+
+    size_t  index = list->PathCount;
+    uint32_t size = uint32_t(nb-1);
+    // append the basic path properties to the list:
+    list->HashList  [index] = hash;
+    list->SizeList  [index] = size;
+    list->PathOffset[index] = list->BlobCount;
+    // intern the path string data (including zero byte):
+    memcpy(&list->PathData[list->BlobCount], path, nb);
+    list->BlobCount += uint32_t(nb);
+    list->PathCount += 1;
+    if (nb > list->MaxPathBytes)
+    {   // includes the zero byte.
+        list->MaxPathBytes = uint32_t(nb);
+    }
+}
+
+/// @summary Resets a file list to empty without freeing any resources.
+/// @param list The file list to reset.
+internal_function void clear_file_list(file_list_t *list)
+{
+    list->PathCount    = 0;
+    list->BlobCount    = 0;
+    list->MaxPathBytes = 0;
+    list->TotalBytes   = 0;
+}
+
+/// @summary Retrieves a path string from a file list.
+/// @param list The file list to query.
+/// @param index The zero-based index of the path to retrieve.
+/// @return A pointer to the start of the path string, or NULL.
+internal_function char const* file_list_path(file_list_t const *list, size_t index)
+{
+    assert(index < list->PathCount);
+    return &list->PathData[list->PathOffset[index]];
+}
+
+/// @summary Searches for a given hash value within the file list.
+/// @param list The file list to search.
+/// @param hash The 32-bit unsigned integer hash of the search path.
+/// @param start The zero-based starting index of the search.
+/// @param out_index On return, this location is updated with the index of the
+/// item within the list. This index is valid until the list is modified.
+/// @return true if the item was found in the list.
+internal_function bool search_file_list_hash(file_list_t const *list, uint32_t hash, size_t start, size_t &out_index)
+{
+    size_t   const  hash_count = list->PathCount;
+    uint32_t const *hash_list  = list->HashList;
+    for (size_t i = start; i < hash_count; ++i)
+    {
+        if (hash_list[i] == hash)
+        {
+            out_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// @summary Locates a specific path within the file list.
+/// @param list The file list to search.
+/// @param path A NULL-terminated UTF-8 file path to search for.
+/// @param out_index On return, this location is updated with the index of the
+/// item within the list. This index is valid until the list is modified.
+/// @return true if the item was found in the list.
+internal_function bool search_file_list_path(file_list_t const *list, char const *path, size_t &out_index)
+{
+    char const *end  = NULL;
+    uint32_t   hash  = hash_path(path, &end);
+    return search_file_list_hash(list, hash, 0, out_index);
+}
+
+/// @summary Verifies a file list, ensuring there are no hash collisions.
+/// @param list The file list to verify.
+/// @return true if the list contains no hash collisions.
+internal_function bool verify_file_list(file_list_t const *list)
+{
+    size_t   const  hash_count = list->PathCount;
+    uint32_t const *hash_list  = list->HashList;
+    for (size_t i = 0; i < hash_count; ++i)
+    {
+        uint32_t path_hash = hash_list[i];
+        size_t   num_hash  = 0; // number of items with hash path_hash
+        for (size_t j = 0; j < hash_count; ++j)
+        {
+            if (path_hash == hash_list[j])
+            {
+                if (++num_hash > 1)
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// @summary Pretty-prints a file list to a buffered stream.
+/// @param fp The output stream. This is typically stdout or stderr.
+/// @param list The file list to format and write to the output stream.
+internal_function void format_file_list(FILE *fp, file_list_t const *list)
+{
+    fprintf(fp, " Index | Hash     | Length | Offset | Path\n");
+    fprintf(fp, "-------+----------+--------+--------+-------------------------------------------\n");
+    for (size_t i = 0; i < list->PathCount; ++i)
+    {
+        fprintf(fp, " %5u | %08X | %6u | %6u | %s\n",
+                unsigned(i),
+                list->HashList[i],
+                list->SizeList[i],
+                list->PathOffset[i],
+                file_list_path(list, i));
+    }
+    fprintf(fp, "\n");
+}
+
+/// @summary Enumerates all files under a directory that match a particular filter.
+/// The implementation of this function is platform-specific.
+/// @param dest The file list to populate with the results. The list is not cleared by the call.
+/// @param path The path to search. If this is an empty string, the CWD is searched.
+/// @param filter The filter string used to accept filenames. The filter '*' accepts everything.
+/// @param recurse Specify true to recurse into subdirectories.
+/// @return true if enumeration completed without error.
+internal_function bool enumerate_files(file_list_t *dest, char const *path, char const *filter, bool recurse)
+{
+    size_t  dir_len    = strlen(path);
+    char   *pathbuf    = (char*) malloc(dir_len + 1 + MAX_PATH + 1); // <path>\<result>0
+    char   *filterbuf  = (char*) malloc(dir_len + 3);                // <path>\*0
+
+    // generate a filter string of the form <path>\* so that we enumerate
+    // all files and directories under the specified path, even if 'path'
+    // doesn't directly contain any files matching the extension filter.
+    strncpy(filterbuf, path, dir_len);
+    if (path[dir_len - 1] != '\\' && path[dir_len - 1] != '/')
+    {
+        filterbuf[dir_len + 0] = '\\';
+        filterbuf[dir_len + 1] = '*';
+        filterbuf[dir_len + 2] = '\0';
+    }
+    else
+    {
+        filterbuf[dir_len + 0] = '*';
+        filterbuf[dir_len + 1] = '\0';
+    }
+
+    // open the find for all files and directories directly under 'path'.
+    FINDEX_INFO_LEVELS  l = FINDEX_INFO_LEVELS (1); // FindExInfoBasic
+    FINDEX_SEARCH_OPS   s = FINDEX_SEARCH_OPS  (0); // FindExSearchNameMatch
+    WIN32_FIND_DATAA info = {0};
+    HANDLE       find_obj = FindFirstFileExA(filterbuf, l, &info, s, NULL, 0);
+    if (find_obj != INVALID_HANDLE_VALUE)
+    {
+        strncpy(pathbuf, path, dir_len);
+        if (path[dir_len - 1] != '\\' && path[dir_len - 1] != '/')
+        {   // append a trailing '\\'.
+            pathbuf[dir_len++] = '\\';
+        }
+        do
+        {
+            if (0 == strcmp(info.cFileName, "."))
+                continue;
+            if (0 == strcmp(info.cFileName, ".."))
+                continue;
+
+            strcpy(&pathbuf[dir_len], info.cFileName);
+            if (recurse && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {   // recurse into the subdirectory.
+                enumerate_files(dest, pathbuf, filter, true);
+            }
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                (info.dwFileAttributes & FILE_ATTRIBUTE_DEVICE   ) == 0 &&
+                (info.dwFileAttributes & FILE_ATTRIBUTE_TEMPORARY) == 0 &&
+                (info.dwFileAttributes & FILE_ATTRIBUTE_VIRTUAL  ) == 0)
+            {   // this is a regular file. if it passes the filter, add it.
+                if (match(info.cFileName, filter))
+                {
+                    append_file_list(dest, pathbuf);
+                }
+            }
+        } while (FindNextFileA(find_obj, &info));
+        FindClose(find_obj);
+        free(filterbuf);
+        free(pathbuf);
+        return true;
+    }
+    free(filterbuf);
+    free(pathbuf);
+    return false;
 }
 
 /// @summary Generates a unique filename for use as a temp file in a given directory.
@@ -4157,6 +4601,198 @@ cleanup:
     return result;
 }
 
+static int test_stream_io(int argc, char **argv, platform_layer_t *p)
+{
+    int result = EXIT_SUCCESS;
+    bool  done = false;
+    file_list_t  files;
+    uint32_t ndone  = 0;
+    uint64_t ntotal = 0;
+    uint64_t nwrite = 0;
+    uint64_t nclose = 0;
+
+    struct state_t
+    {
+        intptr_t         SIID;
+        stream_writer_t *Writer;
+        char const      *SrcPath;
+        int64_t          FileSize;
+        uint32_t         Checksum;
+    };
+
+    state_t *streams = NULL;
+
+    init_io_stats(&IO_STATS);
+    create_aio_state(&AIO_STATE);
+    create_vfs_state(&VFS_STATE);
+    create_file_list(&files, 0, 0);
+
+    if (argc < 2)
+    {
+        fprintf(stderr, "ERROR: Missing required argument indir.\n");
+        fprintf(stdout, "USAGE: a.out indir\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // get a list of all files under indir.
+    if (!enumerate_files(&files, argv[1], "*.*", false))
+    {
+        fprintf(stderr, "ERROR: Unable to list files in \'%s\'.\n", argv[1]);
+        fprintf(stdout, "USAGE: a.out indir\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // allocate storage for the list of stream state.
+    streams = (state_t*) malloc(files.PathCount * sizeof(state_t));
+    if (streams == NULL)
+    {
+        fprintf(stderr, "ERROR: Unable to allocate stream list.\n");
+        result = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // start stream-ins and stream-outs for every file in the input list.
+    for (size_t i = 0; i < files.PathCount; ++i)
+    {
+        char const *path = file_list_path(&files, i);
+        intptr_t    siid = files.HashList[i];
+        int64_t     size = 0;
+        if (p->open_stream(path, siid, 0, 0, STREAM_IN_ONCE, true, size))
+        {
+            fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", path, size);
+            if (p->create_stream(path, 0, size, &streams[i].Writer))
+            {
+                fprintf(stdout, "Created output stream for \'%s\'.\n", path);
+                streams[i].SIID = siid;
+                streams[i].SrcPath = path;
+                streams[i].FileSize = size;
+                streams[i].Checksum = 0;
+                ntotal += uint64_t(size); // HACK: tracking the total number of bytes to write.
+            }
+            else
+            {
+                fprintf(stderr, "ERROR: Unable to create output stream for \'%s\'.\n", path);
+                result = EXIT_FAILURE;
+                goto cleanup;
+            }
+        }
+    }
+
+    // run everything on the same thread, which isn't required.
+    // we could run VFS on one thread, AIO on another, or both on the same.
+    while (!done)
+    {   // update the VFS and AIO drivers. this generates AIO operations,
+        // updates stream-in status, and pushes data to the application.
+        vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+        aio_poll(&AIO_STATE, &IO_STATS);
+
+        // HACK: check for termination based on whether all bytes have been written.
+        nwrite = IO_STATS.Counts[IO_COUNT_BYTES_WRITE_ACTUAL];
+        if (nwrite == ntotal)
+        {
+            for (size_t i = 0; i < files.PathCount; ++i)
+            {
+                char   ext[10];
+                char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
+                strcpy(path, streams[i].SrcPath);
+                snprintf(path, 10, ".%08X", streams[i].Checksum);
+                strcat(path, ext);
+                p->close_stream(&streams[i].Writer, path);
+                fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
+                free(path);
+            }
+        }
+        nclose = IO_STATS.Counts[IO_COUNT_CLOSES_COMPLETE_SUCCESS];
+        if (nclose == files.PathCount * 2)
+        {
+            done = true;
+            break;
+        }
+
+        // print statistic counters:
+        print_io_rates(stdout, &IO_STATS);
+
+        // process data received from the I/O system. normally, different
+        // threads would handle one or more file types, depending on what
+        // needs to be done with the data and who needs access to it.
+        for (size_t i = 0; i < THREAD_ID_COUNT; ++i)
+        {
+            vfs_sird_t read;
+            int32_t    type = int32_t(i); // the file_type_e.
+            while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
+            {
+                if (read.OSError == 0)
+                {   // normally, you'd push the result to a callback.
+                    // note that all of the reading of the data is performed
+                    // through the stream decoder, which transparently performs
+                    // any decompression and/or decryption that might be necessary.
+                    if (read.FileOffset == 0)
+                    {   // reset the decoder to its initial state.
+                        read.Decoder->restart();
+                    }
+                    // locate the corresponding stream state.
+                    state_t *s = NULL;
+                    for (size_t i = 0; i < files.PathCount; ++i)
+                    {
+                        if (streams[i].SIID == read.ASID)
+                        {
+                            s = &streams[i];
+                            break;
+                        }
+                    }
+                    // attach the input buffer to the decoder.
+                    read.Decoder->push(read.DataBuffer, read.DataAmount);
+                    do
+                    {   // read as much data as is available, and then call
+                        // refill to decode the next chunk of the input buffer.
+                        size_t written = 0;
+                        size_t amount  = read.Decoder->amount();
+                        void  *buffer  = read.Decoder->Cursor;
+                        p->append_stream(s->Writer, buffer, amount, written);
+                        assert(written == amount);
+                        // TODO: need some way to notify the application that
+                        // their write has completed. AIO already supports this
+                        // notification, we just need to be able to push it up
+                        // to the application.
+                        read.Decoder->Cursor += amount;
+                    } while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
+                    // after the application has had a chance to process
+                    // the data, return the buffer so it can be used again.
+                    vfs_return_buffer(&VFS_STATE, read.ASID, type, read.DataBuffer);
+                }
+                else
+                {   // an error occurred, so display it and then exit.
+                    platform_print_ioerror(read.ASID, type, read.OSError, strerror(read.OSError));
+                    p->stop_stream(read.ASID);
+                    result = EXIT_FAILURE;
+                }
+            }
+
+            vfs_sies_t eos;
+            while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
+            {
+                //fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
+                p->stop_stream(eos.ASID);
+            }
+        }
+    }
+    vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
+    aio_poll(&AIO_STATE, &IO_STATS);
+
+    // print counters as a sanity check.
+    fprintf(stdout, "\n\n");
+    print_io_stats(stdout, &IO_STATS);
+
+cleanup:
+    if (streams != NULL) free(streams);
+    delete_file_list(&files);
+    delete_vfs_state(&VFS_STATE);
+    delete_aio_state(&AIO_STATE);
+    return result;
+}
+
 static int test_fileio_in(int argc, char **argv, platform_layer_t *p)
 {
     size_t  nr = 0;
@@ -4244,7 +4880,7 @@ int main(int argc, char **argv)
     elevate_process_privileges();
 
     // TODO: dynamically load the application code.
-    exit_code = test_stream_in(argc, argv, &platform_layer);
+    exit_code = test_stream_io(argc, argv, &platform_layer);
     //platform_write_out("C:\\Users\\rklenk\\abc.txt", "Hello, write out!", strlen("Hello, write out!"));
 
     exit(exit_code);
