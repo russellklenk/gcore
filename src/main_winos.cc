@@ -3569,7 +3569,7 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
             req->DataAmount = 0;
             req->BaseOffset = 0;
             req->FileOffset = close.FileSize;
-            req->DataBuffer = NULL;
+            req->DataBuffer = close.FilePath;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
             req->AFID       = 0;
@@ -4697,7 +4697,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
                 char   ext[10];
                 char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
                 strcpy(path, streams[i].SrcPath);
-                snprintf(path, 10, ".%08X", streams[i].Checksum);
+                sprintf(path, ".%08X", streams[i].Checksum);
                 strcat(path, ext);
                 p->close_stream(&streams[i].Writer, path);
                 fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
