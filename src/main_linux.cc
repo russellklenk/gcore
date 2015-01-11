@@ -3263,7 +3263,7 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
             req->DataAmount = 0;
             req->BaseOffset = 0;
             req->FileOffset = close.FileSize;
-            req->DataBuffer = NULL;
+            req->DataBuffer = close.FilePath;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
             req->AFID       = close.Fildes;
