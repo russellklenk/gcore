@@ -1175,7 +1175,7 @@ internal_function inline bool srsw_fifo_get(srsw_fifo_t<T, N> *fifo, T &item)
 template <typename T>
 internal_function bool create_srmw_freelist(srmw_freelist_t<T> &list, size_t capacity)
 {
-    InitializeCriticalSectionAndSpinCount(&list.Lock, SPIN_COUNT_Q);
+    (void) InitializeCriticalSectionAndSpinCount(&list.Lock, SPIN_COUNT_Q);
     list.Head        = &list.XXXX;
     list.XXXX.Next   =  NULL;
     if (capacity)
@@ -1260,8 +1260,8 @@ internal_function inline void srmw_freelist_put(srmw_freelist_t<T> &list, T *nod
 template <typename T>
 internal_function bool create_srmw_fifo(srmw_fifo_t<T> *fifo, size_t capacity)
 {
-    InitializeCriticalSectionAndSpinCount(&fifo->HeadLock, 0);
-    InitializeCriticalSectionAndSpinCount(&fifo->TailLock, 0);
+    (void) InitializeCriticalSectionAndSpinCount(&fifo->HeadLock, 0);
+    (void) InitializeCriticalSectionAndSpinCount(&fifo->TailLock, 0);
     create_srmw_freelist(fifo->FreeList, capacity);
     fifo->XXXX       = srmw_freelist_get(fifo->FreeList);
     fifo->XXXX->Next = NULL;
@@ -2172,6 +2172,13 @@ internal_function bool enumerate_files(file_list_t *dest, char const *path, char
     char   *pathbuf    = (char*) malloc(dir_len + 1 + MAX_PATH + 1); // <path>\<result>0
     char   *filterbuf  = (char*) malloc(dir_len + 3);                // <path>\*0
 
+    if (pathbuf == NULL || filterbuf == NULL)
+    {   // failed to allocate the necessary memory.
+        if (pathbuf   == NULL) free(pathbuf);
+        if (filterbuf == NULL) free(filterbuf);
+        return false;
+    }
+
     // generate a filter string of the form <path>\* so that we enumerate
     // all files and directories under the specified path, even if 'path'
     // doesn't directly contain any files matching the extension filter.
@@ -2277,7 +2284,12 @@ internal_function WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     if (dirlen > 0)
     {   // the output path has volume and directory information specified.
         // convert this data from UTF-8 to UCS-2 and append a directory separator.
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, int(dirlen), temp, nchars);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, int(dirlen), temp, nchars) == 0)
+        {   // unable to perform the conversion. since we did this once previously,
+            // to get the buffer length, this should not ever really happen.
+            free(temp);
+            return NULL;
+        }
         wcscat(temp, L"\\");
     }
     wcscat(temp, prefix);
@@ -2286,7 +2298,7 @@ internal_function WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     // generate a 32-bit 'random' value and convert it to an eight-digit hex value.
     // start with the current tick count, and then mix the bits using the 4-byte
     // integer hash, full avalanche method from burtleburtle.net/bob/hash/integer.html.
-    uint32_t bits = GetTickCount();
+    uint32_t bits = GetTickCount() + uint32_t(rand());
     bits  = (bits + 0x7ed55d16) + (bits << 12);
     bits  = (bits ^ 0xc761c23c) ^ (bits >> 19);
     bits  = (bits + 0x165667b1) + (bits <<  5);
@@ -2329,7 +2341,11 @@ internal_function bool open_file_raw(char const *path, HANDLE iocp, DWORD access
     }
 
     pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
-    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    if (pathbuf == NULL)
+    {   // unable to allocate temporary memory for UCS-2 path.
+        goto error_cleanup;
+    }
+    else if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
     {   // the path cannot be converted from UTF-8 to UCS-2.
         goto error_cleanup;
     }
@@ -2613,6 +2629,7 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
     }
     else
     {   // the read operation has completed synchronously. complete immediately.
+        asio_put(aio, asio);
         error = ERROR_SUCCESS;
         aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
@@ -2648,12 +2665,6 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
             error = ERROR_SUCCESS;
             return (0);
         }
-        else if (err == ERROR_HANDLE_EOF)
-        {   // this is not considered to be an error. complete immediately.
-            error = ERROR_SUCCESS;
-            aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
-            return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
-        }
         else
         {   // an error has occurred. complete immediately.
             error = err;
@@ -2664,6 +2675,7 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
     }
     else
     {   // the write operation has completed synchronously. complete immediately.
+        asio_put(aio, asio);
         error = ERROR_SUCCESS;
         aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
@@ -2844,6 +2856,7 @@ internal_function int aio_tick(aio_state_t *aio, io_stats_t *stats, DWORD timeou
             else
             {   // this should never happen. this is a serious programming error.
                 io_error(stats, IO_ERROR_ORPHANED_IOCB);
+                assert(false && "Orphaned OVERLAPPED");
             }
         }
     }
@@ -3012,7 +3025,11 @@ internal_function bool is_remote(char const *path, io_stats_t *stats)
     }
 
     pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
-    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    if (pathbuf == NULL)
+    {   // unable to allocate temporary memory for the UCS-2 path.
+        return false;
+    }
+    else if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
     {   // the path cannot be converted from UTF-8 to UCS-2.
         if (pathbuf != NULL) free(pathbuf);
         return false;
@@ -3278,6 +3295,7 @@ internal_function void vfs_process_completed_reads(vfs_state_t *vfs, aio_state_t
             {   // the result queue is full. this is a serious error.
                 iobuf_put(vfs->IoAllocator, res.DataBuffer);
                 io_error(stats, IO_ERROR_FULL_RESULTQUEUE);
+                assert(false && "Full I/O result queue");
             }
         }
         else
@@ -3569,7 +3587,7 @@ internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats
             req->DataAmount = 0;
             req->BaseOffset = 0;
             req->FileOffset = close.FileSize;
-            req->DataBuffer = NULL;
+            req->DataBuffer = close.FilePath;
             req->QTimeNanos = nanotime();
             req->ATimeNanos = 0;
             req->AFID       = 0;
@@ -3851,7 +3869,10 @@ internal_function bool platform_open_stream(char const *path, intptr_t id, int32
         hint  = FILE_HINT_DIRECT;
     }
     if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize, decoder, &IO_STATS))
-    {   // queue a load file request to be processed by the VFS driver.
+    {   // we wil immediately complete requests that execute synchronously.
+        UCHAR flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+        SetFileCompletionNotificationModes(fd, flags);
+        // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
         req.Fildes     = fd;
@@ -4000,7 +4021,11 @@ internal_function bool platform_open_file(char const *path, bool read_only, int6
         goto error_cleanup;
     }
     pathbuf = (WCHAR*) malloc(nchars * sizeof(WCHAR));
-    if (pathbuf != NULL && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
+    if (pathbuf == NULL)
+    {   // unable to allocate temporary memory for the UCS-2 path.
+        goto error_cleanup;
+    }
+    else if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, pathbuf, nchars) == 0)
     {   // the path cannot be converted from UTF-8 to UCS-2.
         goto error_cleanup;
     }
@@ -4164,7 +4189,7 @@ internal_function bool platform_write_out(char const *path, void const *data, in
     DWORD       flags         = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING;
     WCHAR      *temp_path     = make_temp_path(path, L"writeout");
     WCHAR      *file_path     = NULL;
-    DWORD       page_size     = 0;
+    DWORD       page_size     = 4096;
     int64_t     file_size     = 0;
     uint8_t    *sector_buffer = NULL;
     size_t      sector_count  = 0;
@@ -4184,7 +4209,10 @@ internal_function bool platform_write_out(char const *path, void const *data, in
     {   // unable to allocate the UCS-2 path buffer.
         goto error_cleanup;
     }
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, file_path, nchars);
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, file_path, nchars) == 0)
+    {   // unable to convert UTF-8 to UCS-2.
+        goto error_cleanup;
+    }
 
     // get the system page size, and allocate a single-page buffer. to support
     // unbuffered I/O, the buffer must be allocated on a sector-size boundary
@@ -4690,20 +4718,6 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
 
         // HACK: check for termination based on whether all bytes have been written.
         nwrite = IO_STATS.Counts[IO_COUNT_BYTES_WRITE_ACTUAL];
-        if (nwrite == ntotal)
-        {
-            for (size_t i = 0; i < files.PathCount; ++i)
-            {
-                char   ext[10];
-                char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
-                strcpy(path, streams[i].SrcPath);
-                snprintf(path, 10, ".%08X", streams[i].Checksum);
-                strcat(path, ext);
-                p->close_stream(&streams[i].Writer, path);
-                fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
-                free(path);
-            }
-        }
         nclose = IO_STATS.Counts[IO_COUNT_CLOSES_COMPLETE_SUCCESS];
         if (nclose == files.PathCount * 2)
         {
@@ -4723,7 +4737,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             int32_t    type = int32_t(i); // the file_type_e.
             while (srsw_fifo_get(&VFS_STATE.SiResult[i], read))
             {
-                if (read.OSError == 0)
+                if (SUCCEEDED(read.OSError))
                 {   // normally, you'd push the result to a callback.
                     // note that all of the reading of the data is performed
                     // through the stream decoder, which transparently performs
@@ -4774,7 +4788,23 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
                 //fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                p->stop_stream(eos.ASID);
+                for (size_t i = 0; i < files.PathCount; ++i)
+                {
+                    if (streams[i].SIID == eos.ASID)
+                    {
+                        p->stop_stream(eos.ASID);
+                        char   ext[10];
+                        char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
+                        strcpy(path, streams[i].SrcPath);
+                        sprintf(ext, ".%08X", streams[i].Checksum);
+                        ext[9] = 0;
+                        strcat(path, ext);
+                        p->close_stream(&streams[i].Writer, path);
+                        fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
+                        free(path);
+                        break;
+                    }
+                }
             }
         }
     }
