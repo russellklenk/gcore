@@ -1,7 +1,7 @@
 CC            = x86_64-w64-mingw32-gcc
 RC            = windres
 TARGET        = game.exe
-LIBRARIES     = -lstdc++ -lm -lglew32 -lglfw3 -lopengl32 -lgdi32 -lcomctl32
+LIBRARIES     = -lstdc++ -lm -lopengl32 -lgdi32 -lcomctl32
 HEADERS       =                   # $(wildcard include/*.hpp)
 SOURCES       = src/main_winos.cc # $(wildcard src/*.cpp)
 RESOURCES     = $(wildcard res/*.rc)

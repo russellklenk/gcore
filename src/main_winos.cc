@@ -60,6 +60,14 @@
     #define IOCTL_STORAGE_QUERY_PROPERTY CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #endif
 
+#ifndef FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+    #define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS    0x1
+#endif
+
+#ifndef FILE_SKIP_SET_EVENT_ON_HANDLE
+    #define FILE_SKIP_SET_EVENT_ON_HANDLE           0x2
+#endif
+
 #if   (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ <= 8)
 typedef enum _STORAGE_PROPERTY_ID {
     StorageDeviceProperty = 0,
@@ -280,15 +288,23 @@ enum io_count_e
     IO_COUNT_READS_STARTED,
     IO_COUNT_READS_COMPLETE_SUCCESS,
     IO_COUNT_READS_COMPLETE_ERROR,
+    IO_COUNT_READS_SYNCHRONOUS, 
+    IO_COUNT_READS_ASYNCHRONOUS, 
     IO_COUNT_WRITES_STARTED,
     IO_COUNT_WRITES_COMPLETE_SUCCESS,
     IO_COUNT_WRITES_COMPLETE_ERROR,
+    IO_COUNT_WRITES_SYNCHRONOUS, 
+    IO_COUNT_WRITES_ASYNCHRONOUS,
     IO_COUNT_FLUSHES_STARTED,
     IO_COUNT_FLUSHES_COMPLETE_SUCCESS,
     IO_COUNT_FLUSHES_COMPLETE_ERROR,
+    IO_COUNT_FLUSHES_SYNCHRONOUS, 
+    IO_COUNT_FLUSHES_ASYNCHRONOUS, 
     IO_COUNT_CLOSES_STARTED,
     IO_COUNT_CLOSES_COMPLETE_SUCCESS,
     IO_COUNT_CLOSES_COMPLETE_ERROR,
+    IO_COUNT_CLOSES_SYNCHRONOUS, 
+    IO_COUNT_CLOSES_ASYNCHRONOUS,
     IO_COUNT_BYTES_READ_REQUEST,
     IO_COUNT_BYTES_READ_ACTUAL,
     IO_COUNT_BYTES_WRITE_REQUEST,
@@ -711,15 +727,23 @@ global_variable io_count_e  IO_COUNT_LIST[IO_COUNT_COUNT] = {
     IO_COUNT_READS_STARTED,
     IO_COUNT_READS_COMPLETE_SUCCESS,
     IO_COUNT_READS_COMPLETE_ERROR,
+    IO_COUNT_READS_SYNCHRONOUS,
+    IO_COUNT_READS_ASYNCHRONOUS,
     IO_COUNT_WRITES_STARTED,
     IO_COUNT_WRITES_COMPLETE_SUCCESS,
     IO_COUNT_WRITES_COMPLETE_ERROR,
+    IO_COUNT_WRITES_SYNCHRONOUS, 
+    IO_COUNT_WRITES_ASYNCHRONOUS,
     IO_COUNT_FLUSHES_STARTED,
     IO_COUNT_FLUSHES_COMPLETE_SUCCESS,
     IO_COUNT_FLUSHES_COMPLETE_ERROR,
+    IO_COUNT_FLUSHES_SYNCHRONOUS, 
+    IO_COUNT_FLUSHES_ASYNCHRONOUS,
     IO_COUNT_CLOSES_STARTED,
     IO_COUNT_CLOSES_COMPLETE_SUCCESS,
     IO_COUNT_CLOSES_COMPLETE_ERROR,
+    IO_COUNT_CLOSES_SYNCHRONOUS, 
+    IO_COUNT_CLOSES_ASYNCHRONOUS,
     IO_COUNT_BYTES_READ_REQUEST,
     IO_COUNT_BYTES_READ_ACTUAL,
     IO_COUNT_BYTES_WRITE_REQUEST,
@@ -751,15 +775,23 @@ global_variable char const *IO_COUNT_NAME[IO_COUNT_COUNT] = {
     "I/O Reads Started",
     "I/O Reads Succeeded",
     "I/O Reads Failed",
+    "I/O Reads Synchronous", 
+    "I/O Reads Asynchronous",
     "I/O Writes Started",
     "I/O Writes Succeeded",
     "I/O Writes Failed",
+    "I/O Writes Synchronous", 
+    "I/O Writes Asynchronous", 
     "I/O Flushes Started",
     "I/O Flushes Succeeded",
     "I/O Flushes Failed",
+    "I/O Flushes Synchronous", 
+    "I/O Flushes Asynchronous",
     "I/O Closes Started",
     "I/O Closes Succeeded",
     "I/O Closes Failed",
+    "I/O Closes Synchronous",
+    "I/O Closes Asynchronous",
     "I/O Read Bytes Requested",
     "I/O Read Bytes Actual",
     "I/O Write Bytes Requested",
@@ -842,13 +874,15 @@ typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
 typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
 typedef BOOL (WINAPI *SetFileInformationByHandleFn)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
 typedef BOOL (WINAPI *GetQueuedCompletionStatusExFn)(HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL);
+typedef BOOL (WINAPI *SetFileCompletionNotificationModesFn)(HANDLE, UCHAR);
 typedef DWORD(WINAPI *GetFinalPathNameByHandleFn)(HANDLE, LPWSTR, DWORD, DWORD);
 
-global_variable GetNativeSystemInfoFn         GetNativeSystemInfo_Func         = NULL;
-global_variable GetFinalPathNameByHandleFn    GetFinalPathNameByHandle_Func    = NULL;
-global_variable SetProcessWorkingSetSizeExFn  SetProcessWorkingSetSizeEx_Func  = NULL;
-global_variable SetFileInformationByHandleFn  SetFileInformationByHandle_Func  = NULL;
-global_variable GetQueuedCompletionStatusExFn GetQueuedCompletionStatusEx_Func = NULL;
+global_variable GetNativeSystemInfoFn                GetNativeSystemInfo_Func                = NULL;
+global_variable GetFinalPathNameByHandleFn           GetFinalPathNameByHandle_Func           = NULL;
+global_variable SetProcessWorkingSetSizeExFn         SetProcessWorkingSetSizeEx_Func         = NULL;
+global_variable SetFileInformationByHandleFn         SetFileInformationByHandle_Func         = NULL;
+global_variable GetQueuedCompletionStatusExFn        GetQueuedCompletionStatusEx_Func        = NULL;
+global_variable SetFileCompletionNotificationModesFn SetFileCompletionNotificationModes_Func = NULL;
 
 /*///////////////////////
 //   Local Functions   //
@@ -882,11 +916,12 @@ internal_function void resolve_kernel_apis(void)
     HMODULE kernel = GetModuleHandleA("kernel32.dll");
     if (kernel != NULL)
     {
-        GetNativeSystemInfo_Func         = (GetNativeSystemInfoFn)          GetProcAddress(kernel, "GetNativeSystemInfo");
-        GetFinalPathNameByHandle_Func    = (GetFinalPathNameByHandleFn)     GetProcAddress(kernel, "GetFinalPathNameByHandleW");
-        SetProcessWorkingSetSizeEx_Func  = (SetProcessWorkingSetSizeExFn)   GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
-        SetFileInformationByHandle_Func  = (SetFileInformationByHandleFn)   GetProcAddress(kernel, "SetFileInformationByHandle");
-        GetQueuedCompletionStatusEx_Func = (GetQueuedCompletionStatusExFn)  GetProcAddress(kernel, "GetQueuedCompletionStatusEx");
+        GetNativeSystemInfo_Func                 = (GetNativeSystemInfoFn)                GetProcAddress(kernel, "GetNativeSystemInfo");
+        GetFinalPathNameByHandle_Func            = (GetFinalPathNameByHandleFn)           GetProcAddress(kernel, "GetFinalPathNameByHandleW");
+        SetProcessWorkingSetSizeEx_Func          = (SetProcessWorkingSetSizeExFn)         GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        SetFileInformationByHandle_Func          = (SetFileInformationByHandleFn)         GetProcAddress(kernel, "SetFileInformationByHandle");
+        GetQueuedCompletionStatusEx_Func         = (GetQueuedCompletionStatusExFn)        GetProcAddress(kernel, "GetQueuedCompletionStatusEx");
+        SetFileCompletionNotificationModes_Func  = (SetFileCompletionNotificationModesFn) GetProcAddress(kernel, "SetFileCompletionNotificationModes");
     }
     // fallback if any of these APIs are not available.
     if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
@@ -894,7 +929,7 @@ internal_function void resolve_kernel_apis(void)
     // TODO: should fail if Vista+ APIs are not available. Or not be lazy and implement fallbacks.
     // for GetFinalPathNameByHandle, see:
     // cbloomrants.blogspot.com/2012/12/12-21-12-file-handle-to-file-name-on.html
-    // GetQueuedCompletionStatusEx is Vista+ only also.
+    // GetQueuedCompletionStatusEx and SetFileCompletionNotificationModes are Vista+ only also.
 }
 
 /// @summary Elevates the privileges for the process to include the privilege
@@ -2298,13 +2333,16 @@ internal_function WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     // generate a 32-bit 'random' value and convert it to an eight-digit hex value.
     // start with the current tick count, and then mix the bits using the 4-byte
     // integer hash, full avalanche method from burtleburtle.net/bob/hash/integer.html.
-    uint32_t bits = GetTickCount() + uint32_t(rand());
+    // add in the value of the processor time stamp counter in case we're doing this
+    // in a tight loop. this helps prevent (but does not eliminate) filename collisions.
+    uint32_t bits = GetTickCount();
     bits  = (bits + 0x7ed55d16) + (bits << 12);
     bits  = (bits ^ 0xc761c23c) ^ (bits >> 19);
     bits  = (bits + 0x165667b1) + (bits <<  5);
     bits  = (bits + 0xd3a2646c) ^ (bits <<  9);
     bits  = (bits + 0xfd7046c5) + (bits <<  3);
     bits  = (bits ^ 0xb55a4f09) ^ (bits >> 16);
+    bits += uint32_t(__rdtsc());
     swprintf(random, 9, L"%08x" ,  bits);
     random[8]  = 0;
     wcscat(temp, random);
@@ -2600,12 +2638,13 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
     asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
     asio->OffsetHigh     = DWORD((absolute_ofs & 0xFFFFFFFFFFFFFFFFULL) >> 32);
     BOOL res = ReadFile(req.Fildes, req.DataBuffer, req.DataAmount, &xfer, asio);
-    if (!res || xfer == 0)
+    if (!res)
     {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
         // which means that the operation will complete asynchronously.
         DWORD err  = GetLastError();
         if   (err == ERROR_IO_PENDING)
         {   // the operation was queued by kernel AIO. append to the active list.
+            io_count(stats, IO_COUNT_READS_ASYNCHRONOUS);
             size_t index = aio->ActiveCount++;
             aio->AAIOList[index] = req;
             aio->AAIOList[index].ATimeNanos = nanotime();
@@ -2613,15 +2652,10 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
             error = ERROR_SUCCESS;
             return (0);
         }
-        else if (err == ERROR_HANDLE_EOF)
-        {   // this is not considered to be an error. complete immediately.
-            error = ERROR_SUCCESS;
-            aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
-            return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
-        }
         else
         {   // an error has occurred. complete immediately with error.
-            error = err;
+            error  = err;
+            asio_put(aio, asio);
             aio_res_t res = aio_result(err, 0, req);
             srsw_fifo_put(&aio->ReadResults, res);
             return (-1);
@@ -2631,6 +2665,7 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
     {   // the read operation has completed synchronously. complete immediately.
         asio_put(aio, asio);
         error = ERROR_SUCCESS;
+        io_count(stats, IO_COUNT_READS_SYNCHRONOUS);
         aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->ReadResults, res) ? 0 : -1;
     }
@@ -2652,12 +2687,13 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
     asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
     asio->OffsetHigh     = DWORD((absolute_ofs & 0xFFFFFFFFFFFFFFFFULL) >> 32);
     BOOL res = WriteFile(req.Fildes, req.DataBuffer, req.DataAmount, &xfer, asio);
-    if (!res || xfer == 0)
+    if (!res)
     {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
         // which means that the operation will complete asynchronously.
         DWORD err  = GetLastError();
         if   (err == ERROR_IO_PENDING)
         {   // the operation was queued by kernel AIO. append to the active list.
+            io_count(stats, IO_COUNT_WRITES_ASYNCHRONOUS);
             size_t index = aio->ActiveCount++;
             aio->AAIOList[index] = req;
             aio->AAIOList[index].ATimeNanos = nanotime();
@@ -2667,7 +2703,8 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
         }
         else
         {   // an error has occurred. complete immediately.
-            error = err;
+            error  = err;
+            asio_put(aio, asio);
             aio_res_t res = aio_result(err, 0, req);
             srsw_fifo_put(&aio->WriteResults, res);
             return (-1);
@@ -2677,6 +2714,7 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
     {   // the write operation has completed synchronously. complete immediately.
         asio_put(aio, asio);
         error = ERROR_SUCCESS;
+        io_count(stats, IO_COUNT_WRITES_SYNCHRONOUS);
         aio_res_t res = aio_result(ERROR_SUCCESS, xfer, req);
         return srsw_fifo_put(&aio->WriteResults, res) ? 0 : -1;
     }
@@ -2694,6 +2732,9 @@ internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, 
     if (!result)  error = GetLastError();
     else error = ERROR_SUCCESS;
 
+    // flushes only ever complete synchronously. the async count is not used.
+    io_count(stats, IO_COUNT_FLUSHES_SYNCHRONOUS);
+
     // generate the completion result and push it to the queue.
     aio_res_t res = aio_result(error, 0, req);
     return srsw_fifo_put(&aio->FlushResults, res) ? 0 : -1;
@@ -2707,6 +2748,9 @@ internal_function int aio_process_flush(aio_state_t *aio, aio_req_t const &req, 
 internal_function int aio_process_close(aio_state_t *aio, aio_req_t const &req, io_stats_t *stats)
 {   // close the file descriptors associated with the file.
     if (req.Fildes != INVALID_HANDLE_VALUE) CloseHandle(req.Fildes);
+
+    // closes only ever complete synchronously. the async count is not used.
+    io_count(stats, IO_COUNT_CLOSES_SYNCHRONOUS);
 
     // generate the completion result and push it to the queue.
     aio_res_t res = aio_result(ERROR_SUCCESS, 0, req);
@@ -2729,6 +2773,9 @@ internal_function int aio_process_finalize(aio_state_t *aio, aio_req_t const &re
     WCHAR *source = NULL;
     FILE_END_OF_FILE_INFO eof;
 
+    // closes only ever complete synchronously. the async count is not used.
+    io_count(stats, IO_COUNT_CLOSES_SYNCHRONOUS);
+
     // get the absolute path of the temporary file (the source file).
     ncharsp = GetFinalPathNameByHandle_Func(req.Fildes, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     source  = (WCHAR*) malloc(ncharsp * sizeof(WCHAR));
@@ -2748,6 +2795,7 @@ internal_function int aio_process_finalize(aio_state_t *aio, aio_req_t const &re
         return 0;
     }
 
+    // TODO: is it necessary to FlushFileBuffers() here?
     // the file needs to be moved into place. set the file size.
     lsize = req.FileOffset;
     eof.EndOfFile.QuadPart = lsize;
@@ -3871,7 +3919,7 @@ internal_function bool platform_open_stream(char const *path, intptr_t id, int32
     if (vfs_resolve_file_read(path, hint, iocp, fd, lsize, psize, offset, ssize, decoder, &IO_STATS))
     {   // we wil immediately complete requests that execute synchronously.
         UCHAR flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-        SetFileCompletionNotificationModes(fd, flags);
+        SetFileCompletionNotificationModes_Func(fd, flags);
         // queue a load file request to be processed by the VFS driver.
         vfs_sics_t req;
         req.Next       = NULL;
@@ -4335,11 +4383,17 @@ internal_function bool platform_create_stream(char const *where, uint32_t priori
     }
     if (reserve_size > 0)
     {   // pre-allocate storage for the file contents, which should improve performance.
-        // this is best-effort, so it's not a fatal error if it fails.
+        // this is best-effort, so it's not a fatal error if it fails. also, in order for
+        // writes to execute asynchronously, the file pointer must be set to the end of 
+        // the physical file. we'll correct the end-of-file to be the logical end of file
+        // when the stream is closed. see platform_close_stream() and aio_process_finalize().
         sector_size = physical_sector_size(fd);
         file_size   = align_up(reserve_size, sector_size);
+        eof.EndOfFile.QuadPart      = file_size;
         sec.AllocationSize.QuadPart = file_size;
         SetFileInformationByHandle_Func(fd, FileAllocationInfo , &sec, sizeof(sec));
+        SetFileInformationByHandle_Func(fd, FileEndOfFileInfo  , &eof, sizeof(eof));
+        SetFileValidData(fd, eof.EndOfFile.QuadPart); // requires elevate_process_privileges().
     }
 
     // now use VirtualAlloc to allocate a buffer for combining small writes.
@@ -4631,24 +4685,21 @@ cleanup:
 
 static int test_stream_io(int argc, char **argv, platform_layer_t *p)
 {
-    int result = EXIT_SUCCESS;
-    bool  done = false;
-    file_list_t  files;
-    uint32_t ndone  = 0;
-    uint64_t ntotal = 0;
-    uint64_t nwrite = 0;
-    uint64_t nclose = 0;
-
     struct state_t
     {
         intptr_t         SIID;
         stream_writer_t *Writer;
         char const      *SrcPath;
         int64_t          FileSize;
+        int64_t          BytesRead;
+        int64_t          BytesWritten;
         uint32_t         Checksum;
     };
 
-    state_t *streams = NULL;
+    file_list_t files;
+    state_t    *streams = NULL;
+    bool        done    = false;
+    int         result  = EXIT_SUCCESS;
 
     init_io_stats(&IO_STATS);
     create_aio_state(&AIO_STATE);
@@ -4693,11 +4744,12 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             if (p->create_stream(path, 0, size, &streams[i].Writer))
             {
                 fprintf(stdout, "Created output stream for \'%s\'.\n", path);
-                streams[i].SIID = siid;
-                streams[i].SrcPath = path;
-                streams[i].FileSize = size;
-                streams[i].Checksum = 0;
-                ntotal += uint64_t(size); // HACK: tracking the total number of bytes to write.
+                streams[i].SIID         = siid;
+                streams[i].SrcPath      = path;
+                streams[i].FileSize     = size;
+                streams[i].BytesRead    = 0;
+                streams[i].BytesWritten = 0;
+                streams[i].Checksum     = 0;
             }
             else
             {
@@ -4715,15 +4767,6 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
         // updates stream-in status, and pushes data to the application.
         vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
         aio_poll(&AIO_STATE, &IO_STATS);
-
-        // HACK: check for termination based on whether all bytes have been written.
-        nwrite = IO_STATS.Counts[IO_COUNT_BYTES_WRITE_ACTUAL];
-        nclose = IO_STATS.Counts[IO_COUNT_CLOSES_COMPLETE_SUCCESS];
-        if (nclose == files.PathCount * 2)
-        {
-            done = true;
-            break;
-        }
 
         // print statistic counters:
         print_io_rates(stdout, &IO_STATS);
@@ -4761,16 +4804,18 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
                     do
                     {   // read as much data as is available, and then call
                         // refill to decode the next chunk of the input buffer.
-                        size_t written = 0;
-                        size_t amount  = read.Decoder->amount();
-                        void  *buffer  = read.Decoder->Cursor;
+                        size_t written    = 0;
+                        size_t amount     = read.Decoder->amount();
+                        void  *buffer     = read.Decoder->Cursor;
                         p->append_stream(s->Writer, buffer, amount, written);
-                        assert(written == amount);
-                        // TODO: need some way to notify the application that
-                        // their write has completed. AIO already supports this
-                        // notification, we just need to be able to push it up
-                        // to the application.
-                        read.Decoder->Cursor += amount;
+                        assert(written   == amount);
+                        s->BytesRead     += amount;
+                        s->BytesWritten  += amount;
+                        // update the checksum with the output of the decoder.
+                        while (read.Decoder->Cursor != read.Decoder->BufferEnd)
+                        {
+                            s->Checksum  += *read.Decoder->Cursor++;
+                        }
                     } while (read.Decoder->refill(read.Decoder) == DECODE_RESULT_START);
                     // after the application has had a chance to process
                     // the data, return the buffer so it can be used again.
@@ -4785,26 +4830,37 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             }
 
             vfs_sies_t eos;
+            // process end-of-stream notifications for the stream-ins.
             while (srsw_fifo_get(&VFS_STATE.SiEndOfS[i], eos))
             {
-                //fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
-                for (size_t i = 0; i < files.PathCount; ++i)
-                {
-                    if (streams[i].SIID == eos.ASID)
-                    {
-                        p->stop_stream(eos.ASID);
-                        char   ext[10];
-                        char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
-                        strcpy(path, streams[i].SrcPath);
-                        sprintf(ext, ".%08X", streams[i].Checksum);
-                        ext[9] = 0;
-                        strcat(path, ext);
-                        p->close_stream(&streams[i].Writer, path);
-                        fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
-                        free(path);
-                        break;
-                    }
+                fprintf(stdout, "Reached end-of-stream for ASID %p.\n", (void*) eos.ASID);
+                p->stop_stream(eos.ASID);
+            }
+
+            // check each stream to determine whether all data has been written.
+            for (size_t i = 0; i < files.PathCount; ++i)
+            {   // we check for the possibility that more bytes have been written 
+                // because the file might have been opened in unbuffered I/O mode, 
+                // where the file size is aligned to the nearest block boundary. 
+                // the file will be truncated to the correct size when it is closed.
+                if (streams[i].BytesWritten >= streams[i].FileSize && streams[i].Writer != NULL)
+                {   // we need to generate the final output path of the file.
+                    // for now, we just append the checksum as another file extension.
+                    char   ext[10];
+                    char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
+                    strcpy(path, streams[i].SrcPath);
+                    sprintf(ext, ".%08X", streams[i].Checksum);
+                    ext[9] = 0;
+                    strcat(path, ext);
+                    p->close_stream(&streams[i].Writer, path);
+                    fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
+                    free(path);
                 }
+            }
+            if (IO_STATS.Counts[IO_COUNT_CLOSES_COMPLETE_SUCCESS] == files.PathCount * 2)
+            {   // using files.PathCount * 2 to ensure that all stream-ins have been 
+                // closed, and that all stream outs have been closed.
+                done = true;
             }
         }
     }
