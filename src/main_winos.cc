@@ -173,7 +173,7 @@ static size_t   const MAX_STREAMS_IN = WINOS_MAX_STREAMS_IN;
 /// @summary Define the maximum number of concurrently active decoder streams.
 /// This needs to be larger than the maximum number of active stream-in files,
 /// as decode will lag behind raw I/O slightly in most cases.
-static size_t   const MAX_STREAMS_LIVE = MAX_STREAMS_IN * 2;
+static size_t    const MAX_STREAMS_LIVE = MAX_STREAMS_IN * 2;
 
 /// @summary Define the maximum number of concurrently active AIO operations.
 /// We set this based on what the maximum number of AIO operations we want to
@@ -618,9 +618,9 @@ struct vfs_io_opq_t
 {
     int32_t            Count;                        /// The number of items in the queue.
     uint64_t           InsertionId;                  /// The counter for tagging each AIO request.
-    uint32_t           Priority[AIO_MAX_ACTIVE];     /// The priority value for each item.
-    uint64_t           InsertId[AIO_MAX_ACTIVE];     /// The inserion order value for each item.
-    aio_req_t          Request [AIO_MAX_ACTIVE];     /// The populated AIO request for each item.
+    uint32_t           Priority[AIO_MAX_ACTIVE];   /// The priority value for each item.
+    uint64_t           InsertId[AIO_MAX_ACTIVE];   /// The inserion order value for each item.
+    aio_req_t          Request [AIO_MAX_ACTIVE];   /// The populated AIO request for each item.
 };
 
 /// @summary Defines the data associated with a priority queue of files. This queue
@@ -1181,7 +1181,7 @@ internal_function inline bool srsw_fifo_put(srsw_fifo_t<T, N> *fifo, T const &it
         srsw_flq_push(fifo->Queue);
         return true;
     }
-    return false;
+    else return false;
 }
 
 /// @summary Dequeues an item.
@@ -1536,6 +1536,14 @@ internal_function inline size_t iobuf_buffers_used(iobuf_alloc_t const &alloc)
     size_t const nallocs = alloc.TotalSize / alloc.AllocSize;
     size_t const nunused = alloc.FreeCount;
     return (nallocs - nunused);
+}
+
+/// @summary Calculate the number of buffers currently available for use.
+/// @param alloc The I/O buffer allocator to query.
+/// @return The number of buffers currently available for use by the application.
+internal_function inline size_t iobuf_buffers_free(iobuf_alloc_t const &alloc)
+{
+    return alloc.FreeCount;
 }
 
 /// @summary Perform a comparison between two elements in an I/O operation priority queue.
@@ -2335,14 +2343,13 @@ internal_function WCHAR* make_temp_path(char const *path, WCHAR const *prefix)
     // integer hash, full avalanche method from burtleburtle.net/bob/hash/integer.html.
     // add in the value of the processor time stamp counter in case we're doing this
     // in a tight loop. this helps prevent (but does not eliminate) filename collisions.
-    uint32_t bits = GetTickCount();
-    bits  = (bits + 0x7ed55d16) + (bits << 12);
+    uint32_t bits = uint32_t(__rdtsc());// GetTickCount();
+    /*bits  = (bits + 0x7ed55d16) + (bits << 12);
     bits  = (bits ^ 0xc761c23c) ^ (bits >> 19);
     bits  = (bits + 0x165667b1) + (bits <<  5);
     bits  = (bits + 0xd3a2646c) ^ (bits <<  9);
     bits  = (bits + 0xfd7046c5) + (bits <<  3);
-    bits  = (bits ^ 0xb55a4f09) ^ (bits >> 16);
-    bits += uint32_t(__rdtsc());
+    bits  = (bits ^ 0xb55a4f09) ^ (bits >> 16);*/
     swprintf(random, 9, L"%08x" ,  bits);
     random[8]  = 0;
     wcscat(temp, random);
@@ -2633,6 +2640,7 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
     DWORD           xfer = 0;
+    int           result = 0;
     asio->Internal       = 0;
     asio->InternalHigh   = 0;
     asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
@@ -2641,28 +2649,31 @@ internal_function int aio_submit_read(aio_state_t *aio, aio_req_t const &req, DW
     if (!res)
     {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
         // which means that the operation will complete asynchronously.
-        DWORD err  = GetLastError();
-        if   (err == ERROR_IO_PENDING)
-        {   // the operation was queued by kernel AIO. append to the active list.
+        error = GetLastError();
+        if (error == ERROR_IO_PENDING)
+        {   // the operation was queued by kernel AIO. 
             io_count(stats, IO_COUNT_READS_ASYNCHRONOUS);
-            size_t index = aio->ActiveCount++;
-            aio->AAIOList[index] = req;
-            aio->AAIOList[index].ATimeNanos = nanotime();
-            aio->ASIOList[index] = asio;
-            error = ERROR_SUCCESS;
-            return (0);
+            error  = ERROR_SUCCESS;
+        }
+        else if (error == ERROR_HANDLE_EOF)
+        {   // attempted to read past end-of-file. not an error.
+            error  = ERROR_SUCCESS;
         }
         else
-        {   // an error has occurred. complete immediately with error.
-            error  = err;
-            asio_put(aio, asio);
-            aio_res_t res = aio_result(err, 0, req);
-            srsw_fifo_put(&aio->ReadResults, res);
-            return (-1);
+        {   // an actual error occurred.
+            result = -1;
         }
+        // append to the active list; GetQueuedCompletionStatusEx will notify. 
+        size_t index = aio->ActiveCount++;
+        aio->AAIOList[index] = req;
+        aio->AAIOList[index].ATimeNanos = nanotime();
+        aio->ASIOList[index] = asio;
+        return result;
     }
     else
     {   // the read operation has completed synchronously. complete immediately.
+        // normally, GetQueuedCompletionStatusEx would notify, but we used the 
+        // SetFileCompletionNotificationModes to override that behavior.
         asio_put(aio, asio);
         error = ERROR_SUCCESS;
         io_count(stats, IO_COUNT_READS_SYNCHRONOUS);
@@ -2682,6 +2693,7 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
     int64_t absolute_ofs = req.BaseOffset + req.FileOffset; // relative->absolute
     OVERLAPPED     *asio = asio_get(aio);
     DWORD           xfer = 0;
+    int           result = 0;
     asio->Internal       = 0;
     asio->InternalHigh   = 0;
     asio->Offset         = DWORD((absolute_ofs & 0x00000000FFFFFFFFULL) >>  0);
@@ -2690,28 +2702,27 @@ internal_function int aio_submit_write(aio_state_t *aio, aio_req_t const &req, D
     if (!res)
     {   // the common case is that GetLastError() returns ERROR_IO_PENDING,
         // which means that the operation will complete asynchronously.
-        DWORD err  = GetLastError();
-        if   (err == ERROR_IO_PENDING)
+        error = GetLastError();
+        if (error == ERROR_IO_PENDING)
         {   // the operation was queued by kernel AIO. append to the active list.
             io_count(stats, IO_COUNT_WRITES_ASYNCHRONOUS);
-            size_t index = aio->ActiveCount++;
-            aio->AAIOList[index] = req;
-            aio->AAIOList[index].ATimeNanos = nanotime();
-            aio->ASIOList[index] = asio;
             error = ERROR_SUCCESS;
-            return (0);
         }
         else
-        {   // an error has occurred. complete immediately.
-            error  = err;
-            asio_put(aio, asio);
-            aio_res_t res = aio_result(err, 0, req);
-            srsw_fifo_put(&aio->WriteResults, res);
-            return (-1);
+        {   // an actual error occurred.
+            result = -1;
         }
+        // append to the active list; GetQueuedCompletionStatusEx will notify. 
+        size_t index = aio->ActiveCount++;
+        aio->AAIOList[index] = req;
+        aio->AAIOList[index].ATimeNanos = nanotime();
+        aio->ASIOList[index] = asio;
+        return result;
     }
     else
     {   // the write operation has completed synchronously. complete immediately.
+        // normally, GetQueuedCompletionStatusEx would notify, but we used the 
+        // SetFileCompletionNotificationModes to override that behavior.
         asio_put(aio, asio);
         error = ERROR_SUCCESS;
         io_count(stats, IO_COUNT_WRITES_SYNCHRONOUS);
@@ -3498,6 +3509,9 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
     {
         if (vfs->LiveStat[i].StatusFlags == VFS_STATUS_NONE)
         {   // only update streams that are active (not paused, not closed.)
+            // TODO: we'll get better disk locality if we store an 'order' 
+            // with the LiveStat structure; this way we aren't affected by 
+            // small files completing causing large files to swap out.
             vfs_find_by_asid(vfs  , vfs->LiveASID[i], index_a);
             io_fpq_put(&file_queue, vfs->LiveStat[i].Priority, index_a, i);
         }
@@ -3511,6 +3525,7 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         // 2. we've run out of pending queue space. stop processing for the tick.
         // 3. we've run out of I/O buffer space. stop processing for the tick.
         uint32_t  nqueued = 0;
+        bool   full_queue = false;
         while (iobuf_bytes_free(allocator) > 0)
         {   // allocate a new request in our internal operation queue.
             aio_req_t *req = io_opq_put(&vfs->IoOperations, priority);
@@ -3555,8 +3570,8 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
             }
             else
             {   // we ran out of I/O queue space; no point in continuing.
-                io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
-                return false;
+                full_queue = true;
+                break;
             }
         }
 
@@ -3577,6 +3592,11 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
         {   // place the stream into the paused state.
             vfs->LiveStat[index_l].StatusFlags |= VFS_STATUS_PAUSE;
         }
+        else if (full_queue)
+        {   // if we ran out of I/O queue space there's no point in continuing.
+            io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
+            return false;
+        }
         else if (nqueued == 0)
         {   // if we ran out of I/O buffer space there's no point in continuing.
             io_stall(stats, IO_STALL_OUT_OF_IOBUFS);
@@ -3586,6 +3606,22 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
     return true;
 }
 
+/// @summary Determines whether any space is available in the VFS I/O pending operations queue.
+/// @param vfs The VFS driver state to query.
+/// @return The number of items available in the VFS I/O operation queue.
+internal_function inline int32_t vfs_opq_available(vfs_state_t *vfs)
+{
+    return (AIO_MAX_ACTIVE - vfs->IoOperations.Count);
+}
+
+/// @summary Determines whether any stream-in buffer space is available.
+/// @param vfs The VFS driver state to query.
+/// @return The number of stream-in buffers available.
+internal_function inline size_t vfs_iobufs_available(vfs_state_t *vfs)
+{
+    return iobuf_buffers_free(vfs->IoAllocator);
+}
+
 /// @summary Processes as many pending stream-out operations as possible.
 /// @param vfs The VFS driver state to update.
 /// @param stats The I/O driver statistics to update.
@@ -3593,63 +3629,69 @@ internal_function bool vfs_update_stream_in(vfs_state_t *vfs, io_stats_t *stats)
 /// the I/O operation queue is full.
 internal_function bool vfs_update_stream_out(vfs_state_t *vfs, io_stats_t *stats)
 {
-    vfs_sowr_t write;
-    while (srmw_fifo_get(&vfs->StOutWriteQ, write))
-    {   // allocate a new request in our internal operation queue.
-        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
-        if (req != NULL)
-        {   // populate the (already queued) request.
-            req->Command    = AIO_COMMAND_WRITE;
-            req->Fildes     = write.Fildes;
-            req->DataAmount = write.DataSize;
-            req->BaseOffset = 0;
-            req->FileOffset = write.FileOffset;
-            req->DataBuffer = write.DataBuffer;
-            req->QTimeNanos = nanotime();
-            req->ATimeNanos = 0;
-            req->AFID       = 0;
-            req->Type       = 0;
-            req->Reserved   = 0;
+    for ( ; ; )
+    {   // loop while I/O queue space is available and there are pending writes.
+        if (vfs_opq_available(vfs))
+        {   // at least one entry is available in the I/O operation queue.
+            // attempt to dequeue a pending write (there may not be any.)
+            vfs_sowr_t write;
+            if (srmw_fifo_get(&vfs->StOutWriteQ, write))
+            {   // queue and populate the I/O operation request for the write.
+                aio_req_t  *req = io_opq_put(&vfs->IoOperations, write.Priority);
+                req->Command    = AIO_COMMAND_WRITE;
+                req->Fildes     = write.Fildes;
+                req->DataAmount = write.DataSize;
+                req->BaseOffset = 0;
+                req->FileOffset = write.FileOffset;
+                req->DataBuffer = write.DataBuffer;
+                req->QTimeNanos = nanotime();
+                req->ATimeNanos = 0;
+                req->AFID       = 0;
+                req->Type       = 0;
+                req->Reserved   = 0;
 
-            // update statistics.
-            io_count(stats, IO_COUNT_WRITES_STARTED);
-            io_count_increment(stats, IO_COUNT_BYTES_WRITE_REQUEST, write.DataSize);
+                // update statistics.
+                io_count(stats, IO_COUNT_WRITES_STARTED);
+                io_count_increment(stats, IO_COUNT_BYTES_WRITE_REQUEST, write.DataSize);
+            }
+            else break; // no more pending writes.
         }
         else
-        {   // the internal operation queue is full.
-            // put the write back in the queue, and return.
+        {   // the I/O operation queue is full. no point in continuing.
             io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
-            srmw_fifo_put(&vfs->StOutWriteQ, write);
             return false;
         }
     }
 
-    vfs_socs_t close;
-    while (srmw_fifo_get(&vfs->StOutCloseQ, close))
-    {   // allocate a new request in our internal operation queue.
-        aio_req_t *req  = io_opq_put(&vfs->IoOperations, write.Priority);
-        if (req != NULL)
-        {   // populate the (already queued) request.
-            req->Command    = AIO_COMMAND_FINAL;
-            req->Fildes     = close.Fildes;
-            req->DataAmount = 0;
-            req->BaseOffset = 0;
-            req->FileOffset = close.FileSize;
-            req->DataBuffer = close.FilePath;
-            req->QTimeNanos = nanotime();
-            req->ATimeNanos = 0;
-            req->AFID       = 0;
-            req->Type       = 0;
-            req->Reserved   = 0;
+    for ( ; ; )
+    {   // loop while I/O queue space is available and there are pending closes.
+        if (vfs_opq_available(vfs))
+        {   // at least one entry is available in the I/O operation queue.
+            // attempt to dequeue a pending close (there may not be any.)
+            vfs_socs_t close;
+            if (srmw_fifo_get(&vfs->StOutCloseQ, close))
+            {   // queue and populate an I/O operation request for the close.
+                aio_req_t  *req = io_opq_put(&vfs->IoOperations, close.Priority);
+                req->Command    = AIO_COMMAND_FINAL;
+                req->Fildes     = close.Fildes;
+                req->DataAmount = 0;
+                req->BaseOffset = 0;
+                req->FileOffset = close.FileSize;
+                req->DataBuffer = close.FilePath;
+                req->QTimeNanos = nanotime();
+                req->ATimeNanos = 0;
+                req->AFID       = 0;
+                req->Type       = 0;
+                req->Reserved   = 0;
 
-            // update statistics.
-            io_count(stats, IO_COUNT_CLOSES_STARTED);
+                // update statistics.
+                io_count(stats, IO_COUNT_CLOSES_STARTED);
+            }
+            else break; // no more pending closes.
         }
         else
-        {   // the internal operation queue is full.
-            // put the close back in the queue, and return.
+        {   // the I/O operation queue is full. no point in continuing.
             io_stall(stats, IO_STALL_FULL_VFS_QUEUE);
-            srmw_fifo_put(&vfs->StOutCloseQ, close);
             return false;
         }
     }
@@ -4614,7 +4656,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
         }
 
         // print statistic counters:
-        print_io_rates(stdout, &IO_STATS);
+        //print_io_rates(stdout, &IO_STATS);
 
         // process data received from the I/O system. normally, different
         // threads would handle one or more file types, depending on what
@@ -4698,8 +4740,11 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
 
     file_list_t files;
     state_t    *streams = NULL;
+    size_t     *sindex  = NULL;
     bool        done    = false;
     int         result  = EXIT_SUCCESS;
+    size_t      ntotal  = 0;
+    size_t      nclose  = 0;
 
     init_io_stats(&IO_STATS);
     create_aio_state(&AIO_STATE);
@@ -4725,7 +4770,8 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
 
     // allocate storage for the list of stream state.
     streams = (state_t*) malloc(files.PathCount * sizeof(state_t));
-    if (streams == NULL)
+    sindex  = (size_t *) malloc(files.PathCount * sizeof(size_t));
+    if (streams == NULL || sindex == NULL)
     {
         fprintf(stderr, "ERROR: Unable to allocate stream list.\n");
         result = EXIT_FAILURE;
@@ -4741,7 +4787,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
         if (p->open_stream(path, siid, 0, 0, STREAM_IN_ONCE, true, size))
         {
             fprintf(stdout, "Successfully loaded \'%s\'; %" PRId64 " bytes.\n", path, size);
-            if (p->create_stream(path, 0, size, &streams[i].Writer))
+            if (p->create_stream("D:\\", 0, size, &streams[i].Writer))
             {
                 fprintf(stdout, "Created output stream for \'%s\'.\n", path);
                 streams[i].SIID         = siid;
@@ -4750,6 +4796,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
                 streams[i].BytesRead    = 0;
                 streams[i].BytesWritten = 0;
                 streams[i].Checksum     = 0;
+                ntotal++;
             }
             else
             {
@@ -4838,7 +4885,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             }
 
             // check each stream to determine whether all data has been written.
-            for (size_t i = 0; i < files.PathCount; ++i)
+            for (size_t i = 0, n = 0; i < files.PathCount; ++i)
             {   // we check for the possibility that more bytes have been written 
                 // because the file might have been opened in unbuffered I/O mode, 
                 // where the file size is aligned to the nearest block boundary. 
@@ -4846,15 +4893,19 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
                 if (streams[i].BytesWritten >= streams[i].FileSize && streams[i].Writer != NULL)
                 {   // we need to generate the final output path of the file.
                     // for now, we just append the checksum as another file extension.
-                    char   ext[10];
+                    char   ext[9];
                     char  *path = (char*) malloc(strlen(streams[i].SrcPath) + 10);
-                    strcpy(path, streams[i].SrcPath);
-                    sprintf(ext, ".%08X", streams[i].Checksum);
-                    ext[9] = 0;
+                    strcpy(path, "D:\\");
+                    sprintf(ext, "%08X", uint32_t(streams[i].SIID));
+                    ext[8] = 0;
                     strcat(path, ext);
                     p->close_stream(&streams[i].Writer, path);
                     fprintf(stdout, "Moving \'%s\' -> \'%s\'.\n", streams[i].SrcPath, path);
                     free(path);
+                }
+                if (streams[i].Writer != NULL)
+                {
+                    sindex[n++] = i;
                 }
             }
             if (IO_STATS.Counts[IO_COUNT_CLOSES_COMPLETE_SUCCESS] == files.PathCount * 2)
@@ -4864,8 +4915,6 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
             }
         }
     }
-    vfs_tick(&VFS_STATE, &AIO_STATE, &IO_STATS);
-    aio_poll(&AIO_STATE, &IO_STATS);
 
     // print counters as a sanity check.
     fprintf(stdout, "\n\n");
