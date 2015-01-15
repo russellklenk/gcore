@@ -3738,6 +3738,7 @@ internal_function void vfs_tick(vfs_state_t *vfs, aio_state_t *aio, io_stats_t *
         else
         {   // the AIO request queue was full, so stall out.
             io_stall(stats, IO_STALL_FULL_AIO_QUEUE);
+            break;
         }
     }
     io_count_assign_max(stats, IO_COUNT_MAX_OPS_QUEUED, qsize);
@@ -4694,6 +4695,7 @@ static int test_stream_in(int argc, char **argv, platform_layer_t *p)
                 else
                 {   // an error occurred, so display it and then exit.
                     platform_print_ioerror(read.ASID, type, read.OSError, strerror(read.OSError));
+                    vfs_return_buffer(&VFS_STATE, read.ASID, type, read.DataBuffer);
                     p->stop_stream(read.ASID);
                     result = EXIT_FAILURE;
                 }
@@ -4871,6 +4873,7 @@ static int test_stream_io(int argc, char **argv, platform_layer_t *p)
                 else
                 {   // an error occurred, so display it and then exit.
                     platform_print_ioerror(read.ASID, type, read.OSError, strerror(read.OSError));
+                    vfs_return_buffer(&VFS_STATE, read.ASID, type, read.DataBuffer);
                     p->stop_stream(read.ASID);
                     result = EXIT_FAILURE;
                 }
